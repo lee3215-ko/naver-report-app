@@ -1,0 +1,4 @@
+openai>=1.30.0
+selenium>=4.21.0
+webdriver-manager>=4.0.1
+customtkinter>=5.2.0

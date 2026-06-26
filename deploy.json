@@ -1,0 +1,17 @@
+﻿{
+  "github_owner": "lee3215-ko",
+  "github_repo": "naver-report-app",
+  "release_asset": "NaverReport.zip",
+  "default_bump": "patch",
+  "app_display_name": "Naver Report",
+  "version": {
+    "file": "paths.py",
+    "variable": "APP_VERSION"
+  },
+  "build": {
+    "script": "build.bat",
+    "dist_dir": "release/NaverReport"
+  },
+  "git_add": [".gitignore", "README.md", "paths.py", "app.py", "run.py", "naver_reporter.py", "ui_theme.py", "make_icon.py", "build.bat", "build.spec", "build_exe.bat", "requirements.txt", "updater.py", "update_ui.py", "assets", "tools"]
+}
+
