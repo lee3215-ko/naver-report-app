@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.2",
+    "version":  "1.0.3",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "사이트 URL 붙여넣기, 계정 대량 등록, 사이트별 신고 집계, Hagrid(헤드리스) 모드, 계정 보호조치 감지, 신고 원본 탭, 자동 업데이트 지원"
+    "notes":  "신고 정지 버튼 추가, 사이트 URL 붙여넣기 입력 인식 개선"
 }

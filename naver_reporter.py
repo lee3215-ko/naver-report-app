@@ -39,7 +39,17 @@ class NaverReporter:
         self.result_callback = result_callback
         self.progress_callback = progress_callback
         self.driver = None
+        self.cancel_requested = False
         self.client = self._openai_client()
+
+    def request_cancel(self):
+        self.cancel_requested = True
+        if self.driver:
+            self.log("작업 중단 — 브라우저 종료")
+            self.quit_driver()
+
+    def _should_stop(self) -> bool:
+        return self.cancel_requested
 
     def _openai_client(self):
         try:
@@ -329,23 +339,106 @@ class NaverReporter:
         except NoSuchElementException:
             pass
 
+    def _read_element_value(self, element) -> str:
+        try:
+            val = element.get_attribute("value")
+            if val:
+                return val.strip()
+        except Exception:
+            pass
+        try:
+            return (self.driver.execute_script("return arguments[0].value || '';", element) or "").strip()
+        except Exception:
+            return ""
+
+    def _dispatch_input_events(self, element, text: str):
+        """React/네이티브 폼 검증이 value 변경을 인식하도록 이벤트 전파."""
+        self.driver.execute_script("""
+            var el = arguments[0];
+            var val = arguments[1];
+            el.focus();
+            try { el.click(); } catch (e) {}
+            var proto = el instanceof HTMLTextAreaElement
+                ? window.HTMLTextAreaElement.prototype
+                : window.HTMLInputElement.prototype;
+            var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) {
+                desc.set.call(el, val);
+            } else {
+                el.value = val;
+            }
+            try {
+                el.dispatchEvent(new InputEvent('beforeinput', {
+                    bubbles: true, cancelable: true, inputType: 'insertFromPaste', data: val
+                }));
+            } catch (e) {}
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            try {
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, inputType: 'insertFromPaste', data: val
+                }));
+            } catch (e) {}
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            el.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, key: 'Enter'}));
+            el.dispatchEvent(new Event('blur', {bubbles: true}));
+        """, element, text)
+
     def _paste_into_element(self, element, text: str, label: str = "입력"):
-        """URL 등 긴 문자열은 한 번에 붙여넣기(JS value 설정)."""
+        """URL 등 긴 문자열 붙여넣기 — 폼 검증이 인식하는지 확인 후 재시도."""
+        expected = text.strip()
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
         self._human_delay(0.2, 0.4)
         try:
             element.click()
         except Exception:
             pass
-        self.driver.execute_script("""
-            var el = arguments[0];
-            var val = arguments[1];
-            el.focus();
-            el.value = val;
-            el.dispatchEvent(new Event('input', {bubbles: true}));
-            el.dispatchEvent(new Event('change', {bubbles: true}));
-        """, element, text)
-        self.log(f"{label} 붙여넣기 ({len(text)}자)")
+
+        self._dispatch_input_events(element, expected)
+        actual = self._read_element_value(element)
+
+        if actual != expected:
+            self.log(f"{label} JS 입력 미인식 → send_keys 재시도")
+            try:
+                element.click()
+                element.clear()
+                self._human_delay(0.1, 0.2)
+                element.send_keys(expected)
+            except ElementNotInteractableException:
+                self._dispatch_input_events(element, expected)
+            actual = self._read_element_value(element)
+
+        if actual != expected:
+            self.driver.execute_script("""
+                var el = arguments[0]; var val = arguments[1];
+                el.focus();
+                try { el.select(); } catch (e) {}
+                document.execCommand('insertText', false, val);
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+            """, element, expected)
+            actual = self._read_element_value(element)
+
+        if actual == expected:
+            self.log(f"{label} 입력 확인 ({len(expected)}자)")
+        else:
+            self.log(f"{label} 입력 경고: 기대 {len(expected)}자, 실제 {len(actual)}자")
+
+    def _ensure_url_fields(self, site: str):
+        """requiredUrl 필드가 실제로 채워졌는지 검증 후 재입력."""
+        fields = [("requiredUrl1", "게시물 URL")]
+        try:
+            url2 = self.driver.find_element(By.ID, "requiredUrl2")
+            if url2.is_displayed():
+                fields.append(("requiredUrl2", "검색결과 URL"))
+        except NoSuchElementException:
+            pass
+        for field_id, label in fields:
+            el = self.driver.find_element(By.ID, field_id)
+            if self._read_element_value(el) != site.strip():
+                self.log(f"{label} 미입력 감지 → 재입력")
+                self._paste_into_element(el, site, label=label)
+                self._human_delay(0.3, 0.6)
 
     def _type_into_element(self, element, text: str, label: str = "입력"):
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
@@ -820,6 +913,8 @@ class NaverReporter:
 
     def fill_form(self, site: str, report_type: str, content: str) -> bool:
         """문의 작성 폼을 채웁니다."""
+        if self._should_stop():
+            return False
         try:
             self._go_to_inquiry_page()
             wait = self._wait(15)
@@ -838,6 +933,8 @@ class NaverReporter:
                     self._human_delay(0.4, 1.0)
             except NoSuchElementException:
                 pass
+
+            self._ensure_url_fields(site)
 
             mo_texts = self.driver.find_elements(By.ID, "moText1CA")
             if len(mo_texts) >= 1:
@@ -906,6 +1003,10 @@ class NaverReporter:
                 return results
 
             for idx, task in enumerate(tasks):
+                if self._should_stop():
+                    self.log("사용자 요청으로 신고 중단")
+                    break
+
                 site = task.get("site", "")
                 report_type = task.get("report_type", "")
                 template = task.get("template", "")

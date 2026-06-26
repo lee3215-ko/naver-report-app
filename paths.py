@@ -4,7 +4,7 @@ import shutil
 import sys
 
 APP_NAME = "NaverReport"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 UPDATE_VERSION_URL = (
     "https://raw.githubusercontent.com/lee3215-ko/naver-report-app/main/version.json"
 )
@@ -69,5 +69,6 @@ def init_runtime_paths():
     """?묒뾽 ?붾젆?곕━쨌?곗씠???대뜑 珥덇린??"""
     os.chdir(get_app_dir())
     migrate_legacy_data()
+
 
 

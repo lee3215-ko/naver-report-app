@@ -576,6 +576,9 @@ class ReportApp:
         self.load_accounts()
         self.load_results()
         self.load_tasks()
+        self._report_running = False
+        self._report_stop_requested = False
+        self._active_reporter = None
         self.page_header.set("Home")
 
     def on_tab_change(self, name):
@@ -677,6 +680,9 @@ class ReportApp:
 
         self.preview_btn = ui_button(btn_frame, "리라이트 미리보기", "warning", height=44, command=self.preview_all)
         self.preview_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.stop_report_btn = ui_button(btn_frame, "신고 정지", "danger", height=44, command=self.stop_report)
+        self.stop_report_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.stop_report_btn.configure(state=tk.DISABLED)
         self.report_btn = ui_button(btn_frame, "신고 시작", "success", height=44, command=self.start_report)
         self.report_btn.pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -1526,7 +1532,7 @@ class ReportApp:
                 return acc.get("password", "")
         return ""
 
-    def _disable_buttons(self):
+    def _disable_buttons(self, for_report: bool = False):
         try:
             self.preview_btn.configure(state=tk.DISABLED)
         except Exception:
@@ -1535,6 +1541,11 @@ class ReportApp:
             self.report_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
+        if for_report:
+            try:
+                self.stop_report_btn.configure(state=tk.NORMAL)
+            except Exception:
+                pass
 
     def _enable_buttons(self):
         try:
@@ -1545,6 +1556,22 @@ class ReportApp:
             self.report_btn.configure(state=tk.NORMAL)
         except Exception:
             pass
+        try:
+            self.stop_report_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def stop_report(self):
+        if not self._report_running:
+            return
+        self._report_stop_requested = True
+        self.log("[정지] 신고 작업을 중단합니다...")
+        try:
+            self.stop_report_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        if self._active_reporter:
+            self._active_reporter.request_cancel()
 
     def preview_all(self):
         api_key = self.api_key_var.get().strip()
@@ -1593,7 +1620,10 @@ class ReportApp:
         total = len(self.accounts) * len(self.tasks)
         self.log("=" * 55)
         self.log(f"신고 시작 | 항목:{len(self.tasks)}개, 계정:{len(self.accounts)}개, 총:{total}개")
-        self._disable_buttons()
+        self._report_running = True
+        self._report_stop_requested = False
+        self._active_reporter = None
+        self._disable_buttons(for_report=True)
         self.progress["value"] = 0
 
         def on_log(message):
@@ -1621,7 +1651,11 @@ class ReportApp:
             self.root.after(0, lambda c=current[0]: self.progress.configure(value=min(c / total * 100, 100)))
 
         def run():
+            stopped = False
             for account in self.accounts:
+                if self._report_stop_requested:
+                    stopped = True
+                    break
                 account_id = account["id"]
                 on_log(f"[계정 시작] {account_id}")
                 reporter = NaverReporter(
@@ -1632,12 +1666,20 @@ class ReportApp:
                     result_callback=on_result,
                     progress_callback=on_progress,
                 )
+                self._active_reporter = reporter
                 try:
                     reporter.report(account_id, account["password"], self.tasks)
+                    if reporter.cancel_requested or self._report_stop_requested:
+                        stopped = True
                 except Exception as e:
                     on_log(f"[{account_id}] 처리 오류: {e}")
+                finally:
+                    self._active_reporter = None
                 on_log(f"[계정 완료] {account_id}")
-            self.root.after(0, self.report_finished)
+                if self._report_stop_requested:
+                    stopped = True
+                    break
+            self.root.after(0, lambda: self.report_finished(stopped=stopped))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1646,11 +1688,18 @@ class ReportApp:
         for line in content.splitlines():
             self.log(f"   {line}")
 
-    def report_finished(self):
+    def report_finished(self, stopped: bool = False):
+        self._report_running = False
+        self._report_stop_requested = False
+        self._active_reporter = None
         self._enable_buttons()
-        self.progress.configure(value=100)
+        if not stopped:
+            self.progress.configure(value=100)
         self.log("=" * 55)
-        self.log("신고 내용 생성 완료")
+        if stopped:
+            self.log("신고 작업이 중단되었습니다.")
+        else:
+            self.log("신고 내용 생성 완료")
         stats = self.compute_site_report_stats()
         protected_accounts = set()
         for info in stats.values():
