@@ -1,10 +1,10 @@
-"""?굿룸뜲?댄꽣 寃쎈줈 (媛쒕컻 / PyInstaller exe 怨듯넻)."""
+"""?援용８???꾧숲 野껋럥以?(揶쏆뮆而?/ PyInstaller exe ?⑤벏??."""
 import os
 import shutil
 import sys
 
 APP_NAME = "NaverReport"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 UPDATE_VERSION_URL = (
     "https://raw.githubusercontent.com/lee3215-ko/naver-report-app/main/version.json"
 )
@@ -22,14 +22,14 @@ def is_frozen() -> bool:
 
 
 def get_app_dir() -> str:
-    """?ㅽ뻾 ?뚯씪(?먮뒗 run.py)???덈뒗 ?대뜑."""
+    """??쎈뻬 ???뵬(?癒?뮉 run.py)????덈뮉 ????"""
     if is_frozen():
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def get_data_dir() -> str:
-    """?ㅼ젙쨌怨꾩젙쨌?묒뾽 ???곴뎄 ????대뜑 (exe ??data/)."""
+    """??쇱젟夷뚧④쑴?숈쮯?臾믩씜 ???怨대럡 ????????(exe ??data/)."""
     data_dir = os.path.join(get_app_dir(), "data")
     os.makedirs(data_dir, exist_ok=True)
     return data_dir
@@ -40,7 +40,7 @@ def data_path(filename: str) -> str:
 
 
 def migrate_legacy_data():
-    """?댁쟾 踰꾩쟾(猷⑦듃 json) ??data/ 濡???踰덈쭔 ?댁쟾."""
+    """??곸읈 甕곌쑴???룐뫂??json) ??data/ 嚥???甕곕뜄彛???곸읈."""
     app_dir = get_app_dir()
     data_dir = get_data_dir()
     for name in DATA_FILES:
@@ -66,7 +66,7 @@ def get_icon_path() -> str | None:
 
 
 def init_runtime_paths():
-    """?묒뾽 ?붾젆?곕━쨌?곗씠???대뜑 珥덇린??"""
+    """?臾믩씜 ?遺얠젂?怨뺚봺夷?怨쀬뵠???????λ뜃由??"""
     os.chdir(get_app_dir())
     migrate_legacy_data()
 

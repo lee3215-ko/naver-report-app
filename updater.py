@@ -166,33 +166,57 @@ set "INSTALL=%~2"
 set "EXE=%~3"
 set "INNER=%~4"
 set "WAITEXE=%~5"
-set "STAGING=%TEMP%\app_update_%RANDOM%"
+set "WAITPID=%~6"
+set "LOG=%TEMP%\NaverReport_update.log"
+set "STAGING=%TEMP%\NaverReport_staging_%RANDOM%"
 
-:wait
-timeout /t 2 /nobreak >nul
-tasklist /FI "IMAGENAME eq %WAITEXE%" 2>nul | find /I "%WAITEXE%" >nul
-if not errorlevel 1 goto wait
+>>"%LOG%" echo [%date% %time%] update start
+>>"%LOG%" echo ZIP=%ZIP%
+>>"%LOG%" echo INSTALL=%INSTALL%
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath $env:ZIP -DestinationPath $env:STAGING -Force"
-if errorlevel 1 goto fail
-
-if exist "%STAGING%\%INNER%" (
-  robocopy "%STAGING%\%INNER%" "%INSTALL%" /E /IS /IT /R:3 /W:1 >nul
+:wait_loop
+timeout /t 1 /nobreak >nul
+if not "%WAITPID%"=="" (
+  tasklist /FI "PID eq %WAITPID%" 2>nul | find "%WAITPID%" >nul
+  if not errorlevel 1 goto wait_loop
 ) else (
-  robocopy "%STAGING%" "%INSTALL%" /E /IS /IT /R:3 /W:1 >nul
+  tasklist /FI "IMAGENAME eq %WAITEXE%" 2>nul | find /I "%WAITEXE%" >nul
+  if not errorlevel 1 goto wait_loop
 )
-if errorlevel 8 goto fail
+
+>>"%LOG%" echo process ended, expanding zip
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath $env:ZIP -DestinationPath $env:STAGING -Force"
+if errorlevel 1 (
+  >>"%LOG%" echo Expand-Archive failed
+  goto fail
+)
+
+if exist "%STAGING%\%INNER%\" (
+  set "SRC=%STAGING%\%INNER%"
+) else (
+  set "SRC=%STAGING%"
+)
+
+>>"%LOG%" echo robocopy "%SRC%" "%INSTALL%"
+robocopy "%SRC%" "%INSTALL%" /E /IS /IT /R:3 /W:1 /NFL /NDL /NJH /NJS
+if errorlevel 8 (
+  >>"%LOG%" echo robocopy failed
+  goto fail
+)
 
 rd /s /q "%STAGING%" 2>nul
 del /f /q "%ZIP%" 2>nul
+>>"%LOG%" echo starting %EXE%
 start "" "%EXE%"
+>>"%LOG%" echo update success
 endlocal
 del "%~f0"
 exit /b 0
 
 :fail
+>>"%LOG%" echo update failed
 rd /s /q "%STAGING%" 2>nul
-msg * "Update failed. Download the zip manually from GitHub Releases."
+msg * "업데이트 실패. 로그: %TEMP%\NaverReport_update.log"
 endlocal
 del "%~f0"
 exit /b 1
@@ -218,7 +242,14 @@ def schedule_apply_update(
     batch_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.bat"
     _write_update_batch(batch_path)
 
-    creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+    startupinfo = None
+    creationflags = 0
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        creationflags = subprocess.CREATE_NO_WINDOW
+
     subprocess.Popen(
         [
             "cmd.exe",
@@ -229,7 +260,9 @@ def schedule_apply_update(
             str(exe_path),
             inner,
             exe_name,
+            str(os.getpid()),
         ],
+        startupinfo=startupinfo,
         creationflags=creationflags,
         close_fds=True,
     )

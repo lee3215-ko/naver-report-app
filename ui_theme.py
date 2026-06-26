@@ -184,7 +184,7 @@ def configure_treeview(style_name: str):
 class SidebarNav:
     """Left sidebar navigation."""
 
-    def __init__(self, parent, command):
+    def __init__(self, parent, command, app_version: str = ""):
         self.command = command
         self.buttons = {}
         self.current = NAV_ITEMS[0][0]
@@ -241,6 +241,10 @@ class SidebarNav:
         footer = frame(self.frame, COLORS["sidebar"])
         footer.pack(fill=tk.X, padx=20, pady=(0, 20))
         label(footer, "GPT · Selenium", "caption", COLORS["sidebar_text"]).pack(anchor="w")
+        if app_version:
+            label(footer, f"v{app_version}", "body_bold", COLORS["sidebar_text"]).pack(
+                anchor="w", pady=(6, 0)
+            )
 
     def select(self, name):
         self.current = name
@@ -264,13 +268,23 @@ class SidebarNav:
 class PageHeader:
     """Top page title bar inside content area."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, app_version: str = ""):
         self.frame = frame(parent, COLORS["bg"])
         self.frame.pack(fill=tk.X, padx=28, pady=(24, 8))
-        self.title = label(self.frame, "", "title", COLORS["text"])
+
+        top_row = frame(self.frame, COLORS["bg"])
+        top_row.pack(fill=tk.X)
+
+        left = frame(top_row, COLORS["bg"])
+        left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.title = label(left, "", "title", COLORS["text"])
         self.title.pack(anchor="w")
-        self.subtitle = label(self.frame, "", "subtitle", COLORS["text_muted"])
+        self.subtitle = label(left, "", "subtitle", COLORS["text_muted"])
         self.subtitle.pack(anchor="w", pady=(4, 0))
+
+        version_text = f"v{app_version}" if app_version else ""
+        self.version_label = label(top_row, version_text, "body_bold", COLORS["accent"])
+        self.version_label.pack(side=tk.RIGHT, anchor="ne", padx=(12, 0), pady=(8, 0))
 
     def set(self, key):
         title, sub = PAGE_META.get(key, (key, ""))

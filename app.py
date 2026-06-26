@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 
 from naver_reporter import NaverReporter
-from paths import data_path
+from paths import data_path, APP_VERSION
 from ui_theme import (
     COLORS,
     FONTS,
@@ -522,7 +522,7 @@ class RegisterWindow:
 class ReportApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Naver Report · 사이트 자동 신고")
+        self.root.title(f"Naver Report · v{APP_VERSION}")
         self.root.geometry("1520x960")
         self.root.minsize(1280, 800)
         if ctk:
@@ -542,12 +542,12 @@ class ReportApp:
         self.templates = []
         self._editing_template_id = None
 
-        self.sidebar = SidebarNav(self.root, self.on_tab_change)
+        self.sidebar = SidebarNav(self.root, self.on_tab_change, app_version=APP_VERSION)
 
         self.content = ui_frame(self.root, COLORS["bg"])
         self.content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.page_header = PageHeader(self.content)
+        self.page_header = PageHeader(self.content, app_version=APP_VERSION)
 
         self.pages_container = ui_frame(self.content, COLORS["bg"])
         self.pages_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))

@@ -10,6 +10,16 @@ $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
 . (Join-Path $PSScriptRoot "gh-env.ps1")
 
+function Invoke-Git {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & git @GitArgs 2>&1 | Out-Null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    if ($code -ne 0) { throw "git failed: git @GitArgs" }
+}
+
 function Read-DeployConfig {
     Get-Content (Join-Path $Root "deploy.json") -Raw | ConvertFrom-Json
 }
@@ -134,20 +144,20 @@ foreach ($item in $cfg.git_add) {
     $addArgs += $item
 }
 if ($addArgs.Count -gt 0) {
-    git add @addArgs
+    Invoke-Git add @addArgs
 }
-git add deploy.json deploy.bat version.json scripts 2>$null
-git add -u
+Invoke-Git add deploy.json deploy.bat version.json scripts
+Invoke-Git add -u
 
 if (git status --porcelain) {
-    git commit -m "Release $newVersion"
+    Invoke-Git commit -m "Release $newVersion"
 }
 
-git push -u origin main
+Invoke-Git push -u origin main
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[git] pull --rebase then push..."
-    git pull origin main --rebase
-    git push -u origin main
+    Invoke-Git pull origin main --rebase
+    Invoke-Git push -u origin main
 }
 
 Write-Host "[4/4] GitHub Release..."

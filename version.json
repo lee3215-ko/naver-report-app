@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.4",
+    "version":  "1.0.5",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "자동 업데이트 알림 수정(version.json BOM 파싱 오류), 업데이트 확인 실패 시 실행 로그 표시"
+    "notes":  "자동 업데이트 재실행 수정, 화면에 버전 표시(v1.x.x)"
 }

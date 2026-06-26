@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import urllib.error
@@ -129,9 +130,14 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
                 dialog.destroy()
                 return
             dialog.destroy()
-            root.quit()
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            # 프로세스를 즉시 종료해야 설치 폴더 잠금이 풀리고 재실행 배치가 진행됩니다.
+            os._exit(0)
 
-        root.after(0, lambda: status.configure(text="설치 준비 중..."))
-        root.after(500, finish)
+        root.after(0, lambda: status.configure(text="설치 준비 중... 잠시 후 다시 실행됩니다."))
+        root.after(400, finish)
 
     threading.Thread(target=worker, daemon=True).start()
