@@ -5,7 +5,7 @@ import re
 import time
 import base64
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -715,10 +715,11 @@ class NaverReporter:
             return self.solve_captcha()
         return True
 
-    def login(self, naver_id: str, naver_pw: str) -> tuple[bool, str]:
+    def login(self, naver_id: str, naver_pw: str, redirect_url: str | None = None) -> tuple[bool, str]:
+        target = redirect_url or self.INQUIRY_FORM_URL
         login_url = (
             "https://nid.naver.com/nidlogin.login?url="
-            + quote(self.INQUIRY_FORM_URL, safe="")
+            + quote(target, safe="")
         )
         self.driver.get(login_url)
         self.log(f"네이버 로그인 페이지 접속: {naver_id}")
@@ -1036,3 +1037,516 @@ class NaverReporter:
         finally:
             self.quit_driver()
         return results
+
+    CAFE_SEARCH_URL = "https://search.naver.com/search.naver?ssc=tab.ur.all&query="
+    CAFE_ARTICLE_PATH_RE = re.compile(
+        r"/([A-Za-z0-9_-]+)/(\d+)",
+        re.IGNORECASE,
+    )
+
+    def _normalize_cafe_article_url(self, href: str) -> str | None:
+        """통합검색 노출 URL 전체 유지 (?art= 토큰 포함)."""
+        if not href or "cafe.naver.com" not in href:
+            return None
+        href = href.strip()
+        if href.startswith("//"):
+            href = "https:" + href
+        if href.startswith("/"):
+            href = "https://cafe.naver.com" + href
+        parsed = urlparse(href.split("#")[0])
+        if "cafe.naver.com" not in parsed.netloc:
+            return None
+        if not self.CAFE_ARTICLE_PATH_RE.search(parsed.path or ""):
+            return None
+        scheme = parsed.scheme or "https"
+        return urlunparse((scheme, parsed.netloc, parsed.path, "", parsed.query, ""))
+
+    def _cafe_article_dedup_key(self, url: str) -> str | None:
+        """게시물 경로(cafe_id/article_id)로 중복 제거 — 검색 순서는 첫 등장 유지."""
+        parsed = urlparse(url.split("#")[0])
+        m = self.CAFE_ARTICLE_PATH_RE.search(parsed.path or "")
+        if m:
+            return f"{m.group(1).lower()}/{m.group(2)}"
+        return None
+
+    def _extract_anchor_title(self, anchor) -> str:
+        for attr in ("innerText", "textContent"):
+            try:
+                raw = anchor.get_attribute(attr) or ""
+                text = " ".join(raw.split())
+                if text:
+                    return text
+            except Exception:
+                pass
+        return (anchor.get_attribute("title") or "").strip()
+
+    def collect_cafe_article_targets(self, keyword: str, max_pages: int = 3) -> list[dict]:
+        """통합검색에서 카페 게시물 URL·제목 수집 (검색 노출 순서 유지)."""
+        encoded = quote(keyword)
+        key_to_index: dict[str, int] = {}
+        targets: list[dict] = []
+        for page in range(max_pages):
+            if self._should_stop():
+                break
+            start = 1 + page * 10
+            search_url = f"{self.CAFE_SEARCH_URL}{encoded}&start={start}"
+            self.driver.get(search_url)
+            self.log(f"통합검색: {keyword} (페이지 {page + 1})")
+            self._human_delay(2.0, 3.5)
+            anchors = self.driver.find_elements(
+                By.CSS_SELECTOR, "a[href*='cafe.naver.com'][href*='art=']",
+            )
+            if not anchors:
+                anchors = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='cafe.naver.com']")
+            for anchor in anchors:
+                href = anchor.get_attribute("href") or ""
+                norm = self._normalize_cafe_article_url(href)
+                if not norm:
+                    continue
+                dedup = self._cafe_article_dedup_key(norm)
+                if not dedup:
+                    continue
+                title = self._extract_anchor_title(anchor)
+                if dedup in key_to_index:
+                    existing = targets[key_to_index[dedup]]
+                    if "art=" in norm and "art=" not in existing["url"]:
+                        existing["url"] = norm
+                    if title and not existing.get("title"):
+                        existing["title"] = title
+                    continue
+                key_to_index[dedup] = len(targets)
+                targets.append({"url": norm, "title": title})
+                label = title or "(제목 없음)"
+                self.log(f"  수집: {label} | {self._truncate_url(norm)}")
+        return targets
+
+    def _truncate_url(self, url: str, max_len: int = 72) -> str:
+        if len(url) <= max_len:
+            return url
+        return url[:max_len] + "..."
+
+    def _click_cafe_report_button(self) -> bool:
+        wait = self._wait(12)
+        try:
+            report_btn = wait.until(
+                EC.element_to_be_clickable(
+                    (By.CSS_SELECTOR, "a.button_report, a[class*='button_report']")
+                )
+            )
+        except TimeoutException:
+            return False
+        self._click_element(report_btn)
+        self.log("카페 신고 버튼 클릭")
+        self._human_delay(1.5, 2.5)
+        return True
+
+    def _select_cafe_illegal_reason_in_context(self) -> bool:
+        wait = self._wait(10)
+        selectors = [
+            (By.CSS_SELECTOR, "label[for='3']"),
+            (By.CSS_SELECTOR, "input#3[type='radio']"),
+            (By.CSS_SELECTOR, "input[type='radio'][value='3']"),
+            (By.XPATH, "//label[contains(.,'불법정보를 포함하고 있습니다')]"),
+            (By.XPATH, "//label[contains(.,'불법정보') and contains(.,'포함')]"),
+            (By.XPATH, "//li[contains(.,'불법정보')]//label"),
+            (By.XPATH, "//*[contains(text(),'불법정보를 포함')]/ancestor::label[1]"),
+        ]
+        for by, sel in selectors:
+            try:
+                el = wait.until(EC.presence_of_element_located((by, sel)))
+                if not el.is_displayed():
+                    continue
+                self._click_element(el)
+                self.log("불법정보 포함 선택")
+                return True
+            except TimeoutException:
+                continue
+            except Exception:
+                continue
+
+        try:
+            clicked = self.driver.execute_script("""
+                var labels = document.querySelectorAll('label');
+                for (var i = 0; i < labels.length; i++) {
+                    var t = (labels[i].textContent || '').replace(/\s+/g, '');
+                    if (t.indexOf('불법정보') >= 0 && t.indexOf('포함') >= 0) {
+                        labels[i].click();
+                        return 'label';
+                    }
+                }
+                var radios = document.querySelectorAll('input[type=radio]');
+                for (var j = 0; j < radios.length; j++) {
+                    var r = radios[j];
+                    if (r.id === '3' || r.value === '3') {
+                        r.checked = true;
+                        r.dispatchEvent(new Event('change', {bubbles: true}));
+                        r.click();
+                        return 'radio';
+                    }
+                }
+                return '';
+            """)
+            if clicked:
+                self.log(f"불법정보 포함 선택 (JS: {clicked})")
+                return True
+        except Exception:
+            pass
+        self.log("불법정보 항목 선택 실패")
+        return False
+
+    def _submit_cafe_report_in_context(self) -> bool:
+        wait = self._wait(8)
+        for by, sel in [
+            (By.XPATH, "//button[contains(.,'신고하기')]"),
+            (By.XPATH, "//a[contains(.,'신고하기')]"),
+            (By.XPATH, "//button[contains(.,'신고') and not(contains(.,'취소'))]"),
+            (By.CSS_SELECTOR, "button.btn_report, a.btn_report"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+        ]:
+            try:
+                btn = wait.until(EC.element_to_be_clickable((by, sel)))
+                self._click_element(btn)
+                return True
+            except TimeoutException:
+                continue
+            except Exception:
+                continue
+        self.log("신고하기 버튼을 찾지 못했습니다")
+        return False
+
+    def _is_already_reported_alert(self, text: str) -> bool:
+        if not text:
+            return False
+        return any(
+            k in text
+            for k in ("이미 신고", "이미 신고되", "이미 신고한", "이미 신고 하", "신고하셨")
+        )
+
+    def _dismiss_cafe_popup(self, timeout: float = 2) -> str | None:
+        """alert 또는 「확인」 팝업 닫기. 표시된 메시지 반환."""
+        text = self._accept_alert(timeout=timeout)
+        if text:
+            return text
+        for by, sel in [
+            (By.XPATH, "//button[contains(.,'확인')]"),
+            (By.XPATH, "//a[contains(.,'확인')]"),
+            (By.CSS_SELECTOR, "button.btn_confirm, a.btn_confirm"),
+        ]:
+            try:
+                el = self.driver.find_element(by, sel)
+                if el.is_displayed():
+                    body = ""
+                    try:
+                        body = self.driver.find_element(By.TAG_NAME, "body").text
+                    except Exception:
+                        pass
+                    self._click_element(el)
+                    if body:
+                        self.log(f"팝업 확인 클릭: {body[:80]}")
+                    return body[:200] if body else "확인"
+            except NoSuchElementException:
+                continue
+        return None
+
+    def _close_extra_windows(self, main_handle: str) -> None:
+        try:
+            for handle in list(self.driver.window_handles):
+                if handle != main_handle:
+                    try:
+                        self.driver.switch_to.window(handle)
+                        self.driver.close()
+                    except Exception:
+                        pass
+            if main_handle in self.driver.window_handles:
+                self.driver.switch_to.window(main_handle)
+            elif self.driver.window_handles:
+                self.driver.switch_to.window(self.driver.window_handles[0])
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+
+    def _wait_for_new_window(self, before_handles: set[str], timeout: float = 15) -> str | None:
+        """신고 클릭 후 열린 새 창(handle) 대기."""
+        end = time.time() + timeout
+        while time.time() < end:
+            new_handles = set(self.driver.window_handles) - before_handles
+            if new_handles:
+                return next(iter(new_handles))
+            time.sleep(0.25)
+        return None
+
+    def _finish_cafe_report_in_active_window(self) -> str:
+        """현재 창(신고 팝업)에서 사유 선택 → 신고하기. ok / already / failed."""
+        try:
+            WebDriverWait(self.driver, 12).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except TimeoutException:
+            pass
+
+        popup_text = self._dismiss_cafe_popup(timeout=1.5)
+        if popup_text and self._is_already_reported_alert(popup_text):
+            self.log("이미 신고된 게시물 — 확인 후 다음 진행")
+            return "already"
+
+        if not self._select_cafe_illegal_reason_in_context():
+            return "failed"
+        self._human_delay(0.5, 1.0)
+        if not self._submit_cafe_report_in_context():
+            return "failed"
+        self._human_delay(1.0, 2.0)
+        popup_text = self._dismiss_cafe_popup(timeout=4)
+        if popup_text:
+            if self._is_already_reported_alert(popup_text):
+                self.log("이미 신고됨 — 확인 후 다음 진행")
+                return "already"
+            if any(k in popup_text for k in ("불가", "제한")):
+                self.log(f"신고 불가: {popup_text}")
+                return "failed"
+        self.log("카페 신고 접수")
+        return "ok"
+
+    def _try_cafe_report_inline_layers(self) -> str:
+        """새 창이 없을 때 iframe/레이어에서 신고 완료 시도."""
+        self.driver.switch_to.default_content()
+        frames_to_try: list = [None]
+        try:
+            frames_to_try.extend(self.driver.find_elements(By.CSS_SELECTOR, "iframe"))
+        except Exception:
+            pass
+        for frame in frames_to_try:
+            try:
+                self.driver.switch_to.default_content()
+                if frame is not None:
+                    self.driver.switch_to.frame(frame)
+                result = self._finish_cafe_report_in_active_window()
+                if result in ("ok", "already"):
+                    return result
+            except Exception:
+                continue
+        self.driver.switch_to.default_content()
+        return "failed"
+
+    def _report_cafe_in_current_context(self) -> str:
+        before_handles = set(self.driver.window_handles)
+        main_handle = self.driver.current_window_handle
+
+        if not self._click_cafe_report_button():
+            return "failed"
+
+        popup_text = self._dismiss_cafe_popup(timeout=2)
+        if popup_text and self._is_already_reported_alert(popup_text):
+            self.log("이미 신고된 게시물 — 확인 후 다음 진행")
+            return "already"
+
+        popup_handle = self._wait_for_new_window(before_handles)
+        if popup_handle:
+            try:
+                self.driver.switch_to.window(popup_handle)
+                self.log("신고 새 창으로 전환")
+                self._human_delay(1.0, 2.0)
+                popup_text = self._dismiss_cafe_popup(timeout=2)
+                if popup_text and self._is_already_reported_alert(popup_text):
+                    self.log("이미 신고됨 — 확인 후 다음 진행")
+                    self._close_extra_windows(main_handle)
+                    return "already"
+                result = self._finish_cafe_report_in_active_window()
+            except Exception as e:
+                self.log(f"신고 새 창 처리 오류: {e}")
+                result = "failed"
+            self._close_extra_windows(main_handle)
+            if result == "ok":
+                return "ok"
+            if result == "already":
+                return "already"
+            self.log("새 창 신고 실패 — 레이어 방식 재시도")
+
+        try:
+            self.driver.switch_to.window(main_handle)
+        except Exception:
+            pass
+        inline = self._try_cafe_report_inline_layers()
+        if inline == "ok":
+            return "ok"
+        if inline == "already":
+            return "already"
+        return "failed"
+
+    def report_cafe_article(self, url: str) -> str:
+        try:
+            self.log(f"게시물 접속: {self._truncate_url(url)}")
+            self.driver.get(url)
+            self._human_delay(2.5, 4.0)
+            self.driver.switch_to.default_content()
+
+            # 게시물 본문은 cafe_main iframe 안에 있는 경우가 많음
+            article_frame = None
+            for iframe_sel in ("iframe#cafe_main", "iframe.name_cafe_main"):
+                try:
+                    article_frame = self.driver.find_element(By.CSS_SELECTOR, iframe_sel)
+                    break
+                except NoSuchElementException:
+                    continue
+
+            if article_frame:
+                self.driver.switch_to.frame(article_frame)
+                result = self._report_cafe_in_current_context()
+                self.driver.switch_to.default_content()
+                if result in ("ok", "already"):
+                    return result
+            else:
+                result = self._report_cafe_in_current_context()
+                if result in ("ok", "already"):
+                    return result
+
+            self.driver.switch_to.default_content()
+            result = self._report_cafe_in_current_context()
+            if result in ("ok", "already"):
+                return result
+
+            self.log("카페 신고 UI를 찾지 못했습니다")
+            return "failed"
+        except Exception as e:
+            self.log(f"카페 게시물 신고 오류: {e}")
+            return "failed"
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+
+    def _cafe_result(
+        self,
+        account_id: str,
+        account_pw: str,
+        keyword: str,
+        url: str,
+        success: bool,
+        status: str,
+    ) -> dict:
+        return {
+            "account_id": account_id,
+            "account_password": account_pw,
+            "keyword": keyword,
+            "url": url,
+            "success": success,
+            "status": status,
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def collect_all_cafe_targets(
+        self, keywords: list[str], max_pages: int = 3,
+    ) -> list[dict]:
+        """모든 키워드 × 최대 N페이지에서 카페 URL·제목 일괄 수집 (검색 순서)."""
+        seen_keys: set[str] = set()
+        targets: list[dict] = []
+        for kw in keywords:
+            if self._should_stop():
+                break
+            for item in self.collect_cafe_article_targets(kw, max_pages=max_pages):
+                dedup = self._cafe_article_dedup_key(item["url"])
+                if not dedup or dedup in seen_keys:
+                    continue
+                seen_keys.add(dedup)
+                targets.append({
+                    "keyword": kw,
+                    "url": item["url"],
+                    "title": item.get("title", ""),
+                })
+        return targets
+
+    def report_cafe_urls_for_account(
+        self,
+        naver_id: str,
+        naver_pw: str,
+        targets: list[dict],
+        skip_pairs: set[tuple[str, str]],
+    ) -> list[dict]:
+        """한 계정으로 수집된 URL 목록 전체 순차 신고."""
+        results: list[dict] = []
+        if not targets:
+            return results
+
+        first_kw = targets[0].get("keyword", "")
+        redirect = f"{self.CAFE_SEARCH_URL}{quote(first_kw)}"
+        ok, reason = self.login(naver_id, naver_pw, redirect_url=redirect)
+        if not ok:
+            status = "protected" if reason == "protected" else "login_failed"
+            item = self._cafe_result(naver_id, naver_pw, "", "", False, status)
+            results.append(item)
+            if self.result_callback:
+                self.result_callback(item)
+            if self.progress_callback:
+                self.progress_callback(1)
+            return results
+
+        self.log(f"[{naver_id}] 수집 URL {len(targets)}건 순차 신고")
+        for idx, target in enumerate(targets):
+            if self._should_stop():
+                break
+            kw = target.get("keyword", "")
+            url = target.get("url", "")
+            title = target.get("title", "")
+            if (naver_id, url) in skip_pairs:
+                self.log(f"[{naver_id}] 스킵(이미 신고): {title or self._truncate_url(url)}")
+                continue
+            label = title or self._truncate_url(url)
+            self.log(f"[{naver_id}] {idx + 1}/{len(targets)} 신고 시도 — {label}")
+            result = self.report_cafe_article(url)
+            if result == "ok":
+                success, status = True, "ok"
+            elif result == "already":
+                success, status = False, "already_reported"
+            else:
+                success, status = False, "failed"
+            item = self._cafe_result(naver_id, naver_pw, kw, url, success, status)
+            results.append(item)
+            if self.result_callback:
+                self.result_callback(item)
+            if self.progress_callback:
+                self.progress_callback(1)
+            self._human_delay(2.0, 4.0)
+        return results
+
+    def report_cafe_batch(
+        self,
+        accounts: list[dict],
+        keywords: list[str],
+        skip_pairs: set[tuple[str, str]],
+        targets_callback=None,
+    ) -> list[dict]:
+        """1) 통합검색 URL 수집 → 2) 계정별 전체 URL 신고."""
+        all_results: list[dict] = []
+        try:
+            self.log("=== 카페 URL 수집 (통합검색 최대 3페이지) ===")
+            self.start_driver()
+            targets = self.collect_all_cafe_targets(keywords, max_pages=3)
+            self.quit_driver()
+            self.log(f"수집 완료: 카페 URL {len(targets)}건")
+            if targets_callback:
+                targets_callback(targets)
+            if not targets:
+                self.log("수집된 카페 URL이 없습니다.")
+                return all_results
+
+            for i, target in enumerate(targets, 1):
+                title = target.get("title") or target.get("keyword", "")
+                self.log(f"  [{i}] {title} → {self._truncate_url(target['url'])}")
+
+            for account in accounts:
+                if self._should_stop():
+                    break
+                account_id = account.get("id", "")
+                account_pw = account.get("password", "")
+                self.log(f"[카페] 계정 시작: {account_id}")
+                self.start_driver()
+                batch = self.report_cafe_urls_for_account(
+                    account_id, account_pw, targets, skip_pairs,
+                )
+                all_results.extend(batch)
+                self.quit_driver()
+                self._human_delay(2.0, 4.0)
+                self.log(f"[카페] 계정 완료: {account_id}")
+        finally:
+            self.quit_driver()
+        return all_results

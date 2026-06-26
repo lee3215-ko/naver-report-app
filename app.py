@@ -36,6 +36,9 @@ SETTINGS_FILE = data_path("settings.json")
 RESULTS_FILE = data_path("results.json")
 TASKS_FILE = data_path("tasks.json")
 TEMPLATES_FILE = data_path("templates.json")
+CAFE_KEYWORDS_FILE = data_path("cafe_keywords.json")
+CAFE_RESULTS_FILE = data_path("cafe_results.json")
+CAFE_COLLECTED_FILE = data_path("cafe_collected.json")
 
 DEFAULT_TEMPLATES = [
     {
@@ -536,6 +539,7 @@ class ReportApp:
         configure_treeview("Preview.Treeview")
         configure_treeview("Account.Treeview")
         configure_treeview("Template.Treeview")
+        configure_treeview("Cafe.Treeview")
 
         self.hidden_results = {}
         self.tasks = []
@@ -553,20 +557,22 @@ class ReportApp:
         self.pages_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
 
         self.pages = {}
-        for name in ["Home", "신고 원본", "리라이트 결과", "Settings", "실행 로그"]:
+        for name in ["웹사이트신고", "카페신고", "카페수집리스트", "신고 원본", "리라이트 결과", "Settings", "실행 로그"]:
             page = ui_frame(self.pages_container, COLORS["bg"])
             page.pack(fill=tk.BOTH, expand=True)
             self.pages[name] = page
 
         self.load_templates()
-        self.build_home_tab(self.pages["Home"])
+        self.build_home_tab(self.pages["웹사이트신고"])
+        self.build_cafe_tab(self.pages["카페신고"])
+        self.build_cafe_collected_tab(self.pages["카페수집리스트"])
         self.build_templates_tab(self.pages["신고 원본"])
         self.build_results_tab(self.pages["리라이트 결과"])
         self.build_settings_tab(self.pages["Settings"])
         self.build_log_tab(self.pages["실행 로그"])
 
         for name, page in self.pages.items():
-            if name != "Home":
+            if name != "웹사이트신고":
                 page.pack_forget()
 
         self.tabs = self.sidebar  # compat: preview_all / start_report call self.tabs.select()
@@ -576,10 +582,14 @@ class ReportApp:
         self.load_accounts()
         self.load_results()
         self.load_tasks()
+        self.load_cafe_keywords()
+        self.load_cafe_results()
+        self.load_cafe_collected()
         self._report_running = False
+        self._cafe_running = False
         self._report_stop_requested = False
         self._active_reporter = None
-        self.page_header.set("Home")
+        self.page_header.set("웹사이트신고")
 
     def on_tab_change(self, name):
         for n, page in self.pages.items():
@@ -593,6 +603,11 @@ class ReportApp:
             self.refresh_site_stats_panel()
         if name == "신고 원본":
             self.refresh_template_list()
+        if name == "카페신고":
+            self.refresh_cafe_keyword_list()
+            self.refresh_cafe_results_tree()
+        if name == "카페수집리스트":
+            self.refresh_cafe_collected_tree()
 
     def _frame(self, parent, bg=None):
         return ui_frame(parent, bg or COLORS["bg"])
@@ -693,6 +708,164 @@ class ReportApp:
                         troughcolor=COLORS["border"], background=COLORS["accent"], thickness=8)
         self.progress = ttk.Progressbar(prog_frame, mode="determinate", maximum=100, style="Modern.Horizontal.TProgressbar")
         self.progress.pack(fill=tk.X)
+
+    # ===================== Cafe Report Tab =====================
+    def build_cafe_tab(self, parent):
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        top_card = self._card(parent)
+        top_card.grid(row=0, column=0, sticky="nsew", pady=(0, 12))
+        top_card.grid_rowconfigure(2, weight=1)
+        top_card.grid_columnconfigure(0, weight=1)
+
+        self._section_label(top_card, "검색 키워드", row=0, pady=(16, 8))
+        hint = self._frame(top_card, COLORS["card"])
+        hint.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
+        ui_label(
+            hint,
+            "키워드로 통합검색(최대 3페이지) → cafe URL 전체 수집 후, "
+            "검색 상위 노출 순서대로 계정마다 순차 신고합니다.",
+            "small",
+            COLORS["text_muted"],
+        ).pack(anchor="w")
+
+        kw_container = self._frame(top_card, COLORS["card"])
+        kw_container.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 12))
+        kw_container.grid_rowconfigure(0, weight=1)
+        kw_container.grid_columnconfigure(0, weight=1)
+
+        self.cafe_keyword_tree = ttk.Treeview(
+            kw_container, columns=("keyword",), show="headings", style="Cafe.Treeview", height=5,
+        )
+        self.cafe_keyword_tree.heading("keyword", text="키워드")
+        self.cafe_keyword_tree.column("keyword", width=400, anchor="w")
+        self.cafe_keyword_tree.grid(row=0, column=0, sticky="nsew")
+        kw_sb = ttk.Scrollbar(kw_container, orient=tk.VERTICAL, command=self.cafe_keyword_tree.yview)
+        kw_sb.grid(row=0, column=1, sticky="ns")
+        self.cafe_keyword_tree.configure(yscrollcommand=kw_sb.set)
+
+        kw_btn = self._frame(top_card, COLORS["card"])
+        kw_btn.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+        ui_button(kw_btn, "+ 키워드 추가", "primary", height=40, command=self.add_cafe_keyword).pack(side=tk.LEFT, padx=(0, 8))
+        ui_button(kw_btn, "선택 삭제", "danger", height=40, command=self.delete_cafe_keyword).pack(side=tk.LEFT)
+
+        bottom_card = self._card(parent)
+        bottom_card.grid(row=1, column=0, sticky="nsew")
+        bottom_card.grid_rowconfigure(1, weight=1)
+        bottom_card.grid_columnconfigure(0, weight=1)
+
+        self._section_label(bottom_card, "카페 신고 결과", row=0, pady=(16, 10))
+
+        res_container = self._frame(bottom_card, COLORS["card"])
+        res_container.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 12))
+        res_container.grid_rowconfigure(0, weight=1)
+        res_container.grid_columnconfigure(0, weight=1)
+
+        self.cafe_result_tree = ttk.Treeview(
+            res_container,
+            columns=("account", "keyword", "url", "status", "datetime"),
+            show="headings",
+            style="Cafe.Treeview",
+            height=8,
+        )
+        for col, title, width in [
+            ("account", "계정", 100),
+            ("keyword", "키워드", 120),
+            ("url", "게시물 URL", 320),
+            ("status", "상태", 90),
+            ("datetime", "일시", 130),
+        ]:
+            self.cafe_result_tree.heading(col, text=title)
+            self.cafe_result_tree.column(col, width=width, anchor="w")
+        self.cafe_result_tree.grid(row=0, column=0, sticky="nsew")
+        res_sb = ttk.Scrollbar(res_container, orient=tk.VERTICAL, command=self.cafe_result_tree.yview)
+        res_sb.grid(row=0, column=1, sticky="ns")
+        self.cafe_result_tree.configure(yscrollcommand=res_sb.set)
+
+        cafe_btn_frame = self._frame(bottom_card, COLORS["card"])
+        cafe_btn_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
+        if ctk:
+            ctk.CTkCheckBox(
+                cafe_btn_frame, text="해그리드 모드 (브라우저 숨김)",
+                variable=self.hagrid_mode_var, font=FONTS["body"],
+                text_color=COLORS["text"],
+            ).pack(side=tk.LEFT, padx=(0, 12))
+        else:
+            tk.Checkbutton(
+                cafe_btn_frame, text="해그리드 모드 (브라우저 숨김)",
+                variable=self.hagrid_mode_var, font=FONTS["body"],
+                bg=COLORS["card"], fg=COLORS["text"],
+            ).pack(side=tk.LEFT, padx=(0, 12))
+        self.cafe_report_btn = ui_button(
+            cafe_btn_frame, "카페 신고 시작", "success", height=44, command=self.start_cafe_report,
+        )
+        self.cafe_report_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.cafe_stop_btn = ui_button(
+            cafe_btn_frame, "신고 정지", "danger", height=44, command=self.stop_report,
+        )
+        self.cafe_stop_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.cafe_stop_btn.configure(state=tk.DISABLED)
+
+        cafe_prog = self._frame(bottom_card, COLORS["card"])
+        cafe_prog.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+        self.cafe_progress = ttk.Progressbar(
+            cafe_prog, mode="determinate", maximum=100, style="Modern.Horizontal.TProgressbar",
+        )
+        self.cafe_progress.pack(fill=tk.X)
+
+    def build_cafe_collected_tab(self, parent):
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        card = self._card(parent)
+        card.grid(row=0, column=0, sticky="nsew")
+        card.grid_rowconfigure(2, weight=1)
+        card.grid_columnconfigure(0, weight=1)
+
+        self._section_label(card, "카페 수집 목록", row=0, pady=(16, 8))
+        hint = self._frame(card, COLORS["card"])
+        hint.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
+        ui_label(
+            hint,
+            "카페 신고 실행 시 통합검색에서 수집된 게시물입니다. "
+            "검색 결과에 표시된 제목 순서대로 신고합니다.",
+            "small",
+            COLORS["text_muted"],
+        ).pack(anchor="w")
+
+        container = self._frame(card, COLORS["card"])
+        container.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 12))
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        self.cafe_collected_tree = ttk.Treeview(
+            container,
+            columns=("datetime", "keyword", "title", "url", "rank"),
+            show="headings",
+            style="Cafe.Treeview",
+            height=16,
+        )
+        for col, title, width in [
+            ("datetime", "수집일시", 130),
+            ("keyword", "키워드", 110),
+            ("title", "게시물 제목", 280),
+            ("url", "URL", 280),
+            ("rank", "순위", 50),
+        ]:
+            self.cafe_collected_tree.heading(col, text=title)
+            self.cafe_collected_tree.column(col, width=width, anchor="w")
+        self.cafe_collected_tree.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(container, orient=tk.VERTICAL, command=self.cafe_collected_tree.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.cafe_collected_tree.configure(yscrollcommand=sb.set)
+
+        btn_frame = self._frame(card, COLORS["card"])
+        btn_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+        ui_button(
+            btn_frame, "목록 비우기", "danger", height=40, command=self.clear_cafe_collected,
+        ).pack(side=tk.RIGHT)
 
     # ===================== Templates Tab =====================
     def build_templates_tab(self, parent):
@@ -1156,6 +1329,157 @@ class ReportApp:
         with open(TASKS_FILE, "w", encoding="utf-8") as f:
             json.dump(self.tasks, f, ensure_ascii=False, indent=2)
 
+    def load_cafe_keywords(self):
+        self.cafe_keywords = []
+        if os.path.exists(CAFE_KEYWORDS_FILE):
+            try:
+                with open(CAFE_KEYWORDS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self.cafe_keywords = [str(k).strip() for k in data if str(k).strip()]
+            except Exception:
+                self.cafe_keywords = []
+        self.refresh_cafe_keyword_list()
+
+    def save_cafe_keywords(self):
+        with open(CAFE_KEYWORDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.cafe_keywords, f, ensure_ascii=False, indent=2)
+
+    def load_cafe_results(self):
+        self.cafe_results = []
+        if os.path.exists(CAFE_RESULTS_FILE):
+            try:
+                with open(CAFE_RESULTS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self.cafe_results = data
+            except Exception:
+                self.cafe_results = []
+
+    def save_cafe_results(self):
+        with open(CAFE_RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.cafe_results, f, ensure_ascii=False, indent=2)
+
+    def load_cafe_collected(self):
+        self.cafe_collected = []
+        if os.path.isfile(CAFE_COLLECTED_FILE):
+            try:
+                with open(CAFE_COLLECTED_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self.cafe_collected = data
+            except (json.JSONDecodeError, OSError):
+                self.cafe_collected = []
+
+    def save_cafe_collected(self):
+        with open(CAFE_COLLECTED_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.cafe_collected, f, ensure_ascii=False, indent=2)
+
+    def refresh_cafe_collected_tree(self):
+        if not hasattr(self, "cafe_collected_tree"):
+            return
+        for item in self.cafe_collected_tree.get_children():
+            self.cafe_collected_tree.delete(item)
+        for row in reversed(self.cafe_collected):
+            self.cafe_collected_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.get("datetime", ""),
+                    row.get("keyword", ""),
+                    row.get("title", ""),
+                    self._truncate(row.get("url", ""), 80),
+                    row.get("rank", ""),
+                ),
+            )
+
+    def clear_cafe_collected(self):
+        if not self.cafe_collected:
+            return
+        if not messagebox.askyesno("목록 비우기", "수집 목록을 모두 삭제하시겠습니까?"):
+            return
+        self.cafe_collected = []
+        self.save_cafe_collected()
+        self.refresh_cafe_collected_tree()
+
+    def refresh_cafe_keyword_list(self):
+        if not hasattr(self, "cafe_keyword_tree"):
+            return
+        for item in self.cafe_keyword_tree.get_children():
+            self.cafe_keyword_tree.delete(item)
+        for kw in self.cafe_keywords:
+            self.cafe_keyword_tree.insert("", tk.END, values=(kw,))
+
+    def refresh_cafe_results_tree(self):
+        if not hasattr(self, "cafe_result_tree"):
+            return
+        for item in self.cafe_result_tree.get_children():
+            self.cafe_result_tree.delete(item)
+        status_labels = {
+            "ok": "완료",
+            "already_reported": "이미신고",
+            "protected": "보호조치",
+            "login_failed": "로그인실패",
+            "no_reportable": "대상없음",
+            "stopped": "중단",
+            "failed": "실패",
+        }
+        for row in reversed(self.cafe_results):
+            st = row.get("status", "")
+            label = status_labels.get(st, st or "-")
+            self.cafe_result_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.get("account_id", ""),
+                    row.get("keyword", ""),
+                    self._truncate(row.get("url", ""), 80),
+                    label,
+                    row.get("datetime", ""),
+                ),
+            )
+
+    def add_cafe_keyword(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("검색 키워드 추가")
+        dialog.geometry("420x120")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ui_label(dialog, "통합검색 키워드", "body_bold", COLORS["text"]).pack(padx=16, pady=(16, 8), anchor="w")
+        kw_var = tk.StringVar()
+        if ctk:
+            entry = ctk.CTkEntry(dialog, textvariable=kw_var, width=380, height=36)
+        else:
+            entry = tk.Entry(dialog, textvariable=kw_var, width=50)
+        entry.pack(padx=16, pady=(0, 12))
+        entry.focus_set()
+
+        def ok():
+            kw = kw_var.get().strip()
+            if not kw:
+                messagebox.showwarning("입력 필요", "키워드를 입력해주세요.", parent=dialog)
+                return
+            if kw not in self.cafe_keywords:
+                self.cafe_keywords.append(kw)
+                self.save_cafe_keywords()
+                self.refresh_cafe_keyword_list()
+            dialog.destroy()
+
+        ui_button(dialog, "추가", "primary", height=36, command=ok).pack(padx=16, pady=(0, 12))
+
+    def delete_cafe_keyword(self):
+        selected = self.cafe_keyword_tree.selection()
+        if not selected:
+            messagebox.showinfo("선택 필요", "삭제할 키워드를 선택해주세요.")
+            return
+        for item in selected:
+            vals = self.cafe_keyword_tree.item(item, "values")
+            if vals:
+                kw = vals[0]
+                self.cafe_keywords = [k for k in self.cafe_keywords if k != kw]
+        self.save_cafe_keywords()
+        self.refresh_cafe_keyword_list()
+
     def load_templates(self):
         if os.path.exists(TEMPLATES_FILE):
             try:
@@ -1532,7 +1856,7 @@ class ReportApp:
                 return acc.get("password", "")
         return ""
 
-    def _disable_buttons(self, for_report: bool = False):
+    def _disable_buttons(self, for_report: bool = False, for_cafe: bool = False):
         try:
             self.preview_btn.configure(state=tk.DISABLED)
         except Exception:
@@ -1541,9 +1865,17 @@ class ReportApp:
             self.report_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
-        if for_report:
+        try:
+            self.cafe_report_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        if for_report or for_cafe:
             try:
                 self.stop_report_btn.configure(state=tk.NORMAL)
+            except Exception:
+                pass
+            try:
+                self.cafe_stop_btn.configure(state=tk.NORMAL)
             except Exception:
                 pass
 
@@ -1557,17 +1889,26 @@ class ReportApp:
         except Exception:
             pass
         try:
+            self.cafe_report_btn.configure(state=tk.NORMAL)
+        except Exception:
+            pass
+        try:
             self.stop_report_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        try:
+            self.cafe_stop_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
 
     def stop_report(self):
-        if not self._report_running:
+        if not self._report_running and not self._cafe_running:
             return
         self._report_stop_requested = True
         self.log("[정지] 신고 작업을 중단합니다...")
         try:
             self.stop_report_btn.configure(state=tk.DISABLED)
+            self.cafe_stop_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
         if self._active_reporter:
@@ -1598,6 +1939,118 @@ class ReportApp:
             self.root.after(0, self.refresh_results_tree)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def start_cafe_report(self):
+        if not self.accounts:
+            messagebox.showwarning("계정 필요", "네이버 계정을 하나 이상 등록해주세요.")
+            self.tabs.select("Settings")
+            return
+        if not self.cafe_keywords:
+            messagebox.showwarning("키워드 필요", "검색 키워드를 하나 이상 등록해주세요.")
+            return
+
+        total = len(self.accounts)
+        self.log("=" * 55)
+        self.log(
+            f"카페 신고 시작 | 키워드:{len(self.cafe_keywords)}개, 계정:{total}개 "
+            f"(URL 수집 후 계정별 전체 신고)"
+        )
+        self._cafe_running = True
+        self._report_stop_requested = False
+        self._active_reporter = None
+        self._disable_buttons(for_cafe=True)
+        self.cafe_progress["value"] = 0
+
+        skip_pairs = {
+            (r.get("account_id"), r.get("url"))
+            for r in self.cafe_results
+            if r.get("url") and r.get("account_id")
+            and r.get("status") in ("ok", "already_reported")
+        }
+
+        def on_log(message):
+            self.root.after(0, lambda: self.log(message))
+
+        def on_result(item):
+            self.cafe_results.append(item)
+            self.root.after(0, self.save_cafe_results)
+            self.root.after(0, self.refresh_cafe_results_tree)
+
+        current = [0]
+        total_work = [max(total, 1)]
+
+        def on_targets_ready(targets):
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            batch = []
+            for i, t in enumerate(targets, 1):
+                batch.append({
+                    "datetime": now,
+                    "keyword": t.get("keyword", ""),
+                    "title": t.get("title", ""),
+                    "url": t.get("url", ""),
+                    "rank": i,
+                })
+            self.cafe_collected.extend(batch)
+            self.root.after(0, self.save_cafe_collected)
+            self.root.after(0, self.refresh_cafe_collected_tree)
+            total_work[0] = max(len(targets) * total, 1)
+            on_log(f"진행 예정: URL {len(targets)}건 × 계정 {total}개 = {total_work[0]}회 시도")
+
+        def on_progress(delta):
+            current[0] += delta
+            self.root.after(
+                0,
+                lambda c=current[0]: self.cafe_progress.configure(
+                    value=min(c / total_work[0] * 100, 100)
+                ),
+            )
+
+        api_key = self.api_key_var.get().strip()
+
+        def run():
+            stopped = False
+            reporter = NaverReporter(
+                api_key=api_key or "cafe-only",
+                model=self.model_var.get(),
+                headless=bool(self.hagrid_mode_var.get()),
+                log_callback=on_log,
+                result_callback=on_result,
+                progress_callback=on_progress,
+            )
+            self._active_reporter = reporter
+            try:
+                reporter.report_cafe_batch(
+                    self.accounts,
+                    self.cafe_keywords,
+                    skip_pairs,
+                    targets_callback=lambda t: self.root.after(0, lambda targets=t: on_targets_ready(targets)),
+                )
+                if reporter.cancel_requested or self._report_stop_requested:
+                    stopped = True
+            except Exception as e:
+                on_log(f"[카페] 처리 오류: {e}")
+            finally:
+                self._active_reporter = None
+            self.root.after(0, lambda: self.cafe_report_finished(stopped=stopped))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def cafe_report_finished(self, stopped: bool = False):
+        self._cafe_running = False
+        self._report_stop_requested = False
+        self._active_reporter = None
+        self._enable_buttons()
+        if not stopped:
+            self.cafe_progress.configure(value=100)
+        self.log("=" * 55)
+        if stopped:
+            self.log("카페 신고 작업이 중단되었습니다.")
+        else:
+            ok_count = sum(1 for r in self.cafe_results if r.get("success"))
+            self.log(f"카페 신고 완료 — 성공 {ok_count}건")
+        self.save_cafe_results()
+        self.refresh_cafe_results_tree()
+        self.tabs.select("카페신고")
 
     def generate_variants(self, site_url, report_type, templates, api_key, model):
         return self.generate_variants_with_account(site_url, report_type, templates, api_key, model, "default")
