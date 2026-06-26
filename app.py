@@ -587,6 +587,7 @@ class ReportApp:
         self.page_header.set(name)
         if name == "리라이트 결과":
             self.refresh_results_tree()
+            self.refresh_site_stats_panel()
         if name == "신고 원본":
             self.refresh_template_list()
 
@@ -798,11 +799,11 @@ class ReportApp:
 
     # ===================== Results Tab =====================
     def build_results_tab(self, parent):
-        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
         parent.grid_columnconfigure(0, weight=1)
 
         search_card = self._card(parent)
-        search_card.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        search_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         search_inner = self._frame(search_card, COLORS["card"])
         search_inner.pack(fill=tk.X, padx=20, pady=16)
         search_inner.grid_columnconfigure(1, weight=1)
@@ -825,8 +826,35 @@ class ReportApp:
         ui_button(search_inner, "검색", "primary", width=90, height=40, command=self.filter_results).grid(row=0, column=2, padx=(0, 8))
         ui_button(search_inner, "초기화", "ghost", width=90, height=40, command=self.clear_filter).grid(row=0, column=3)
 
+        stats_card = self._card(parent)
+        stats_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        stats_inner = self._frame(stats_card, COLORS["card"])
+        stats_inner.pack(fill=tk.X, padx=20, pady=14)
+        ui_label(stats_inner, "사이트별 신고 집계", "body_bold", COLORS["text"]).pack(anchor="w")
+        ui_label(
+            stats_inner,
+            "보호조치 계정은 신고 횟수에서 제외됩니다.",
+            "caption",
+            COLORS["text_light"],
+        ).pack(anchor="w", pady=(2, 8))
+        if ctk:
+            self.site_stats_text = ctk.CTkTextbox(
+                stats_inner, wrap=tk.WORD, font=FONTS["mono"], height=88,
+                fg_color=COLORS["accent_light"], text_color=COLORS["text"],
+                border_color=COLORS["card_border"], border_width=1, corner_radius=10,
+                activate_scrollbars=True, state="disabled",
+            )
+        else:
+            self.site_stats_text = tk.Text(
+                stats_inner, wrap=tk.WORD, font=FONTS["mono"], height=5,
+                bg=COLORS["accent_light"], fg=COLORS["text"],
+                highlightbackground=COLORS["card_border"], highlightthickness=1,
+                padx=10, pady=8, relief=tk.FLAT, state=tk.DISABLED,
+            )
+        self.site_stats_text.pack(fill=tk.X)
+
         card = self._card(parent)
-        card.grid(row=1, column=0, sticky="nsew")
+        card.grid(row=2, column=0, sticky="nsew")
         card.grid_rowconfigure(1, weight=1)
         card.grid_columnconfigure(0, weight=1)
 
@@ -839,20 +867,25 @@ class ReportApp:
         frame.grid_rowconfigure(0, weight=1)
         frame.grid_columnconfigure(0, weight=1)
 
-        tree = ttk.Treeview(frame, columns=("datetime", "account", "site", "report_type", "original", "rewritten"),
-                            show="headings", style="Preview.Treeview")
+        tree = ttk.Treeview(
+            frame,
+            columns=("datetime", "account", "site", "report_type", "site_count", "original", "rewritten"),
+            show="headings", style="Preview.Treeview",
+        )
         tree.heading("datetime", text="생성 시간")
         tree.heading("account", text="사용 계정")
         tree.heading("site", text="사이트")
         tree.heading("report_type", text="유형")
+        tree.heading("site_count", text="사이트 신고")
         tree.heading("original", text="원본 신고 내용")
         tree.heading("rewritten", text="리라이트 된 내용")
-        tree.column("datetime", width=120, anchor="center")
-        tree.column("account", width=110, anchor="center")
-        tree.column("site", width=180, anchor="w")
-        tree.column("report_type", width=80, anchor="center")
-        tree.column("original", width=320, anchor="w")
-        tree.column("rewritten", width=320, anchor="w")
+        tree.column("datetime", width=110, anchor="center")
+        tree.column("account", width=100, anchor="center")
+        tree.column("site", width=160, anchor="w")
+        tree.column("report_type", width=70, anchor="center")
+        tree.column("site_count", width=80, anchor="center")
+        tree.column("original", width=260, anchor="w")
+        tree.column("rewritten", width=260, anchor="w")
         tree.grid(row=0, column=0, sticky="nsew")
 
         sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
@@ -972,14 +1005,23 @@ class ReportApp:
         bulk_frame = self._frame(account_card, COLORS["card"])
         bulk_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10))
         bulk_frame.grid_columnconfigure(0, weight=1)
+        bulk_frame.grid_columnconfigure(1, weight=1)
         ui_label(
             bulk_frame,
-            "계정 일괄 등록 (한 줄에 아이디·비밀번호 — 공백/탭/콜론(:) 구분)",
+            "계정 일괄 등록 — 줄 순서대로 아이디·비밀번호가 짝을 이룹니다",
             "body_bold",
             COLORS["text_muted"],
-        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self.bulk_account_text = self._text_area(bulk_frame, height=88)
-        self.bulk_account_text.grid(row=1, column=0, sticky="ew")
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        ui_label(bulk_frame, "아이디 (한 줄에 하나)", "caption", COLORS["text_light"]).grid(
+            row=1, column=0, sticky="w", padx=(0, 8))
+        ui_label(bulk_frame, "비밀번호 (한 줄에 하나)", "caption", COLORS["text_light"]).grid(
+            row=1, column=1, sticky="w")
+
+        self.bulk_id_text = self._text_area(bulk_frame, height=100)
+        self.bulk_id_text.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(4, 0))
+        self.bulk_pw_text = self._text_area(bulk_frame, height=100)
+        self.bulk_pw_text.grid(row=2, column=1, sticky="nsew", pady=(4, 0))
 
         add_frame = self._frame(account_card, COLORS["card"])
         add_frame.grid(row=3, column=0, sticky="ew", padx=15, pady=(0, 12))
@@ -1312,30 +1354,34 @@ class ReportApp:
         return [cleaned] if cleaned.strip() else []
 
     # Accounts
-    def parse_account_lines(self, text):
-        parsed = []
+    def _parse_line_list(self, text):
+        lines = []
         for line in text.splitlines():
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "\t" in line:
-                parts = line.split("\t", 1)
-            elif ":" in line and line.count(":") == 1:
-                parts = line.split(":", 1)
-            else:
-                parts = line.split(None, 1)
-            if len(parts) < 2:
-                continue
-            naver_id, naver_pw = parts[0].strip(), parts[1].strip()
-            if naver_id and naver_pw:
-                parsed.append((naver_id, naver_pw))
-        return parsed
+            if line and not line.startswith("#"):
+                lines.append(line)
+        return lines
+
+    def pair_accounts_by_order(self, id_text, pw_text):
+        ids = self._parse_line_list(id_text)
+        pws = self._parse_line_list(pw_text)
+        if not ids:
+            return None, "아이디를 입력해주세요."
+        if not pws:
+            return None, "비밀번호를 입력해주세요."
+        if len(ids) != len(pws):
+            return None, (
+                f"아이디와 비밀번호 줄 수가 같아야 합니다.\n"
+                f"(아이디 {len(ids)}줄, 비밀번호 {len(pws)}줄)"
+            )
+        return list(zip(ids, pws)), None
 
     def add_accounts_bulk(self):
-        raw = self._textbox_get(self.bulk_account_text)
-        entries = self.parse_account_lines(raw)
-        if not entries:
-            messagebox.showwarning("입력 오류", "등록할 계정을 입력해주세요.\n(한 줄: 아이디 비밀번호)")
+        id_raw = self._textbox_get(self.bulk_id_text)
+        pw_raw = self._textbox_get(self.bulk_pw_text)
+        entries, err = self.pair_accounts_by_order(id_raw, pw_raw)
+        if err:
+            messagebox.showwarning("입력 오류", err)
             return
 
         added, skipped = 0, 0
@@ -1352,7 +1398,8 @@ class ReportApp:
 
         self.save_accounts()
         self.refresh_account_list()
-        self._set_textbox_content(self.bulk_account_text, "")
+        self._set_textbox_content(self.bulk_id_text, "")
+        self._set_textbox_content(self.bulk_pw_text, "")
         self.log(f"계정 일괄 등록: {added}개 추가, {skipped}개 중복 스킵")
         messagebox.showinfo("완료", f"{added}개 계정이 등록되었습니다.")
 
@@ -1438,12 +1485,13 @@ class ReportApp:
         tags = (site, report_type, original, rewritten)
         if status == "protected":
             tags = ("protected", site, report_type, original, rewritten)
+        stats = self.compute_site_report_stats()
+        site_count = self._format_site_count_cell(site, status or "", stats)
         self.results_tree.insert("", tk.END, values=(
-            dt, account_id, site, report_type,
+            dt, account_id, site, report_type, site_count,
             self._truncate(original, 45), self._truncate(display_rewritten, 45)),
             tags=tags)
-
-    def open_preview_detail(self):
+        self.refresh_site_stats_panel()
         selected = self.results_tree.selection()
         if not selected:
             return
@@ -1603,6 +1651,18 @@ class ReportApp:
         self.progress.configure(value=100)
         self.log("=" * 55)
         self.log("신고 내용 생성 완료")
+        stats = self.compute_site_report_stats()
+        protected_accounts = set()
+        for info in stats.values():
+            protected_accounts.update(info["protected_accounts"])
+        if protected_accounts:
+            self.log(f"보호조치 제외 계정 (신고 횟수 미포함): {', '.join(sorted(protected_accounts))}")
+        for site, info in sorted(stats.items(), key=lambda x: -x[1]["valid"]):
+            if info["valid"] or info["protected"]:
+                msg = f"[집계] {self._truncate(site, 60)} — 신고 {info['valid']}회"
+                if info["protected"]:
+                    msg += f", 보호조치 {info['protected']}건 제외"
+                self.log(msg)
         self.save_results()
         self.refresh_results_tree()
         self.tabs.select("리라이트 결과")
@@ -1612,7 +1672,70 @@ class ReportApp:
             return ""
         return text[:length] + "..." if len(text) > length else text
 
+    def compute_site_report_stats(self):
+        stats = {}
+        for data in self.hidden_results.values():
+            site = data.get("site", "")
+            if not site:
+                continue
+            if site not in stats:
+                stats[site] = {"valid": 0, "protected": 0, "protected_accounts": set()}
+            if data.get("status") == "protected":
+                stats[site]["protected"] += 1
+                acc = data.get("account_id", "")
+                if acc:
+                    stats[site]["protected_accounts"].add(acc)
+            else:
+                stats[site]["valid"] += 1
+        return stats
+
+    def _format_site_count_cell(self, site, status, stats):
+        if status == "protected":
+            return "제외"
+        info = stats.get(site, {})
+        valid = info.get("valid", 0)
+        return f"{valid}회" if valid else "-"
+
+    def refresh_site_stats_panel(self):
+        if not hasattr(self, "site_stats_text"):
+            return
+        stats = self.compute_site_report_stats()
+        lines = []
+        all_protected_accounts = set()
+        if not stats:
+            lines.append("등록된 신고 결과가 없습니다.")
+        else:
+            for site, info in sorted(stats.items(), key=lambda x: (-x[1]["valid"], x[0])):
+                short = self._truncate(site, 90)
+                line = f"• {short}  →  신고 {info['valid']}회"
+                if info["protected"]:
+                    accs = ", ".join(sorted(info["protected_accounts"]))
+                    line += f"  (보호조치 {info['protected']}건 제외"
+                    if accs:
+                        line += f": {accs}"
+                    line += ")"
+                    all_protected_accounts.update(info["protected_accounts"])
+                lines.append(line)
+            if all_protected_accounts:
+                lines.append("")
+                lines.append(
+                    f"⚠ 보호조치 제외 계정: {', '.join(sorted(all_protected_accounts))}"
+                )
+        text = "\n".join(lines)
+        if ctk and isinstance(self.site_stats_text, ctk.CTkTextbox):
+            self.site_stats_text.configure(state="normal")
+            self.site_stats_text.delete("1.0", tk.END)
+            self.site_stats_text.insert("1.0", text)
+            self.site_stats_text.configure(state="disabled")
+        else:
+            self.site_stats_text.configure(state=tk.NORMAL)
+            self.site_stats_text.delete("1.0", tk.END)
+            self.site_stats_text.insert(tk.END, text)
+            self.site_stats_text.configure(state=tk.DISABLED)
+
     def refresh_results_tree(self, keyword=""):
+        stats = self.compute_site_report_stats()
+        self.refresh_site_stats_panel()
         for item in self.results_tree.get_children():
             self.results_tree.delete(item)
         for key, data in self.hidden_results.items():
@@ -1628,14 +1751,16 @@ class ReportApp:
             dt = data.get("datetime", "")
             account_id = data.get("account_id", "")
             status = data.get("status", "")
+            site = data.get("site", "")
             display_rewritten = data["rewritten"]
             if status == "protected":
                 display_rewritten = "보호조치 해제 필요"
+            site_count = self._format_site_count_cell(site, status, stats)
             tags = (data["site"], data["report_type"], data["original"], data["rewritten"])
             if status == "protected":
                 tags = ("protected", data["site"], data["report_type"], data["original"], data["rewritten"])
             self.results_tree.insert("", tk.END, values=(
-                dt, account_id, data["site"], data["report_type"],
+                dt, account_id, site, data["report_type"], site_count,
                 self._truncate(data["original"], 45), self._truncate(display_rewritten, 45)),
                 tags=tags)
 

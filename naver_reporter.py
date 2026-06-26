@@ -329,6 +329,24 @@ class NaverReporter:
         except NoSuchElementException:
             pass
 
+    def _paste_into_element(self, element, text: str, label: str = "입력"):
+        """URL 등 긴 문자열은 한 번에 붙여넣기(JS value 설정)."""
+        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+        self._human_delay(0.2, 0.4)
+        try:
+            element.click()
+        except Exception:
+            pass
+        self.driver.execute_script("""
+            var el = arguments[0];
+            var val = arguments[1];
+            el.focus();
+            el.value = val;
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+        """, element, text)
+        self.log(f"{label} 붙여넣기 ({len(text)}자)")
+
     def _type_into_element(self, element, text: str, label: str = "입력"):
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
         time.sleep(0.15)
@@ -808,14 +826,14 @@ class NaverReporter:
             self._human_delay(0.8, 1.5)
 
             url_input = wait.until(EC.presence_of_element_located((By.ID, "requiredUrl1")))
-            self._type_into_element(url_input, site, label="게시물 URL")
+            self._paste_into_element(url_input, site, label="게시물 URL")
             self.log(f"게시물 URL 입력: {site}")
             self._human_delay(0.4, 1.0)
 
             try:
                 url2 = self.driver.find_element(By.ID, "requiredUrl2")
                 if url2.is_displayed():
-                    self._type_into_element(url2, site, label="검색결과 URL")
+                    self._paste_into_element(url2, site, label="검색결과 URL")
                     self.log(f"검색결과 URL 입력: {site}")
                     self._human_delay(0.4, 1.0)
             except NoSuchElementException:
@@ -827,7 +845,7 @@ class NaverReporter:
                 self.log(f"유형(키워드) 입력: {report_type}")
                 self._human_delay(0.3, 0.8)
             if len(mo_texts) >= 2:
-                self._type_into_element(mo_texts[1], site, label="사이트 키워드")
+                self._paste_into_element(mo_texts[1], site, label="사이트 키워드")
                 self.log(f"사이트(키워드) 입력: {site}")
                 self._human_delay(0.3, 0.8)
 

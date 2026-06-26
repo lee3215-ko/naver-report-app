@@ -43,8 +43,12 @@ function Test-GhRelease([string]$Tag) {
     if (-not $gh) {
         return $false
     }
-    & $gh release view $Tag *> $null
-    return $LASTEXITCODE -eq 0
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    & $gh release view $Tag 2>$null | Out-Null
+    $ok = $LASTEXITCODE -eq 0
+    $ErrorActionPreference = $prev
+    return $ok
 }
 
 function Ensure-GhInstalled {

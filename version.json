@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.1",
+    "version":  "1.0.2",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "GitHub 자동 배포 및 앱 내 업데이트"
+    "notes":  "사이트 URL 붙여넣기, 계정 대량 등록, 사이트별 신고 집계, Hagrid(헤드리스) 모드, 계정 보호조치 감지, 신고 원본 탭, 자동 업데이트 지원"
 }
