@@ -55,6 +55,14 @@ def _github_api_url(raw_url: str) -> str | None:
     )
 
 
+def _decode_json_bytes(raw: bytes) -> dict:
+    text = raw.decode("utf-8-sig").strip()
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("version.json must be a JSON object")
+    return payload
+
+
 def _fetch_via_github_api(api_url: str, user_agent: str) -> dict | None:
     request = urllib.request.Request(
         api_url,
@@ -63,13 +71,10 @@ def _fetch_via_github_api(api_url: str, user_agent: str) -> dict | None:
             "Accept": "application/vnd.github+json",
         },
     )
-    with urllib.request.urlopen(request, timeout=8) as response:
-        meta = json.loads(response.read().decode("utf-8"))
-    content = base64.b64decode(meta["content"]).decode("utf-8")
-    payload = json.loads(content)
-    if not isinstance(payload, dict):
-        raise ValueError("version.json must be a JSON object")
-    return payload
+    with urllib.request.urlopen(request, timeout=15) as response:
+        meta = json.loads(response.read().decode("utf-8-sig"))
+    content = base64.b64decode(meta["content"]).decode("utf-8-sig")
+    return _decode_json_bytes(content.encode("utf-8"))
 
 
 def _fetch_via_raw_url(raw_url: str, user_agent: str) -> dict:
@@ -81,11 +86,8 @@ def _fetch_via_raw_url(raw_url: str, user_agent: str) -> dict:
         busted_url,
         headers={"User-Agent": user_agent, "Cache-Control": "no-cache"},
     )
-    with urllib.request.urlopen(request, timeout=8) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("version.json must be a JSON object")
-    return payload
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return _decode_json_bytes(response.read())
 
 
 def fetch_version_payload(version_url: str, user_agent: str) -> dict | None:

@@ -1,10 +1,10 @@
-﻿"""?굿룸뜲?댄꽣 寃쎈줈 (媛쒕컻 / PyInstaller exe 怨듯넻)."""
+"""?굿룸뜲?댄꽣 寃쎈줈 (媛쒕컻 / PyInstaller exe 怨듯넻)."""
 import os
 import shutil
 import sys
 
 APP_NAME = "NaverReport"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 UPDATE_VERSION_URL = (
     "https://raw.githubusercontent.com/lee3215-ko/naver-report-app/main/version.json"
 )

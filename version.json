@@ -1,5 +1,5 @@
-﻿{
-    "version":  "1.0.3",
+{
+    "version":  "1.0.4",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "신고 정지 버튼 추가, 사이트 URL 붙여넣기 입력 인식 개선"
+    "notes":  "자동 업데이트 알림 수정(version.json BOM 파싱 오류), 업데이트 확인 실패 시 실행 로그 표시"
 }

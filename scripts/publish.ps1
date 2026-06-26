@@ -29,7 +29,7 @@ function Set-AppVersion($cfg, [string]$Version) {
     $text = Get-Content $path -Raw
     $var = [regex]::Escape($cfg.version.variable)
     $text = $text -replace "${var}\s*=\s*`"[^`"]+`"", "$($cfg.version.variable) = `"$Version`""
-    Set-Content -Path $path -Value $text -Encoding UTF8
+    Write-TextNoBom $path $text
 }
 
 function Bump-Version([string]$Version, [string]$Part) {
@@ -54,7 +54,14 @@ function Write-VersionJson($cfg, [string]$Version, [string]$ReleaseNotes) {
         url     = $downloadUrl
         notes   = $ReleaseNotes
     } | ConvertTo-Json -Depth 3
-    Set-Content -Path (Join-Path $Root "version.json") -Value $payload -Encoding UTF8
+    $path = Join-Path $Root "version.json"
+  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText($path, $payload + "`n", $utf8NoBom)
+}
+
+function Write-TextNoBom([string]$Path, [string]$Text) {
+  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText($Path, $Text, $utf8NoBom)
 }
 
 function Ensure-GitRemote($cfg) {

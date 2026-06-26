@@ -14,6 +14,7 @@ from updater import (
     can_auto_update,
     check_for_update,
     download_file,
+    fetch_version_payload,
     schedule_apply_update,
 )
 
@@ -27,19 +28,43 @@ def schedule_update_check(
     exe_name: str,
     delay_ms: int = 2500,
     zip_inner_folder: str | None = None,
+    log_callback=None,
 ) -> None:
     if not version_url.strip():
         return
 
+    def log(msg: str) -> None:
+        if log_callback:
+            try:
+                log_callback(msg)
+            except Exception:
+                pass
+
     def worker() -> None:
-        info = check_for_update(version_url, current_version, app_name=app_name)
+        try:
+            info = check_for_update(version_url, current_version, app_name=app_name)
+        except Exception as exc:
+            root.after(0, lambda: log(f"[업데이트] 확인 오류: {exc}"))
+            return
         if info is not None:
             root.after(0, lambda: _show_dialog(root, info, current_version, app_name, exe_name, zip_inner_folder))
+        else:
+            payload = fetch_version_payload(version_url, f"{app_name}/{current_version}")
+            if payload is None:
+                root.after(0, lambda: log("[업데이트] version.json 조회 실패 (네트워크 또는 GitHub 접근 확인)"))
 
     root.after(delay_ms, lambda: threading.Thread(target=worker, daemon=True).start())
 
 
 def _show_dialog(root, info: UpdateInfo, current_version: str, app_name: str, exe_name: str, zip_inner_folder):
+    try:
+        root.update_idletasks()
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(200, lambda: root.attributes("-topmost", False))
+    except Exception:
+        pass
+
     message = f"새 버전 {info.version}이 있습니다.\n(현재: {current_version})"
     if info.notes:
         message += f"\n\n{info.notes}"

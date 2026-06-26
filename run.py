@@ -39,5 +39,6 @@ if __name__ == "__main__":
         app_name=APP_NAME,
         exe_name="NaverReport.exe",
         zip_inner_folder="NaverReport",
+        log_callback=app.log,
     )
     root.mainloop()
