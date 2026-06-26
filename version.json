@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.6",
+    "version":  "1.0.7",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "## v1.0.6\n\n- 카페 신고: 검색 상위 노출 순서대로 신고 (URL 정렬 제거)\n- 이미 신고 팝업 확인 후 다음 URL 계속 진행\n- 카페 수집 리스트 탭 추가 (제목·URL·순위)\n- 검색 결과 게시물 제목 한글 표시\n- 중복 게시물 제거 (같은 글 페이지 중복)"
+    "notes":  "## v1.0.7\n\n- 자동 업데이트 수정 (앱 종료 후 설치 스크립트가 정상 실행)\n- zip Python으로 풀기, 다운로드 검증·로그 강화\n- v1.0.6: 카페 신고 순서·수집 리스트·이미 신고 처리"
 }

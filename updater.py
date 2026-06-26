@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -131,7 +133,23 @@ def get_install_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def get_update_log_path() -> Path:
+    return Path(tempfile.gettempdir()) / "NaverReport_update.log"
+
+
 ProgressCallback = Callable[[int, int], None]
+
+
+def validate_zip_file(zip_path: Path, min_bytes: int = 1024) -> None:
+    if not zip_path.is_file():
+        raise ValueError("다운로드 파일이 없습니다.")
+    size = zip_path.stat().st_size
+    if size < min_bytes:
+        raise ValueError(f"다운로드 파일이 너무 작습니다 ({size} bytes).")
+    with zip_path.open("rb") as handle:
+        header = handle.read(4)
+    if header[:2] != b"PK":
+        raise ValueError("다운로드 파일이 zip 형식이 아닙니다 (GitHub 오류 페이지일 수 있습니다).")
 
 
 def download_file(
@@ -140,9 +158,10 @@ def download_file(
     *,
     user_agent: str,
     on_progress: ProgressCallback | None = None,
+    timeout: int = 600,
 ) -> None:
     request = urllib.request.Request(url.strip(), headers={"User-Agent": user_agent})
-    with urllib.request.urlopen(request, timeout=120) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         total = int(response.headers.get("Content-Length", 0) or 0)
         downloaded = 0
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -157,22 +176,32 @@ def download_file(
                     on_progress(downloaded, total)
 
 
+def extract_zip_to_staging(zip_path: Path, staging_dir: Path) -> Path:
+    """zip을 임시 폴더에 풀고 복사 원본 경로 반환."""
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(staging_dir)
+    return staging_dir
+
+
 def _write_update_batch(batch_path: Path) -> None:
-    batch_path.write_text(
-        r"""@echo off
+  batch_path.write_text(
+    r"""@echo off
 setlocal EnableExtensions
-set "ZIP=%~1"
+set "STAGING=%~1"
 set "INSTALL=%~2"
 set "EXE=%~3"
 set "INNER=%~4"
 set "WAITEXE=%~5"
 set "WAITPID=%~6"
 set "LOG=%TEMP%\NaverReport_update.log"
-set "STAGING=%TEMP%\NaverReport_staging_%RANDOM%"
 
 >>"%LOG%" echo [%date% %time%] update start
->>"%LOG%" echo ZIP=%ZIP%
+>>"%LOG%" echo STAGING=%STAGING%
 >>"%LOG%" echo INSTALL=%INSTALL%
+>>"%LOG%" echo EXE=%EXE%
 
 :wait_loop
 timeout /t 1 /nobreak >nul
@@ -184,12 +213,8 @@ if not "%WAITPID%"=="" (
   if not errorlevel 1 goto wait_loop
 )
 
->>"%LOG%" echo process ended, expanding zip
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath $env:ZIP -DestinationPath $env:STAGING -Force"
-if errorlevel 1 (
-  >>"%LOG%" echo Expand-Archive failed
-  goto fail
-)
+>>"%LOG%" echo process ended, waiting file unlock
+timeout /t 3 /nobreak >nul
 
 if exist "%STAGING%\%INNER%\" (
   set "SRC=%STAGING%\%INNER%"
@@ -198,14 +223,13 @@ if exist "%STAGING%\%INNER%\" (
 )
 
 >>"%LOG%" echo robocopy "%SRC%" "%INSTALL%"
-robocopy "%SRC%" "%INSTALL%" /E /IS /IT /R:3 /W:1 /NFL /NDL /NJH /NJS
+robocopy "%SRC%" "%INSTALL%" /E /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS
 if errorlevel 8 (
-  >>"%LOG%" echo robocopy failed
+  >>"%LOG%" echo robocopy failed code %errorlevel%
   goto fail
 )
 
 rd /s /q "%STAGING%" 2>nul
-del /f /q "%ZIP%" 2>nul
 >>"%LOG%" echo starting %EXE%
 start "" "%EXE%"
 >>"%LOG%" echo update success
@@ -215,14 +239,13 @@ exit /b 0
 
 :fail
 >>"%LOG%" echo update failed
-rd /s /q "%STAGING%" 2>nul
 msg * "업데이트 실패. 로그: %TEMP%\NaverReport_update.log"
 endlocal
 del "%~f0"
 exit /b 1
 """,
-        encoding="utf-8",
-    )
+    encoding="utf-8",
+  )
 
 
 def schedule_apply_update(
@@ -236,33 +259,40 @@ def schedule_apply_update(
     if not can_auto_update():
         raise RuntimeError("Auto-update works only in packaged exe builds.")
 
+    validate_zip_file(zip_path)
+
     target_dir = install_dir or get_install_dir()
     inner = zip_inner_folder or target_dir.name
     exe_path = target_dir / exe_name
+    staging_dir = Path(tempfile.gettempdir()) / f"NaverReport_staging_{os.getpid()}"
+
+    try:
+        extract_zip_to_staging(zip_path, staging_dir)
+    except (zipfile.BadZipFile, OSError) as exc:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise RuntimeError(f"업데이트 zip 풀기 실패: {exc}") from exc
+
     batch_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.bat"
     _write_update_batch(batch_path)
 
-    startupinfo = None
-    creationflags = 0
-    if sys.platform == "win32":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
-        creationflags = subprocess.CREATE_NO_WINDOW
-
+    creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     subprocess.Popen(
         [
             "cmd.exe",
             "/c",
             str(batch_path),
-            str(zip_path),
+            str(staging_dir),
             str(target_dir),
             str(exe_path),
             inner,
             exe_name,
             str(os.getpid()),
         ],
-        startupinfo=startupinfo,
         creationflags=creationflags,
         close_fds=True,
     )
+
+    try:
+        zip_path.unlink(missing_ok=True)
+    except OSError:
+        pass
