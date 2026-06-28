@@ -66,6 +66,10 @@ class NaverReporter:
     def _human_delay(self, min_sec: float = 0.8, max_sec: float = 2.5):
         time.sleep(random.uniform(min_sec, max_sec))
 
+    def _cafe_fast_delay(self, min_sec: float = 0.08, max_sec: float = 0.22):
+        """카페 신고 팝업 — 짧은 대기."""
+        time.sleep(random.uniform(min_sec, max_sec))
+
     def _is_on_inquiry_form(self) -> bool:
         try:
             if "inquiry/input.help" not in self.driver.current_url:
@@ -1137,38 +1141,15 @@ class NaverReporter:
             return False
         self._click_element(report_btn)
         self.log("카페 신고 버튼 클릭")
-        self._human_delay(1.5, 2.5)
+        self._cafe_fast_delay(0.25, 0.5)
         return True
 
     def _select_cafe_illegal_reason_in_context(self) -> bool:
-        wait = self._wait(10)
-        selectors = [
-            (By.CSS_SELECTOR, "label[for='3']"),
-            (By.CSS_SELECTOR, "input#3[type='radio']"),
-            (By.CSS_SELECTOR, "input[type='radio'][value='3']"),
-            (By.XPATH, "//label[contains(.,'불법정보를 포함하고 있습니다')]"),
-            (By.XPATH, "//label[contains(.,'불법정보') and contains(.,'포함')]"),
-            (By.XPATH, "//li[contains(.,'불법정보')]//label"),
-            (By.XPATH, "//*[contains(text(),'불법정보를 포함')]/ancestor::label[1]"),
-        ]
-        for by, sel in selectors:
-            try:
-                el = wait.until(EC.presence_of_element_located((by, sel)))
-                if not el.is_displayed():
-                    continue
-                self._click_element(el)
-                self.log("불법정보 포함 선택")
-                return True
-            except TimeoutException:
-                continue
-            except Exception:
-                continue
-
         try:
             clicked = self.driver.execute_script("""
                 var labels = document.querySelectorAll('label');
                 for (var i = 0; i < labels.length; i++) {
-                    var t = (labels[i].textContent || '').replace(/\s+/g, '');
+                    var t = (labels[i].textContent || '').replace(/\\s+/g, '');
                     if (t.indexOf('불법정보') >= 0 && t.indexOf('포함') >= 0) {
                         labels[i].click();
                         return 'label';
@@ -1187,15 +1168,38 @@ class NaverReporter:
                 return '';
             """)
             if clicked:
-                self.log(f"불법정보 포함 선택 (JS: {clicked})")
+                self.log("불법정보 포함 선택")
                 return True
         except Exception:
             pass
+
+        wait = self._wait(5)
+        selectors = [
+            (By.CSS_SELECTOR, "label[for='3']"),
+            (By.CSS_SELECTOR, "input#3[type='radio']"),
+            (By.CSS_SELECTOR, "input[type='radio'][value='3']"),
+            (By.XPATH, "//label[contains(.,'불법정보를 포함하고 있습니다')]"),
+            (By.XPATH, "//label[contains(.,'불법정보') and contains(.,'포함')]"),
+            (By.XPATH, "//li[contains(.,'불법정보')]//label"),
+            (By.XPATH, "//*[contains(text(),'불법정보를 포함')]/ancestor::label[1]"),
+        ]
+        for by, sel in selectors:
+            try:
+                el = wait.until(EC.element_to_be_clickable((by, sel)))
+                if not el.is_displayed():
+                    continue
+                self._click_element(el)
+                self.log("불법정보 포함 선택")
+                return True
+            except TimeoutException:
+                continue
+            except Exception:
+                continue
         self.log("불법정보 항목 선택 실패")
         return False
 
     def _submit_cafe_report_in_context(self) -> bool:
-        wait = self._wait(8)
+        wait = self._wait(5)
         for by, sel in [
             (By.XPATH, "//button[contains(.,'신고하기')]"),
             (By.XPATH, "//a[contains(.,'신고하기')]"),
@@ -1272,30 +1276,30 @@ class NaverReporter:
             new_handles = set(self.driver.window_handles) - before_handles
             if new_handles:
                 return next(iter(new_handles))
-            time.sleep(0.25)
+            time.sleep(0.1)
         return None
 
     def _finish_cafe_report_in_active_window(self) -> str:
         """현재 창(신고 팝업)에서 사유 선택 → 신고하기. ok / already / failed."""
         try:
-            WebDriverWait(self.driver, 12).until(
+            WebDriverWait(self.driver, 6).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
         except TimeoutException:
             pass
 
-        popup_text = self._dismiss_cafe_popup(timeout=1.5)
+        popup_text = self._dismiss_cafe_popup(timeout=0.8)
         if popup_text and self._is_already_reported_alert(popup_text):
             self.log("이미 신고된 게시물 — 확인 후 다음 진행")
             return "already"
 
         if not self._select_cafe_illegal_reason_in_context():
             return "failed"
-        self._human_delay(0.5, 1.0)
+        self._cafe_fast_delay(0.05, 0.15)
         if not self._submit_cafe_report_in_context():
             return "failed"
-        self._human_delay(1.0, 2.0)
-        popup_text = self._dismiss_cafe_popup(timeout=4)
+        self._cafe_fast_delay(0.3, 0.6)
+        popup_text = self._dismiss_cafe_popup(timeout=3)
         if popup_text:
             if self._is_already_reported_alert(popup_text):
                 self.log("이미 신고됨 — 확인 후 다음 진행")
@@ -1334,7 +1338,7 @@ class NaverReporter:
         if not self._click_cafe_report_button():
             return "failed"
 
-        popup_text = self._dismiss_cafe_popup(timeout=2)
+        popup_text = self._dismiss_cafe_popup(timeout=1.2)
         if popup_text and self._is_already_reported_alert(popup_text):
             self.log("이미 신고된 게시물 — 확인 후 다음 진행")
             return "already"
@@ -1344,8 +1348,8 @@ class NaverReporter:
             try:
                 self.driver.switch_to.window(popup_handle)
                 self.log("신고 새 창으로 전환")
-                self._human_delay(1.0, 2.0)
-                popup_text = self._dismiss_cafe_popup(timeout=2)
+                self._cafe_fast_delay(0.2, 0.45)
+                popup_text = self._dismiss_cafe_popup(timeout=1.0)
                 if popup_text and self._is_already_reported_alert(popup_text):
                     self.log("이미 신고됨 — 확인 후 다음 진행")
                     self._close_extra_windows(main_handle)

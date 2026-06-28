@@ -612,6 +612,16 @@ class ReportApp:
     def _frame(self, parent, bg=None):
         return ui_frame(parent, bg or COLORS["bg"])
 
+    def _center_toplevel(self, window, width: int, height: int):
+        window.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = max(self.root.winfo_width(), 1)
+        rh = max(self.root.winfo_height(), 1)
+        x = rx + (rw - width) // 2
+        y = ry + (rh - height) // 2
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
     def _card(self, parent):
         return ui_card(parent)
 
@@ -783,6 +793,7 @@ class ReportApp:
         res_sb = ttk.Scrollbar(res_container, orient=tk.VERTICAL, command=self.cafe_result_tree.yview)
         res_sb.grid(row=0, column=1, sticky="ns")
         self.cafe_result_tree.configure(yscrollcommand=res_sb.set)
+        self.cafe_result_tree.bind("<Delete>", lambda e: self.delete_selected_cafe_result())
 
         cafe_btn_frame = self._frame(bottom_card, COLORS["card"])
         cafe_btn_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
@@ -830,7 +841,7 @@ class ReportApp:
         ui_label(
             hint,
             "카페 신고 실행 시 통합검색에서 수집된 게시물입니다. "
-            "검색 결과에 표시된 제목 순서대로 신고합니다.",
+            "재수집 시 검색결과에서 빠진 게시물은 「사라짐」으로 표시됩니다.",
             "small",
             COLORS["text_muted"],
         ).pack(anchor="w")
@@ -842,17 +853,18 @@ class ReportApp:
 
         self.cafe_collected_tree = ttk.Treeview(
             container,
-            columns=("datetime", "keyword", "title", "url", "rank"),
+            columns=("datetime", "keyword", "title", "url", "rank", "status"),
             show="headings",
             style="Cafe.Treeview",
             height=16,
         )
         for col, title, width in [
             ("datetime", "수집일시", 130),
-            ("keyword", "키워드", 110),
-            ("title", "게시물 제목", 280),
-            ("url", "URL", 280),
-            ("rank", "순위", 50),
+            ("keyword", "키워드", 100),
+            ("title", "게시물 제목", 240),
+            ("url", "URL", 220),
+            ("rank", "순위", 45),
+            ("status", "상태", 70),
         ]:
             self.cafe_collected_tree.heading(col, text=title)
             self.cafe_collected_tree.column(col, width=width, anchor="w")
@@ -860,6 +872,9 @@ class ReportApp:
         sb = ttk.Scrollbar(container, orient=tk.VERTICAL, command=self.cafe_collected_tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.cafe_collected_tree.configure(yscrollcommand=sb.set)
+        self.cafe_collected_tree.tag_configure(
+            "disappeared", background="#f1f5f9", foreground="#94a3b8",
+        )
 
         btn_frame = self._frame(card, COLORS["card"])
         btn_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
@@ -1360,6 +1375,58 @@ class ReportApp:
         with open(CAFE_RESULTS_FILE, "w", encoding="utf-8") as f:
             json.dump(self.cafe_results, f, ensure_ascii=False, indent=2)
 
+    def _cafe_article_key(self, url: str) -> str:
+        m = re.search(r"/([A-Za-z0-9_-]+)/(\d+)", url or "", re.IGNORECASE)
+        if m:
+            return f"{m.group(1).lower()}/{m.group(2)}"
+        return (url or "").strip()
+
+    def _merge_cafe_collection(self, targets: list[dict], collected_at: str) -> int:
+        """재수집 시 이전 노출 대비 검색결과에서 빠진 게시물을 사라짐으로 표시."""
+        by_keyword: dict[str, list[dict]] = {}
+        for t in targets:
+            kw = t.get("keyword", "")
+            if kw:
+                by_keyword.setdefault(kw, []).append(t)
+
+        disappeared_count = 0
+        for kw, items in by_keyword.items():
+            new_keys = {self._cafe_article_key(t.get("url", "")) for t in items}
+            for row in self.cafe_collected:
+                if row.get("keyword") != kw or row.get("status") == "disappeared":
+                    continue
+                key = self._cafe_article_key(row.get("url", ""))
+                if key not in new_keys:
+                    row["status"] = "disappeared"
+                    row["disappeared_datetime"] = collected_at
+                    disappeared_count += 1
+
+            existing: dict[str, dict] = {}
+            for row in self.cafe_collected:
+                if row.get("keyword") == kw:
+                    existing[self._cafe_article_key(row.get("url", ""))] = row
+
+            for i, t in enumerate(items, 1):
+                url = t.get("url", "")
+                key = self._cafe_article_key(url)
+                if key in existing:
+                    row = existing[key]
+                    row["status"] = "active"
+                    row["rank"] = i
+                    row["datetime"] = collected_at
+                    row["title"] = t.get("title") or row.get("title", "")
+                    row.pop("disappeared_datetime", None)
+                else:
+                    self.cafe_collected.append({
+                        "datetime": collected_at,
+                        "keyword": kw,
+                        "title": t.get("title", ""),
+                        "url": url,
+                        "rank": i,
+                        "status": "active",
+                    })
+        return disappeared_count
+
     def load_cafe_collected(self):
         self.cafe_collected = []
         if os.path.isfile(CAFE_COLLECTED_FILE):
@@ -1380,7 +1447,11 @@ class ReportApp:
             return
         for item in self.cafe_collected_tree.get_children():
             self.cafe_collected_tree.delete(item)
+        status_labels = {"active": "노출", "disappeared": "사라짐"}
         for row in reversed(self.cafe_collected):
+            st = row.get("status", "active")
+            label = status_labels.get(st, st or "노출")
+            tags = ("disappeared",) if st == "disappeared" else ()
             self.cafe_collected_tree.insert(
                 "",
                 tk.END,
@@ -1390,7 +1461,9 @@ class ReportApp:
                     row.get("title", ""),
                     self._truncate(row.get("url", ""), 80),
                     row.get("rank", ""),
+                    label,
                 ),
+                tags=tags,
             )
 
     def clear_cafe_collected(self):
@@ -1437,21 +1510,45 @@ class ReportApp:
                     label,
                     row.get("datetime", ""),
                 ),
+                tags=(
+                    row.get("account_id", ""),
+                    row.get("keyword", ""),
+                    row.get("url", ""),
+                    row.get("datetime", ""),
+                ),
             )
 
     def add_cafe_keyword(self):
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root) if ctk else tk.Toplevel(self.root)
         dialog.title("검색 키워드 추가")
-        dialog.geometry("420x120")
         dialog.transient(self.root)
         dialog.grab_set()
-        ui_label(dialog, "통합검색 키워드", "body_bold", COLORS["text"]).pack(padx=16, pady=(16, 8), anchor="w")
+        dialog.resizable(False, False)
+        if ctk:
+            dialog.configure(fg_color=COLORS["bg"])
+        else:
+            dialog.configure(bg=COLORS["bg"])
+
+        width, height = 440, 170
+        self._center_toplevel(dialog, width, height)
+
+        container = self._frame(dialog, COLORS["bg"])
+        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        ui_label(container, "통합검색 키워드", "body_bold", COLORS["text"]).pack(anchor="w")
         kw_var = tk.StringVar()
         if ctk:
-            entry = ctk.CTkEntry(dialog, textvariable=kw_var, width=380, height=36)
+            entry = ctk.CTkEntry(
+                container, textvariable=kw_var, height=38,
+                fg_color=COLORS["input_bg"], text_color=COLORS["text"],
+                border_color=COLORS["input_border"],
+            )
         else:
-            entry = tk.Entry(dialog, textvariable=kw_var, width=50)
-        entry.pack(padx=16, pady=(0, 12))
+            entry = tk.Entry(
+                container, textvariable=kw_var, font=FONTS["body"],
+                bg=COLORS["input_bg"], fg=COLORS["text"],
+            )
+        entry.pack(fill=tk.X, pady=(8, 0))
         entry.focus_set()
 
         def ok():
@@ -1465,7 +1562,34 @@ class ReportApp:
                 self.refresh_cafe_keyword_list()
             dialog.destroy()
 
-        ui_button(dialog, "추가", "primary", height=36, command=ok).pack(padx=16, pady=(0, 12))
+        btn_row = self._frame(container, COLORS["bg"])
+        btn_row.pack(fill=tk.X, pady=(16, 0))
+        ui_button(btn_row, "취소", "ghost", width=90, height=36, command=dialog.destroy).pack(side=tk.RIGHT)
+        ui_button(btn_row, "추가", "primary", width=90, height=36, command=ok).pack(side=tk.RIGHT, padx=(0, 8))
+
+        entry.bind("<Return>", lambda e: ok())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+    def delete_selected_cafe_result(self):
+        selected = self.cafe_result_tree.selection()
+        if not selected:
+            return
+        tags = self.cafe_result_tree.item(selected[0])["tags"]
+        if len(tags) < 4:
+            return
+        account, keyword, url, dt = tags[0], tags[1], tags[2], tags[3]
+        self.cafe_results = [
+            r for r in self.cafe_results
+            if not (
+                r.get("account_id") == account
+                and r.get("keyword") == keyword
+                and r.get("url") == url
+                and r.get("datetime") == dt
+            )
+        ]
+        self.save_cafe_results()
+        self.refresh_cafe_results_tree()
+        self.log(f"카페 신고 결과 삭제: {keyword}")
 
     def delete_cafe_keyword(self):
         selected = self.cafe_keyword_tree.selection()
@@ -1822,6 +1946,8 @@ class ReportApp:
             self._truncate(original, 45), self._truncate(display_rewritten, 45)),
             tags=tags)
         self.refresh_site_stats_panel()
+
+    def open_preview_detail(self):
         selected = self.results_tree.selection()
         if not selected:
             return
@@ -1981,18 +2107,11 @@ class ReportApp:
 
         def on_targets_ready(targets):
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            batch = []
-            for i, t in enumerate(targets, 1):
-                batch.append({
-                    "datetime": now,
-                    "keyword": t.get("keyword", ""),
-                    "title": t.get("title", ""),
-                    "url": t.get("url", ""),
-                    "rank": i,
-                })
-            self.cafe_collected.extend(batch)
+            disappeared = self._merge_cafe_collection(targets, now)
             self.root.after(0, self.save_cafe_collected)
             self.root.after(0, self.refresh_cafe_collected_tree)
+            if disappeared:
+                on_log(f"[수집] 검색결과에서 사라진 게시물 {disappeared}건 → 수집 목록에 「사라짐」 표시")
             total_work[0] = max(len(targets) * total, 1)
             on_log(f"진행 예정: URL {len(targets)}건 × 계정 {total}개 = {total_work[0]}회 시도")
 
