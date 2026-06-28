@@ -1,5 +1,6 @@
 # PyInstaller spec — Naver Report 배포용 (onedir: PKG 손상 방지)
 import os
+import certifi
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
@@ -7,8 +8,10 @@ SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
 ICON_FILE = os.path.join(SPEC_DIR, "assets", "app_icon.ico")
 
 datas = [(ICON_FILE, "assets")] if os.path.isfile(ICON_FILE) else []
+datas += [(certifi.where(), "certifi")]
 binaries = []
 hiddenimports = [
+    "certifi",
     "customtkinter",
     "openai",
     "httpx",

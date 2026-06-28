@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,34 @@ from typing import Callable
 _RAW_GITHUB_RE = re.compile(
     r"^https://raw\.githubusercontent\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?P<branch>[^/]+)/(?P<path>.+)$"
 )
+
+
+def _ca_bundle_path() -> str | None:
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", "")
+        for candidate in (
+            os.path.join(base, "certifi", "cacert.pem"),
+            os.path.join(base, "cacert.pem"),
+        ):
+            if candidate and os.path.isfile(candidate):
+                return candidate
+    try:
+        import certifi
+        return certifi.where()
+    except ImportError:
+        return None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """PyInstaller exe에서도 HTTPS 검증이 되도록 certifi CA 번들 사용."""
+    cafile = _ca_bundle_path()
+    if cafile:
+        return ssl.create_default_context(cafile=cafile)
+    return ssl.create_default_context()
+
+
+def _urlopen(request: urllib.request.Request, *, timeout: int):
+    return urllib.request.urlopen(request, timeout=timeout, context=_ssl_context())
 
 
 @dataclass(frozen=True)
@@ -73,7 +102,7 @@ def _fetch_via_github_api(api_url: str, user_agent: str) -> dict | None:
             "Accept": "application/vnd.github+json",
         },
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with _urlopen(request, timeout=15) as response:
         meta = json.loads(response.read().decode("utf-8-sig"))
     content = base64.b64decode(meta["content"]).decode("utf-8-sig")
     return _decode_json_bytes(content.encode("utf-8"))
@@ -88,7 +117,7 @@ def _fetch_via_raw_url(raw_url: str, user_agent: str) -> dict:
         busted_url,
         headers={"User-Agent": user_agent, "Cache-Control": "no-cache"},
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with _urlopen(request, timeout=15) as response:
         return _decode_json_bytes(response.read())
 
 
@@ -161,7 +190,7 @@ def download_file(
     timeout: int = 600,
 ) -> None:
     request = urllib.request.Request(url.strip(), headers={"User-Agent": user_agent})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _urlopen(request, timeout=timeout) as response:
         total = int(response.headers.get("Content-Length", 0) or 0)
         downloaded = 0
         dest.parent.mkdir(parents=True, exist_ok=True)

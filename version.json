@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.8",
+    "version":  "1.0.9",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "## v1.0.8\n\n- 카페 신고: 불법정보·신고하기 클릭 속도 개선\n- 카페 신고 결과 Delete 키 삭제\n- 리라이트 결과 더블클릭 상세 보기 수정\n- 키워드 추가 팝업 중앙 표시·Enter 등록·버튼 UI 수정\n- 재수집 시 검색에서 빠진 게시물 「사라짐」 표시"
+    "notes":  "## v1.0.9\n\n- 자동 업데이트 SSL 인증서 오류 수정 (CERTIFICATE_VERIFY_FAILED)\n- certifi CA 번들 EXE에 포함"
 }
