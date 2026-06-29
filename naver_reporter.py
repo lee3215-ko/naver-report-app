@@ -428,20 +428,21 @@ class NaverReporter:
         else:
             self.log(f"{label} 입력 경고: 기대 {len(expected)}자, 실제 {len(actual)}자")
 
-    def _ensure_url_fields(self, site: str):
+    def _ensure_url_fields(self, site: str, search_url: str = ""):
         """requiredUrl 필드가 실제로 채워졌는지 검증 후 재입력."""
-        fields = [("requiredUrl1", "게시물 URL")]
+        effective_search = (search_url or site).strip()
+        fields: list[tuple[str, str, str]] = [("requiredUrl1", site, "게시물 URL")]
         try:
             url2 = self.driver.find_element(By.ID, "requiredUrl2")
             if url2.is_displayed():
-                fields.append(("requiredUrl2", "검색결과 URL"))
+                fields.append(("requiredUrl2", effective_search, "검색결과 URL"))
         except NoSuchElementException:
             pass
-        for field_id, label in fields:
+        for field_id, value, label in fields:
             el = self.driver.find_element(By.ID, field_id)
-            if self._read_element_value(el) != site.strip():
+            if self._read_element_value(el) != value.strip():
                 self.log(f"{label} 미입력 감지 → 재입력")
-                self._paste_into_element(el, site, label=label)
+                self._paste_into_element(el, value, label=label)
                 self._human_delay(0.3, 0.6)
 
     def _type_into_element(self, element, text: str, label: str = "입력"):
@@ -916,10 +917,11 @@ class NaverReporter:
         self.log("문의 제출 실패 (최대 재시도 초과)")
         return False
 
-    def fill_form(self, site: str, report_type: str, content: str) -> bool:
+    def fill_form(self, site: str, report_type: str, content: str, search_url: str = "") -> bool:
         """문의 작성 폼을 채웁니다."""
         if self._should_stop():
             return False
+        effective_search = (search_url or site).strip()
         try:
             self._go_to_inquiry_page()
             wait = self._wait(15)
@@ -933,13 +935,13 @@ class NaverReporter:
             try:
                 url2 = self.driver.find_element(By.ID, "requiredUrl2")
                 if url2.is_displayed():
-                    self._paste_into_element(url2, site, label="검색결과 URL")
-                    self.log(f"검색결과 URL 입력: {site}")
+                    self._paste_into_element(url2, effective_search, label="검색결과 URL")
+                    self.log(f"검색결과 URL 입력: {effective_search}")
                     self._human_delay(0.4, 1.0)
             except NoSuchElementException:
                 pass
 
-            self._ensure_url_fields(site)
+            self._ensure_url_fields(site, effective_search)
 
             mo_texts = self.driver.find_elements(By.ID, "moText1CA")
             if len(mo_texts) >= 1:
@@ -977,16 +979,20 @@ class NaverReporter:
 
     def _emit_protection_results(self, naver_id: str, naver_pw: str, tasks: list):
         for task in tasks:
+            site = task.get("site", "")
+            search_url = task.get("search_url", "") or site
             item = {
                 "account_id": naver_id,
                 "account_password": naver_pw,
-                "site": task.get("site", ""),
+                "site": site,
                 "report_type": task.get("report_type", ""),
                 "original": task.get("template", ""),
                 "rewritten": "보호조치 해제 필요",
                 "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "success": False,
                 "status": "protected",
+                "search_url": search_url,
+                "search_url_custom": task.get("search_url_custom", False),
             }
             if self.result_callback:
                 self.result_callback(item)
@@ -1015,13 +1021,15 @@ class NaverReporter:
                 site = task.get("site", "")
                 report_type = task.get("report_type", "")
                 template = task.get("template", "")
+                search_url = task.get("search_url", "") or site
+                search_url_custom = task.get("search_url_custom", False)
 
                 self._human_delay(1.0, 2.5)
                 rewritten = self._rewrite(template, naver_id, site, report_type)
                 self.log(f"[{naver_id}] {idx + 1}/{len(tasks)} 리라이트 완료 ({len(rewritten)}자)")
                 self._human_delay(0.8, 1.8)
 
-                success = self.fill_form(site, report_type, rewritten)
+                success = self.fill_form(site, report_type, rewritten, search_url=search_url)
                 dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 results.append({
                     "account_id": naver_id,
@@ -1032,6 +1040,8 @@ class NaverReporter:
                     "rewritten": rewritten,
                     "datetime": dt,
                     "success": success,
+                    "search_url": search_url,
+                    "search_url_custom": search_url_custom,
                 })
                 if self.result_callback:
                     self.result_callback(results[-1])

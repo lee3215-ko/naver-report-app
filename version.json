@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.9",
+    "version":  "1.0.10",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "## v1.0.9\n\n- 자동 업데이트 SSL 인증서 오류 수정 (CERTIFICATE_VERIFY_FAILED)\n- certifi CA 번들 EXE에 포함"
+    "notes":  "신고 항목 더블클릭 수정, 검색결과 URL 미입력 시 사이트 주소 자동 사용, 리라이트 결과에 검색URL 입력 여부 표시"
 }

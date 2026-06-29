@@ -66,7 +66,8 @@ DEFAULT_TEMPLATES = [
 
 class DetailWindow:
     def __init__(self, parent, site, report_type, original, rewritten,
-                 account_id="", account_password=""):
+                 account_id="", account_password="",
+                 search_url="", search_url_custom=False):
         self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
         self.top.title("신고 내용 상세")
         self.top.geometry("860x720")
@@ -92,7 +93,17 @@ class DetailWindow:
         self.site_box.pack(fill=tk.X, pady=(6, 10))
         self._set_text(self.site_box, site)
         self.site_box.bind("<Double-Button-1>", self._on_url_double_click)
-        ui_label(meta_inner, f"유형 · {report_type}", "small", COLORS["text_muted"]).pack(anchor="w", pady=(0, 8))
+        mode_label = "별도입력" if search_url_custom else "사이트동일"
+        ui_label(meta_inner, f"유형 · {report_type}", "small", COLORS["text_muted"]).pack(anchor="w", pady=(0, 4))
+        ui_label(meta_inner, f"검색결과 URL · {mode_label}", "small", COLORS["text_muted"]).pack(anchor="w", pady=(0, 8))
+        display_search = (search_url or site).strip()
+        if display_search and (search_url_custom or display_search != site):
+            self.search_url_box = self._url_textbox(meta_inner)
+            self.search_url_box.pack(fill=tk.X, pady=(0, 10))
+            self._set_text(self.search_url_box, display_search)
+            self.search_url_box.bind("<Double-Button-1>", self._on_search_url_double_click)
+        else:
+            self.search_url_box = None
 
         cred_row = ui_frame(meta_inner, COLORS["card"])
         cred_row.pack(fill=tk.X, pady=(4, 0))
@@ -169,6 +180,17 @@ class DetailWindow:
             self.site_box.tag_add("sel", "1.0", "end")
         else:
             self.site_box.tag_add(tk.SEL, "1.0", tk.END)
+        self.top.clipboard_clear()
+        self.top.clipboard_append(text)
+
+    def _on_search_url_double_click(self, event=None):
+        if not self.search_url_box:
+            return
+        text = self._get_text(self.search_url_box)
+        if ctk and isinstance(self.search_url_box, ctk.CTkTextbox):
+            self.search_url_box.tag_add("sel", "1.0", "end")
+        else:
+            self.search_url_box.tag_add(tk.SEL, "1.0", tk.END)
         self.top.clipboard_clear()
         self.top.clipboard_append(text)
 
@@ -257,9 +279,11 @@ class DetailWindow:
 
 
 class RegisterWindow:
-    def __init__(self, parent, app):
+    def __init__(self, parent, app, task_index=None):
+        self.task_index = task_index
+        self.edit_mode = task_index is not None
         self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
-        self.top.title("신고 항목 등록")
+        self.top.title("신고 항목 수정" if self.edit_mode else "신고 항목 등록")
         if ctk:
             self.top.configure(fg_color=COLORS["bg"])
         else:
@@ -274,7 +298,12 @@ class RegisterWindow:
         main.pack(fill=tk.BOTH, expand=True, padx=28, pady=28)
         main.grid_columnconfigure(0, weight=1)
 
-        ui_label(main, "신고 항목 등록", "title", COLORS["text"]).grid(row=0, column=0, sticky="w", pady=(0, 20))
+        ui_label(
+            main,
+            "신고 항목 수정" if self.edit_mode else "신고 항목 등록",
+            "title",
+            COLORS["text"],
+        ).grid(row=0, column=0, sticky="w", pady=(0, 20))
 
         card = ui_card(main)
         card.grid(row=1, column=0, sticky="ew")
@@ -329,8 +358,37 @@ class RegisterWindow:
             )
         self.site_text.grid(row=0, column=0, sticky="nsew")
 
+        ui_label(card_inner, "검색결과 URL", "body_bold", COLORS["text_muted"]).grid(
+            row=5, column=0, sticky="w", pady=(8, 4))
+        ui_label(
+            card_inner,
+            "선택 · 줄 번호는 사이트 주소와 짝 · 미입력 시 사이트 주소가 검색결과 URL에 사용됨",
+            "caption",
+            COLORS["text_light"],
+        ).grid(row=6, column=0, sticky="w", pady=(0, 8))
+
+        search_box = ui_frame(card_inner, COLORS["card"])
+        search_box.grid(row=7, column=0, sticky="ew", pady=(0, 8), padx=16)
+        search_box.grid_columnconfigure(0, weight=1)
+
+        if ctk:
+            self.search_url_text = ctk.CTkTextbox(
+                search_box, wrap="char", font=FONTS["mono"],
+                height=100, fg_color=COLORS["input_bg"], text_color=COLORS["text"],
+                border_color=COLORS["input_border"], border_width=1, corner_radius=10,
+                activate_scrollbars=True,
+            )
+        else:
+            self.search_url_text = tk.Text(
+                search_box, wrap=tk.CHAR, font=FONTS["mono"], height=5,
+                bg=COLORS["input_bg"], fg=COLORS["text"],
+                highlightbackground=COLORS["input_border"], highlightthickness=1,
+                padx=12, pady=10, relief=tk.FLAT,
+            )
+        self.search_url_text.grid(row=0, column=0, sticky="nsew")
+
         preview_header = ui_frame(card_inner, COLORS["card"])
-        preview_header.grid(row=5, column=0, sticky="ew", pady=(4, 6))
+        preview_header.grid(row=8, column=0, sticky="ew", pady=(4, 6))
         ui_label(preview_header, "등록 예정 URL", "body_bold", COLORS["text_muted"]).pack(side=tk.LEFT)
         self.url_count_label = ui_label(preview_header, "0개", "badge", COLORS["accent"])
         self.url_count_label.pack(side=tk.RIGHT)
@@ -349,11 +407,11 @@ class RegisterWindow:
                 highlightbackground=COLORS["card_border"], highlightthickness=1,
                 padx=12, pady=10, relief=tk.FLAT, state=tk.DISABLED,
             )
-        self.url_preview.grid(row=6, column=0, sticky="ew", pady=(0, 16), padx=16)
+        self.url_preview.grid(row=9, column=0, sticky="ew", pady=(0, 16), padx=16)
 
-        ui_label(card_inner, "신고 원고", "body_bold", COLORS["text_muted"]).grid(row=7, column=0, sticky="w", pady=(0, 10))
+        ui_label(card_inner, "신고 원고", "body_bold", COLORS["text_muted"]).grid(row=10, column=0, sticky="w", pady=(0, 10))
         tpl_frame = ui_frame(card_inner, COLORS["card"])
-        tpl_frame.grid(row=8, column=0, sticky="ew", pady=(0, 8))
+        tpl_frame.grid(row=11, column=0, sticky="ew", pady=(0, 8))
         tpl_frame.grid_columnconfigure(0, weight=1)
         tpl_frame.grid_columnconfigure(1, weight=1)
 
@@ -365,11 +423,37 @@ class RegisterWindow:
         btn_frame = ui_frame(main, COLORS["bg"])
         btn_frame.grid(row=2, column=0, sticky="e", pady=(20, 0))
         ui_button(btn_frame, "취소", "ghost", width=110, command=self.top.destroy).pack(side=tk.RIGHT, padx=(10, 0))
-        ui_button(btn_frame, "등록", "primary", width=110, command=self.register).pack(side=tk.RIGHT)
+        save_label = "저장" if self.edit_mode else "등록"
+        ui_button(btn_frame, save_label, "primary", width=110, command=self.register).pack(side=tk.RIGHT)
 
         self.site_text.bind("<KeyRelease>", lambda e: self._update_url_preview())
         self.site_text.bind("<Control-Return>", lambda e: self.register())
+        self.search_url_text.bind("<KeyRelease>", lambda e: self._update_url_preview())
+        self.search_url_text.bind("<Control-Return>", lambda e: self.register())
+        if self.edit_mode:
+            self._load_task(app.tasks[task_index])
         self._update_url_preview()
+
+    def _set_textbox(self, widget, text: str):
+        if ctk and isinstance(widget, ctk.CTkTextbox):
+            widget.delete("1.0", tk.END)
+            widget.insert("1.0", text)
+        else:
+            widget.delete("1.0", tk.END)
+            widget.insert(tk.END, text)
+
+    def _load_task(self, task: dict):
+        self.type_var.set(task.get("report_type", ""))
+        self._set_textbox(self.site_text, task.get("site", ""))
+        if task.get("search_url_custom"):
+            self._set_textbox(self.search_url_text, task.get("search_url", ""))
+        else:
+            self._set_textbox(self.search_url_text, "")
+        tn = task.get("template_name", "")
+        if tn:
+            self.template_var.set(tn)
+            self._build_template_buttons()
+            self._on_tpl_select(tn)
 
     def _on_tpl_select(self, name):
         for n, btn in self.tpl_buttons.items():
@@ -432,6 +516,38 @@ class RegisterWindow:
         self.template_var.set(name)
         self._on_tpl_select(name)
 
+    def _parse_search_url_lines(self):
+        raw = self._search_url_text_content()
+        urls = []
+        for line in raw.splitlines():
+            url = line.strip()
+            if not url:
+                urls.append("")
+                continue
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            urls.append(url)
+        return urls
+
+    def _resolve_paired_sites(self):
+        """(site, effective_search_url, search_url_custom) — 검색 URL 미입력 시 사이트 주소 사용."""
+        raw_pairs = self._parse_paired_sites()
+        resolved = []
+        for site, search in raw_pairs:
+            custom = bool(search)
+            effective = search if custom else site
+            resolved.append((site, effective, custom))
+        return resolved
+
+    def _parse_paired_sites(self):
+        sites = self._parse_site_lines()
+        search_lines = self._parse_search_url_lines()
+        pairs = []
+        for i, site in enumerate(sites):
+            search = search_lines[i] if i < len(search_lines) else ""
+            pairs.append((site, search))
+        return pairs
+
     def _parse_site_lines(self):
         raw = self._site_text_content()
         sites = []
@@ -460,8 +576,8 @@ class RegisterWindow:
             self.url_preview.configure(state=tk.DISABLED)
 
     def _update_url_preview(self):
-        sites = self._parse_site_lines()
-        count = len(sites)
+        pairs = self._resolve_paired_sites()
+        count = len(pairs)
         if ctk and isinstance(self.url_count_label, ctk.CTkLabel):
             self.url_count_label.configure(
                 text=f"{count}개",
@@ -471,18 +587,22 @@ class RegisterWindow:
         else:
             self.url_count_label.configure(text=f"{count}개")
 
-        if not sites:
+        if not pairs:
             self._set_preview_text("URL을 입력하면 여기에 번호와 함께 표시됩니다.")
             return
 
         lines = []
-        for idx, site in enumerate(sites, 1):
-            lines.append(f"  {idx:02d}  {self._short_url(site)}")
+        for idx, (site, effective, custom) in enumerate(pairs, 1):
+            lines.append(f"  {idx:02d}  사이트: {self._short_url(site)}")
+            if custom:
+                lines.append(f"       검색: {self._short_url(effective)} (별도입력)")
+            else:
+                lines.append(f"       검색: {self._short_url(effective)} (사이트와 동일)")
         self._set_preview_text("\n".join(lines))
 
     def center_window(self, parent):
         self.top.update_idletasks()
-        width, height = 640, 880
+        width, height = 640, 1020
         parent_x = parent.winfo_x()
         parent_y = parent.winfo_y()
         parent_w = parent.winfo_width()
@@ -496,6 +616,11 @@ class RegisterWindow:
             return self.site_text.get("1.0", tk.END).strip()
         return self.site_text.get("1.0", tk.END).strip()
 
+    def _search_url_text_content(self):
+        if ctk and isinstance(self.search_url_text, ctk.CTkTextbox):
+            return self.search_url_text.get("1.0", tk.END).strip()
+        return self.search_url_text.get("1.0", tk.END).strip()
+
     def register(self):
         report_type = self.type_var.get().strip()
         template_choice = self.template_var.get()
@@ -504,8 +629,8 @@ class RegisterWindow:
             messagebox.showwarning("입력 필요", "유형을 입력해주세요.")
             return
 
-        sites = self._parse_site_lines()
-        if not sites:
+        pairs = self._resolve_paired_sites()
+        if not pairs:
             messagebox.showwarning("입력 필요", "사이트 주소를 입력해주세요.")
             return
 
@@ -514,10 +639,20 @@ class RegisterWindow:
             messagebox.showwarning("원본 없음", "해당 원본 신고 내용이 비어 있습니다.")
             return
 
-        for site in sites:
-            self.app.add_task(site, report_type, template, template_choice)
-
-        self.app.log(f"일괄 등록 완료: {len(sites)}개 URL")
+        if self.edit_mode:
+            site, effective, custom = pairs[0]
+            self.app.update_task(
+                self.task_index, site, report_type, template, template_choice,
+                search_url=effective, search_url_custom=custom,
+            )
+            self.app.log(f"신고 항목 수정: [{report_type}] {site}")
+        else:
+            for site, effective, custom in pairs:
+                self.app.add_task(
+                    site, report_type, template, template_choice,
+                    search_url=effective, search_url_custom=custom,
+                )
+            self.app.log(f"일괄 등록 완료: {len(pairs)}개 URL")
         self.app.root.update_idletasks()
         self.top.destroy()
 
@@ -974,8 +1109,10 @@ class ReportApp:
         parent.grid_rowconfigure(0, weight=1)
         parent.grid_columnconfigure(0, weight=1)
 
-        tree = ttk.Treeview(parent, columns=("no", "report_type", "site", "template_name"),
-                            show="headings", style="Task.Treeview")
+        tree = ttk.Treeview(
+            parent, columns=("no", "report_type", "site", "template_name"),
+            show="headings", style="Task.Treeview", selectmode="extended",
+        )
         tree.heading("no", text="No.")
         tree.heading("report_type", text="유형")
         tree.heading("site", text="사이트")
@@ -989,6 +1126,7 @@ class ReportApp:
         sb.grid(row=0, column=1, sticky="ns")
         tree.configure(yscrollcommand=sb.set)
         tree.bind("<Delete>", lambda e: self.delete_selected_task())
+        tree.bind("<Double-1>", lambda e: self.open_edit_task())
         return tree
 
     # ===================== Results Tab =====================
@@ -1063,23 +1201,25 @@ class ReportApp:
 
         tree = ttk.Treeview(
             frame,
-            columns=("datetime", "account", "site", "report_type", "site_count", "original", "rewritten"),
-            show="headings", style="Preview.Treeview",
+            columns=("datetime", "account", "site", "search_mode", "report_type", "site_count", "original", "rewritten"),
+            show="headings", style="Preview.Treeview", selectmode="extended",
         )
         tree.heading("datetime", text="생성 시간")
         tree.heading("account", text="사용 계정")
         tree.heading("site", text="사이트")
+        tree.heading("search_mode", text="검색URL")
         tree.heading("report_type", text="유형")
         tree.heading("site_count", text="사이트 신고")
         tree.heading("original", text="원본 신고 내용")
         tree.heading("rewritten", text="리라이트 된 내용")
         tree.column("datetime", width=110, anchor="center")
-        tree.column("account", width=100, anchor="center")
-        tree.column("site", width=160, anchor="w")
+        tree.column("account", width=90, anchor="center")
+        tree.column("site", width=150, anchor="w")
+        tree.column("search_mode", width=72, anchor="center")
         tree.column("report_type", width=70, anchor="center")
         tree.column("site_count", width=80, anchor="center")
-        tree.column("original", width=260, anchor="w")
-        tree.column("rewritten", width=260, anchor="w")
+        tree.column("original", width=220, anchor="w")
+        tree.column("rewritten", width=220, anchor="w")
         tree.grid(row=0, column=0, sticky="nsew")
 
         sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
@@ -1183,8 +1323,10 @@ class ReportApp:
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
 
-        self.account_tree = ttk.Treeview(tree_frame, columns=("id", "password"),
-                                         show="headings", style="Account.Treeview")
+        self.account_tree = ttk.Treeview(
+            tree_frame, columns=("id", "password"),
+            show="headings", style="Account.Treeview", selectmode="extended",
+        )
         self.account_tree.heading("id", text="아이디")
         self.account_tree.heading("password", text="비밀번호")
         self.account_tree.column("id", width=150, anchor="center")
@@ -1311,6 +1453,8 @@ class ReportApp:
                         "rewritten": value.get("rewritten", ""),
                         "datetime": value.get("datetime", ""),
                         "status": value.get("status", ""),
+                        "search_url": value.get("search_url", ""),
+                        "search_url_custom": value.get("search_url_custom", False),
                     }
             except Exception:
                 self.hidden_results = {}
@@ -1327,6 +1471,8 @@ class ReportApp:
                 "rewritten": value["rewritten"],
                 "datetime": value.get("datetime", ""),
                 "status": value.get("status", ""),
+                "search_url": value.get("search_url", ""),
+                "search_url_custom": value.get("search_url_custom", False),
             }
         with open(RESULTS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1338,6 +1484,18 @@ class ReportApp:
                     self.tasks = json.load(f)
             except Exception:
                 self.tasks = []
+        for task in self.tasks:
+            site = task.get("site", "")
+            if "search_url_custom" not in task:
+                stored = (task.get("search_url") or "").strip()
+                if stored and stored != site:
+                    task["search_url_custom"] = True
+                    task["search_url"] = stored
+                else:
+                    task["search_url_custom"] = False
+                    task["search_url"] = site
+            elif not (task.get("search_url") or "").strip():
+                task["search_url"] = site
         self.refresh_task_list()
 
     def save_tasks(self):
@@ -1731,7 +1889,14 @@ class ReportApp:
             return widget.get("1.0", tk.END).strip()
         return widget.get("1.0", tk.END).strip()
 
-    def add_task(self, site, report_type, template, template_name=None):
+    @staticmethod
+    def search_url_mode_label(search_url_custom: bool) -> str:
+        return "별도입력" if search_url_custom else "사이트동일"
+
+    def add_task(
+        self, site, report_type, template, template_name=None,
+        search_url="", search_url_custom=False,
+    ):
         if template_name is None:
             options = self.get_template_options()
             template_name = options[0][0] if options else ""
@@ -1740,10 +1905,35 @@ class ReportApp:
             "report_type": report_type,
             "template": template,
             "template_name": template_name,
+            "search_url": search_url or site,
+            "search_url_custom": bool(search_url_custom),
         })
         self.save_tasks()
         self.refresh_task_list()
-        self.log(f"등록: [{report_type}] {site}")
+        mode = self.search_url_mode_label(search_url_custom)
+        self.log(f"등록: [{report_type}] {site} (검색URL: {mode})")
+
+    def update_task(
+        self, index, site, report_type, template, template_name,
+        search_url="", search_url_custom=False,
+    ):
+        self.tasks[index] = {
+            "site": site,
+            "report_type": report_type,
+            "template": template,
+            "template_name": template_name,
+            "search_url": search_url or site,
+            "search_url_custom": bool(search_url_custom),
+        }
+        self.save_tasks()
+        self.refresh_task_list()
+
+    def open_edit_task(self):
+        selected = self.task_tree.selection()
+        if not selected:
+            return
+        idx = self.task_tree.index(selected[0])
+        RegisterWindow(self.root, self, task_index=idx)
 
     def refresh_task_list(self):
         for item in self.task_tree.get_children():
@@ -1762,11 +1952,15 @@ class ReportApp:
         if not selected:
             messagebox.showwarning("선택 오류", "삭제할 항목을 선택해주세요.")
             return
-        idx = self.task_tree.index(selected[0])
-        del self.tasks[idx]
+        indices = sorted((self.task_tree.index(item) for item in selected), reverse=True)
+        for idx in indices:
+            del self.tasks[idx]
         self.save_tasks()
         self.refresh_task_list()
-        self.log("항목 삭제 완료")
+        if len(indices) == 1:
+            self.log("항목 삭제 완료")
+        else:
+            self.log(f"항목 {len(indices)}개 삭제 완료")
 
     def refresh_account_list(self):
         for item in self.account_tree.get_children():
@@ -1862,11 +2056,15 @@ class ReportApp:
         if not selected:
             messagebox.showwarning("선택 오류", "삭제할 계정을 선택해주세요.")
             return
-        naver_id = self.account_tree.item(selected[0])["values"][0]
-        self.accounts = [acc for acc in self.accounts if acc["id"] != naver_id]
+        ids_to_remove = {self.account_tree.item(item)["values"][0] for item in selected}
+        removed = [acc["id"] for acc in self.accounts if acc["id"] in ids_to_remove]
+        self.accounts = [acc for acc in self.accounts if acc["id"] not in ids_to_remove]
         self.save_accounts()
         self.refresh_account_list()
-        self.log(f"계정 삭제 완료: {naver_id}")
+        if len(removed) == 1:
+            self.log(f"계정 삭제 완료: {removed[0]}")
+        else:
+            self.log(f"계정 삭제 완료: {len(removed)}개")
 
     # GPT / Preview / Report
     def generate_variants_with_account(self, site_url, report_type, templates, api_key, model, account_id):
@@ -1929,7 +2127,10 @@ class ReportApp:
         self.hidden_results[key] = {"site": site, "report_type": report_type, "account_id": account_id or "", **data, "datetime": dt}
         return dt
 
-    def insert_preview(self, site, report_type, original, rewritten, dt=None, account_id=None, status=None):
+    def insert_preview(
+        self, site, report_type, original, rewritten, dt=None, account_id=None,
+        status=None, search_url_custom=False,
+    ):
         if dt is None:
             dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         account_id = account_id or ""
@@ -1941,8 +2142,9 @@ class ReportApp:
             tags = ("protected", site, report_type, original, rewritten)
         stats = self.compute_site_report_stats()
         site_count = self._format_site_count_cell(site, status or "", stats)
+        search_label = self.search_url_mode_label(bool(search_url_custom))
         self.results_tree.insert("", tk.END, values=(
-            dt, account_id, site, report_type, site_count,
+            dt, account_id, site, search_label, report_type, site_count,
             self._truncate(original, 45), self._truncate(display_rewritten, 45)),
             tags=tags)
         self.refresh_site_stats_panel()
@@ -1952,9 +2154,9 @@ class ReportApp:
         if not selected:
             return
         row = self.results_tree.item(selected[0])["values"]
-        if len(row) < 4:
+        if len(row) < 5:
             return
-        dt, account_id, site, report_type = row[0], row[1], row[2], row[3]
+        dt, account_id, site, report_type = row[0], row[1], row[2], row[4]
         tags = self.results_tree.item(selected[0])["tags"]
         if not tags:
             return
@@ -1963,10 +2165,22 @@ class ReportApp:
         else:
             site, report_type, original, rewritten = tags[0], tags[1], tags[2], tags[3]
         account_password = self.get_account_password_for_result(dt, account_id, site, report_type)
+        result_meta = self.get_result_meta(dt, account_id, site, report_type)
         DetailWindow(
             self.root, site, report_type, original, rewritten,
             account_id=account_id, account_password=account_password,
+            search_url=result_meta.get("search_url", ""),
+            search_url_custom=result_meta.get("search_url_custom", False),
         )
+
+    def get_result_meta(self, dt, account_id, site, report_type):
+        for data in self.hidden_results.values():
+            if (data.get("datetime") == dt
+                    and data.get("account_id", "") == account_id
+                    and data.get("site") == site
+                    and data.get("report_type") == report_type):
+                return data
+        return {}
 
     def get_account_password_for_result(self, dt, account_id, site, report_type):
         for data in self.hidden_results.values():
@@ -2055,8 +2269,13 @@ class ReportApp:
 
         def run():
             for task in self.tasks:
-                results = self.generate_variants(task["site"], task["report_type"], [task["template"]], api_key, self.model_var.get())
+                results = self.generate_variants(
+                    task["site"], task["report_type"], [task["template"]],
+                    api_key, self.model_var.get(),
+                )
                 for url, data in results.items():
+                    data["search_url"] = task.get("search_url", url)
+                    data["search_url_custom"] = task.get("search_url_custom", False)
                     self._add_result(url, task["report_type"], data)
             self.root.after(0, self._enable_buttons)
             self.root.after(0, lambda: self.log("[미리보기] 완료"))
@@ -2208,13 +2427,16 @@ class ReportApp:
                 "rewritten": item["rewritten"],
                 "status": status,
                 "account_password": item.get("account_password", ""),
+                "search_url": item.get("search_url", ""),
+                "search_url_custom": item.get("search_url_custom", False),
             }
             dt = self._add_result(item["site"], item["report_type"], data, item["account_id"])
             self.root.after(
                 0,
                 lambda s=item["site"], rt=item["report_type"], o=item["original"], r=item["rewritten"],
-                       d=dt, a=item["account_id"], st=status:
-                self.insert_preview(s, rt, o, r, d, a, st)
+                       d=dt, a=item["account_id"], st=status,
+                       suc=item.get("search_url_custom", False):
+                self.insert_preview(s, rt, o, r, d, a, st, search_url_custom=suc)
             )
 
         current = [0]
@@ -2377,11 +2599,12 @@ class ReportApp:
             if status == "protected":
                 display_rewritten = "보호조치 해제 필요"
             site_count = self._format_site_count_cell(site, status, stats)
+            search_label = self.search_url_mode_label(bool(data.get("search_url_custom")))
             tags = (data["site"], data["report_type"], data["original"], data["rewritten"])
             if status == "protected":
                 tags = ("protected", data["site"], data["report_type"], data["original"], data["rewritten"])
             self.results_tree.insert("", tk.END, values=(
-                dt, account_id, site, data["report_type"], site_count,
+                dt, account_id, site, search_label, data["report_type"], site_count,
                 self._truncate(data["original"], 45), self._truncate(display_rewritten, 45)),
                 tags=tags)
 
@@ -2389,19 +2612,27 @@ class ReportApp:
         selected = self.results_tree.selection()
         if not selected:
             return
-        values = self.results_tree.item(selected[0])["values"]
-        dt, account, site, rt = values[0], values[1], values[2], values[3]
-        matched = None
-        for key, data in self.hidden_results.items():
-            if (data.get("datetime") == dt and data.get("account_id", "") == account
-                    and data.get("site") == site and data.get("report_type") == rt):
-                matched = key
-                break
-        if matched:
-            del self.hidden_results[matched]
-            self.save_results()
-            self.refresh_results_tree(self.search_var.get())
-            self.log(f"결과 삭제: {site}")
+        keys_to_remove: set[str] = set()
+        for item in selected:
+            values = self.results_tree.item(item)["values"]
+            if len(values) < 5:
+                continue
+            dt, account, site, rt = values[0], values[1], values[2], values[4]
+            for key, data in self.hidden_results.items():
+                if (data.get("datetime") == dt and data.get("account_id", "") == account
+                        and data.get("site") == site and data.get("report_type") == rt):
+                    keys_to_remove.add(key)
+                    break
+        if not keys_to_remove:
+            return
+        for key in keys_to_remove:
+            del self.hidden_results[key]
+        self.save_results()
+        self.refresh_results_tree(self.search_var.get())
+        if len(keys_to_remove) == 1:
+            self.log("결과 삭제 완료")
+        else:
+            self.log(f"결과 {len(keys_to_remove)}개 삭제 완료")
 
     def filter_results(self):
         self.refresh_results_tree(self.search_var.get())
