@@ -215,72 +215,54 @@ def extract_zip_to_staging(zip_path: Path, staging_dir: Path) -> Path:
     return staging_dir
 
 
-def _write_update_batch(batch_path: Path) -> None:
-  batch_path.write_text(
-    r"""@echo off
-setlocal EnableExtensions
-set "STAGING=%~1"
-set "INSTALL=%~2"
-set "EXE=%~3"
-set "INNER=%~4"
-set "WAITEXE=%~5"
-set "WAITPID=%~6"
-set "LOG=%TEMP%\NaverReport_update.log"
-
->>"%LOG%" echo [%date% %time%] update start
->>"%LOG%" echo STAGING=%STAGING%
->>"%LOG%" echo INSTALL=%INSTALL%
->>"%LOG%" echo EXE=%EXE%
->>"%LOG%" echo WAITPID=%WAITPID%
-
-set /a WAIT_COUNT=0
-:wait_loop
-set /a WAIT_COUNT+=1
-if %WAIT_COUNT% gtr 90 goto proceed
-timeout /t 1 /nobreak >nul
-if not "%WAITPID%"=="" (
-  powershell -NoProfile -WindowStyle Hidden -Command "if (Get-Process -Id %WAITPID% -ErrorAction SilentlyContinue) { exit 1 } else { exit 0 }" >nul 2>&1
-  if errorlevel 1 goto wait_loop
-) else (
-  tasklist /FI "IMAGENAME eq %WAITEXE%" 2>nul | find /I "%WAITEXE%" >nul
-  if not errorlevel 1 goto wait_loop
+def _write_update_script(script_path: Path) -> None:
+    script_path.write_text(
+        r"""param(
+    [string]$Staging,
+    [string]$Install,
+    [string]$Exe,
+    [string]$Inner,
+    [int]$WaitPid
 )
-goto proceed
+$ErrorActionPreference = "Continue"
+$Log = Join-Path $env:TEMP "NaverReport_update.log"
+function Write-Log([string]$Message) {
+    Add-Content -Path $Log -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
+}
 
-:proceed
->>"%LOG%" echo process ended, waiting file unlock
-timeout /t 3 /nobreak >nul
+Write-Log "update start (powershell)"
+Write-Log "Staging=$Staging"
+Write-Log "Install=$Install"
+Write-Log "Exe=$Exe"
+Write-Log "WaitPid=$WaitPid"
 
-if exist "%STAGING%\%INNER%\" (
-  set "SRC=%STAGING%\%INNER%"
-) else (
-  set "SRC=%STAGING%"
-)
+$deadline = (Get-Date).AddSeconds(90)
+while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Seconds 1
+}
+Write-Log "process wait done"
+Start-Sleep -Seconds 3
 
->>"%LOG%" echo robocopy "%SRC%" "%INSTALL%"
-robocopy "%SRC%" "%INSTALL%" /E /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS >nul
-if errorlevel 8 (
-  >>"%LOG%" echo robocopy failed code %errorlevel%
-  goto fail
-)
+$src = Join-Path $Staging $Inner
+if (-not (Test-Path $src)) { $src = $Staging }
+Write-Log "robocopy $src -> $Install"
 
-rd /s /q "%STAGING%" 2>nul
->>"%LOG%" echo starting %EXE%
-start "" "%EXE%"
->>"%LOG%" echo update success
-endlocal
-del "%~f0"
-exit /b 0
+& robocopy $src $Install /E /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS | Out-Null
+if ($LASTEXITCODE -ge 8) {
+    Write-Log "robocopy failed code $LASTEXITCODE"
+    exit 1
+}
 
-:fail
->>"%LOG%" echo update failed
-msg * "업데이트 실패. 로그: %TEMP%\NaverReport_update.log"
-endlocal
-del "%~f0"
-exit /b 1
+Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
+Write-Log "starting $Exe"
+Start-Process -FilePath $Exe
+Write-Log "update success"
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+exit 0
 """,
-    encoding="utf-8",
-  )
+        encoding="utf-8",
+    )
 
 
 def schedule_apply_update(
@@ -307,22 +289,26 @@ def schedule_apply_update(
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise RuntimeError(f"업데이트 zip 풀기 실패: {exc}") from exc
 
-    batch_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.bat"
-    _write_update_batch(batch_path)
+    script_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.ps1"
+    _write_update_script(script_path)
 
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = 0
     subprocess.Popen(
         [
-            "cmd.exe",
-            "/c",
-            str(batch_path),
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+            str(script_path),
             str(staging_dir),
             str(target_dir),
             str(exe_path),
             inner,
-            exe_name,
             str(os.getpid()),
         ],
         startupinfo=startupinfo,

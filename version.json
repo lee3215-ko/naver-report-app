@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.12",
+    "version":  "1.0.13",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "자동 업데이트 CMD 멈춤 수정 (find PID 무한대기, 창 숨김)"
+    "notes":  "자동 업데이트 CMD find 멈춤 완전 수정 (PowerShell 전용 설치)"
 }
