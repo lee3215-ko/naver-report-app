@@ -1,9 +1,12 @@
 {
     "version":  "1.0.16",
-    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.16/NaverReport.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/465107783",
     "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.16/NaverReport.zip",
     "notes":  "신고 목록 드래그 순서 변경, 유형 한글 입력 IME 수정",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/465107783",
+    "asset_id":  465107783,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/465107783",
                           "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.16/NaverReport.zip",
                           "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip"
                       ]
