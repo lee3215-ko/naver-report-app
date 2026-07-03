@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.11",
+    "version":  "1.0.12",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "검색URL 자동(실시간 tqi·ackey), 신고항목 수정, 계정목록 더블클릭 복사, 검색URL 입력여부 표시"
+    "notes":  "자동 업데이트 CMD 멈춤 수정 (find PID 무한대기, 창 숨김)"
 }

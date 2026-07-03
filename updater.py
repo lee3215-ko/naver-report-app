@@ -231,17 +231,23 @@ set "LOG=%TEMP%\NaverReport_update.log"
 >>"%LOG%" echo STAGING=%STAGING%
 >>"%LOG%" echo INSTALL=%INSTALL%
 >>"%LOG%" echo EXE=%EXE%
+>>"%LOG%" echo WAITPID=%WAITPID%
 
+set /a WAIT_COUNT=0
 :wait_loop
+set /a WAIT_COUNT+=1
+if %WAIT_COUNT% gtr 90 goto proceed
 timeout /t 1 /nobreak >nul
 if not "%WAITPID%"=="" (
-  tasklist /FI "PID eq %WAITPID%" 2>nul | find "%WAITPID%" >nul
-  if not errorlevel 1 goto wait_loop
+  powershell -NoProfile -WindowStyle Hidden -Command "if (Get-Process -Id %WAITPID% -ErrorAction SilentlyContinue) { exit 1 } else { exit 0 }" >nul 2>&1
+  if errorlevel 1 goto wait_loop
 ) else (
   tasklist /FI "IMAGENAME eq %WAITEXE%" 2>nul | find /I "%WAITEXE%" >nul
   if not errorlevel 1 goto wait_loop
 )
+goto proceed
 
+:proceed
 >>"%LOG%" echo process ended, waiting file unlock
 timeout /t 3 /nobreak >nul
 
@@ -252,7 +258,7 @@ if exist "%STAGING%\%INNER%\" (
 )
 
 >>"%LOG%" echo robocopy "%SRC%" "%INSTALL%"
-robocopy "%SRC%" "%INSTALL%" /E /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS
+robocopy "%SRC%" "%INSTALL%" /E /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS >nul
 if errorlevel 8 (
   >>"%LOG%" echo robocopy failed code %errorlevel%
   goto fail
@@ -304,7 +310,9 @@ def schedule_apply_update(
     batch_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.bat"
     _write_update_batch(batch_path)
 
-    creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
     subprocess.Popen(
         [
             "cmd.exe",
@@ -317,7 +325,8 @@ def schedule_apply_update(
             exe_name,
             str(os.getpid()),
         ],
-        creationflags=creationflags,
+        startupinfo=startupinfo,
+        creationflags=subprocess.CREATE_NO_WINDOW,
         close_fds=True,
     )
 
