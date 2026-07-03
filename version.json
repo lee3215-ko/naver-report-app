@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.13",
+    "version":  "1.0.14",
     "url":  "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip",
-    "notes":  "자동 업데이트 CMD find 멈춤 완전 수정 (PowerShell 전용 설치)"
+    "notes":  "자동 업데이트 테스트 — data 폴더 보존, CMD find 없음"
 }

@@ -241,14 +241,19 @@ while ((Get-Date) -lt $deadline) {
     if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) { break }
     Start-Sleep -Seconds 1
 }
+if (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue) {
+    Write-Log "force stop pid $WaitPid"
+    Stop-Process -Id $WaitPid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+}
 Write-Log "process wait done"
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 2
 
 $src = Join-Path $Staging $Inner
 if (-not (Test-Path $src)) { $src = $Staging }
-Write-Log "robocopy $src -> $Install"
+Write-Log "robocopy $src -> $Install (data folder excluded)"
 
-& robocopy $src $Install /E /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS | Out-Null
+& robocopy $src $Install /E /IS /IT /XD data /R:8 /W:3 /NFL /NDL /NJH /NJS | Out-Null
 if ($LASTEXITCODE -ge 8) {
     Write-Log "robocopy failed code $LASTEXITCODE"
     exit 1
