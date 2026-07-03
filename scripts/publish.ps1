@@ -194,6 +194,13 @@ if (Test-GhRelease $tag) {
     Invoke-Gh release create $tag $zipPath --title $newVersion --notes $Notes --latest
 }
 
+Write-VersionJson $cfg $newVersion $Notes
+if (git status --porcelain version.json) {
+    Invoke-Git add version.json
+    Invoke-Git commit -m "Update version.json download URLs for $newVersion"
+    Invoke-Git push origin main
+}
+
 Write-Host ""
 Write-Host "Done!"
 Write-Host "  version: $newVersion"

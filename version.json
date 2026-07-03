@@ -1,10 +1,10 @@
 {
-    "version":  "1.0.15",
-    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.15/NaverReport.zip",
-    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.15/NaverReport.zip",
-    "notes":  "다운로드 DNS 오류 수정(api.github 우회), 신고항목 등록 즉시 완료",
+    "version":  "1.0.16",
+    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.16/NaverReport.zip",
+    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.16/NaverReport.zip",
+    "notes":  "신고 목록 드래그 순서 변경, 유형 한글 입력 IME 수정",
     "download_urls":  [
-                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.15/NaverReport.zip",
+                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.16/NaverReport.zip",
                           "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip"
                       ]
 }

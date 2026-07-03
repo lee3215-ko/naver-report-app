@@ -316,22 +316,23 @@ class RegisterWindow:
         card_inner.grid_columnconfigure(0, weight=1)
 
         ui_label(card_inner, "유형", "body_bold", COLORS["text_muted"]).grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self.type_var = tk.StringVar()
+        self._preview_after_id = None
         if ctk:
             self.type_entry = ctk.CTkEntry(
-                card_inner, textvariable=self.type_var, height=42,
+                card_inner, height=42,
                 font=FONTS["body"], fg_color=COLORS["input_bg"], text_color=COLORS["text"],
                 border_color=COLORS["input_border"], corner_radius=10,
             )
         else:
             self.type_entry = tk.Entry(
-                card_inner, textvariable=self.type_var, font=FONTS["body"],
+                card_inner, font=FONTS["body"],
                 bg=COLORS["input_bg"], fg=COLORS["text"],
                 highlightbackground=COLORS["input_border"], highlightthickness=1,
             )
         self.type_entry.grid(row=1, column=0, sticky="ew", pady=(0, 16))
         self.type_entry.bind("<Return>", lambda e: self.register())
-        self.type_entry.bind("<KeyRelease>", self._on_type_entry_release)
+        self.type_entry.bind("<KeyRelease>", self._schedule_url_preview)
+        self.type_entry.bind("<FocusOut>", self._on_type_focus_out)
         self.type_entry.focus()
 
         ui_label(card_inner, "사이트 주소", "body_bold", COLORS["text_muted"]).grid(
@@ -475,8 +476,34 @@ class RegisterWindow:
             widget.delete("1.0", tk.END)
             widget.insert(tk.END, text)
 
-    def _on_type_entry_release(self, event=None):
+    def _get_type_text(self) -> str:
+        if ctk and isinstance(self.type_entry, ctk.CTkEntry):
+            return self.type_entry.get()
+        return self.type_entry.get()
+
+    def _set_type_text(self, text: str) -> None:
+        if ctk and isinstance(self.type_entry, ctk.CTkEntry):
+            self.type_entry.delete(0, tk.END)
+            self.type_entry.insert(0, text)
+        else:
+            self.type_entry.delete(0, tk.END)
+            self.type_entry.insert(0, text)
+
+    def _schedule_url_preview(self, event=None):
+        if self._preview_after_id is not None:
+            self.top.after_cancel(self._preview_after_id)
+        self._preview_after_id = self.top.after(150, self._deferred_url_preview)
+
+    def _deferred_url_preview(self):
+        self._preview_after_id = None
         self._update_url_preview()
+
+    def _on_type_focus_out(self, event=None):
+        if self._preview_after_id is not None:
+            self.top.after_cancel(self._preview_after_id)
+            self._preview_after_id = None
+        # IME 조합 완료 후 반영되도록 짧게 지연
+        self.top.after(80, self._update_url_preview)
 
     def _toggle_search_auto(self):
         self.search_url_auto = not self.search_url_auto
@@ -551,7 +578,7 @@ class RegisterWindow:
                 self._set_textbox(self.search_url_text, "")
 
     def _load_task(self, task: dict):
-        self.type_var.set(task.get("report_type", ""))
+        self._set_type_text(task.get("report_type", ""))
         self._set_textbox(self.site_text, task.get("site", ""))
         if task.get("search_url_auto"):
             self.search_url_auto = True
@@ -651,7 +678,7 @@ class RegisterWindow:
         """(site, effective_search_url, search_url_custom, search_url_auto)."""
         sites = self._parse_site_lines()
         if self.search_url_auto:
-            kw = self.type_var.get().strip()
+            kw = self._get_type_text().strip()
             preview_url = resolve_naver_search_url(kw, live=False) if kw else ""
             return [(site, preview_url or site, True, True) for site in sites]
 
@@ -748,7 +775,7 @@ class RegisterWindow:
         return self.search_url_text.get("1.0", tk.END).strip()
 
     def register(self):
-        report_type = self.type_var.get().strip()
+        report_type = self._get_type_text().strip()
         template_choice = self.template_var.get()
 
         if not report_type:
@@ -809,6 +836,9 @@ class ReportApp:
         self.tasks = []
         self.templates = []
         self._editing_template_id = None
+        self._task_drag_state = None
+        self._task_drag_indicator = None
+        self._task_drag_ghost = None
 
         self.sidebar = SidebarNav(self.root, self.on_tab_change, app_version=APP_VERSION)
 
@@ -923,6 +953,12 @@ class ReportApp:
         header = self._frame(bottom_card, COLORS["card"])
         header.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 10))
         ui_label(header, "등록된 신고 목록", "heading", COLORS["text"]).pack(side=tk.LEFT)
+        ui_label(
+            header,
+            "드래그하여 순서 변경",
+            "caption",
+            COLORS["text_light"],
+        ).pack(side=tk.LEFT, padx=(12, 0))
         if ctk:
             self.task_count_label = ctk.CTkLabel(
                 header, text="0개", font=FONTS["badge"],
@@ -1254,8 +1290,14 @@ class ReportApp:
         sb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
         tree.configure(yscrollcommand=sb.set)
+        tree.tag_configure("drag_source", background="#dbeafe")
+        tree.tag_configure("drag_target", background="#e0f2fe")
+        tree.tag_configure("drop_flash", background="#bbf7d0")
         tree.bind("<Delete>", lambda e: self.delete_selected_task())
         tree.bind("<Double-1>", lambda e: self.open_edit_task())
+        tree.bind("<ButtonPress-1>", self._on_task_drag_press, add="+")
+        tree.bind("<B1-Motion>", self._on_task_drag_motion, add="+")
+        tree.bind("<ButtonRelease-1>", self._on_task_drag_release, add="+")
         return tree
 
     # ===================== Results Tab =====================
@@ -2093,6 +2135,169 @@ class ReportApp:
                 self.get_template_title(task.get("template_name", "")),
             ))
         self.task_count_label.configure(text=f"{len(self.tasks)}개")
+
+    def _clear_task_drag_ui(self):
+        tree = self.task_tree
+        for iid in tree.get_children():
+            tree.item(iid, tags=())
+        if self._task_drag_indicator is not None:
+            self._task_drag_indicator.place_forget()
+        if self._task_drag_ghost is not None:
+            self._task_drag_ghost.destroy()
+            self._task_drag_ghost = None
+        self._task_drag_state = None
+
+    def _ensure_task_drag_indicator(self):
+        if self._task_drag_indicator is None:
+            self._task_drag_indicator = tk.Frame(
+                self.task_tree,
+                bg=COLORS["accent"],
+                height=3,
+            )
+        return self._task_drag_indicator
+
+    def _task_drop_index(self, event_y: int) -> int:
+        tree = self.task_tree
+        children = tree.get_children()
+        if not children:
+            return 0
+        item = tree.identify_row(event_y)
+        if not item:
+            return len(children)
+        bbox = tree.bbox(item)
+        if not bbox:
+            return tree.index(item)
+        _, y, _, h = bbox
+        idx = tree.index(item)
+        return idx + 1 if event_y > y + h / 2 else idx
+
+    def _show_task_drag_indicator(self, drop_idx: int):
+        tree = self.task_tree
+        children = tree.get_children()
+        indicator = self._ensure_task_drag_indicator()
+        if not children:
+            indicator.place(x=0, y=2, relwidth=1, anchor="nw")
+            indicator.lift()
+            return
+        if drop_idx >= len(children):
+            bbox = tree.bbox(children[-1])
+            y = bbox[1] + bbox[3] - 1 if bbox else 0
+        else:
+            bbox = tree.bbox(children[drop_idx])
+            y = bbox[1] - 1 if bbox else 0
+        indicator.place(x=0, y=max(y, 0), relwidth=1, anchor="nw")
+        indicator.lift()
+
+    def _show_task_drag_ghost(self, iid: str, event_y: int):
+        tree = self.task_tree
+        values = tree.item(iid, "values")
+        if not values:
+            return
+        label_text = f"  {values[1]}  {str(values[2])[:48]}"
+        if self._task_drag_ghost is None:
+            self._task_drag_ghost = tk.Label(
+                tree,
+                text=label_text,
+                bg=COLORS["accent_light"],
+                fg=COLORS["text"],
+                font=FONTS["small"],
+                relief=tk.RAISED,
+                borderwidth=1,
+                padx=10,
+                pady=6,
+            )
+        else:
+            self._task_drag_ghost.configure(text=label_text)
+        ghost_y = max(event_y - 18, 2)
+        self._task_drag_ghost.place(x=8, y=ghost_y, relwidth=0.96, anchor="nw")
+        self._task_drag_ghost.lift()
+
+    def _highlight_task_drop_target(self, drop_idx: int):
+        tree = self.task_tree
+        children = tree.get_children()
+        for iid in children:
+            tags = list(tree.item(iid, "tags") or ())
+            if "drag_target" in tags:
+                tags.remove("drag_target")
+            tree.item(iid, tags=tuple(tags))
+        if 0 <= drop_idx < len(children):
+            iid = children[drop_idx]
+            tags = tuple(set((tree.item(iid, "tags") or ()) + ("drag_target",)))
+            tree.item(iid, tags=tags)
+
+    def _on_task_drag_press(self, event):
+        tree = self.task_tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        self._task_drag_state = {
+            "iid": iid,
+            "source_idx": tree.index(iid),
+            "start_x": event.x,
+            "start_y": event.y,
+            "active": False,
+            "drop_idx": tree.index(iid),
+        }
+
+    def _on_task_drag_motion(self, event):
+        state = self._task_drag_state
+        if not state:
+            return
+        if not state["active"]:
+            if abs(event.y - state["start_y"]) < 8 and abs(event.x - state["start_x"]) < 8:
+                return
+            state["active"] = True
+            tree = self.task_tree
+            tree.selection_set(state["iid"])
+            tree.item(state["iid"], tags=("drag_source",))
+        drop_idx = self._task_drop_index(event.y)
+        state["drop_idx"] = drop_idx
+        self._show_task_drag_indicator(drop_idx)
+        self._show_task_drag_ghost(state["iid"], event.y)
+        self._highlight_task_drop_target(
+            min(drop_idx, max(len(self.task_tree.get_children()) - 1, 0)),
+        )
+
+    def _on_task_drag_release(self, event):
+        state = self._task_drag_state
+        if not state:
+            return
+        source_idx = state["source_idx"]
+        drop_idx = state.get("drop_idx", source_idx)
+        was_active = state["active"]
+        self._clear_task_drag_ui()
+
+        if not was_active:
+            return
+
+        if drop_idx > source_idx:
+            insert_idx = drop_idx - 1
+        else:
+            insert_idx = drop_idx
+        if insert_idx == source_idx:
+            return
+        if not (0 <= source_idx < len(self.tasks)):
+            return
+        insert_idx = max(0, min(insert_idx, len(self.tasks) - 1))
+
+        task = self.tasks.pop(source_idx)
+        self.tasks.insert(insert_idx, task)
+        self.save_tasks()
+        self.refresh_task_list()
+        children = self.task_tree.get_children()
+        if 0 <= insert_idx < len(children):
+            self._pulse_task_row(children[insert_idx])
+        self.log(f"신고 목록 순서 변경: {source_idx + 1}번 → {insert_idx + 1}번")
+
+    def _pulse_task_row(self, iid: str, step: int = 0):
+        if step >= 6:
+            self.task_tree.item(iid, tags=())
+            return
+        tag = ("drop_flash",) if step % 2 == 0 else ()
+        self.task_tree.item(iid, tags=tag)
+        self.root.after(70, lambda: self._pulse_task_row(iid, step + 1))
 
     def delete_selected_task(self):
         selected = self.task_tree.selection()
