@@ -9,7 +9,7 @@ from datetime import datetime
 from urllib.parse import quote
 
 from naver_reporter import NaverReporter
-from naver_search_url import build_naver_search_url as resolve_naver_search_url, fetch_naver_search_url_live
+from naver_search_url import build_naver_search_url as resolve_naver_search_url
 from paths import data_path, APP_VERSION
 from ui_theme import (
     COLORS,
@@ -369,9 +369,6 @@ class RegisterWindow:
         ui_label(search_header, "검색결과 URL", "body_bold", COLORS["text_muted"]).grid(
             row=0, column=0, sticky="w")
         self.search_url_auto = False
-        self._live_auto_url = ""
-        self._auto_url_fetching = False
-        self._auto_url_fetch_gen = 0
         if ctk:
             self.auto_search_btn = ctk.CTkButton(
                 search_header, text="자동", width=84, height=34,
@@ -480,43 +477,10 @@ class RegisterWindow:
 
     def _on_type_entry_release(self, event=None):
         self._update_url_preview()
-        if self.search_url_auto:
-            self._schedule_auto_url_fetch()
 
     def _toggle_search_auto(self):
         self.search_url_auto = not self.search_url_auto
         self._apply_search_auto_ui()
-        if self.search_url_auto:
-            self._schedule_auto_url_fetch()
-        else:
-            self._live_auto_url = ""
-        self._update_url_preview()
-
-    def _schedule_auto_url_fetch(self):
-        if not self.search_url_auto:
-            return
-        kw = self.type_var.get().strip()
-        if not kw:
-            self._live_auto_url = ""
-            self._update_url_preview()
-            return
-        self._auto_url_fetching = True
-        self._auto_url_fetch_gen += 1
-        gen = self._auto_url_fetch_gen
-        self._update_url_preview()
-
-        def work():
-            url = fetch_naver_search_url_live(kw, log=self.app.log)
-            def apply():
-                if gen == self._auto_url_fetch_gen:
-                    self._on_auto_url_fetched(url)
-            self.top.after(0, apply)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_auto_url_fetched(self, url: str):
-        self._auto_url_fetching = False
-        self._live_auto_url = url
         self._update_url_preview()
 
     def _apply_search_auto_ui(self):
@@ -592,7 +556,6 @@ class RegisterWindow:
         if task.get("search_url_auto"):
             self.search_url_auto = True
             self._apply_search_auto_ui()
-            self._schedule_auto_url_fetch()
         else:
             self.search_url_auto = False
             self._apply_search_auto_ui()
@@ -688,15 +651,9 @@ class RegisterWindow:
         """(site, effective_search_url, search_url_custom, search_url_auto)."""
         sites = self._parse_site_lines()
         if self.search_url_auto:
-            if self._auto_url_fetching:
-                auto_url = ""
-            else:
-                auto_url = self._live_auto_url or resolve_naver_search_url(
-                    self.type_var.get().strip(), live=False,
-                )
-            if not auto_url and not self._auto_url_fetching:
-                return []
-            return [(site, auto_url, True, True) for site in sites]
+            kw = self.type_var.get().strip()
+            preview_url = resolve_naver_search_url(kw, live=False) if kw else ""
+            return [(site, preview_url or site, True, True) for site in sites]
 
         raw_pairs = self._parse_paired_sites()
         resolved = []
@@ -755,21 +712,14 @@ class RegisterWindow:
             self.url_count_label.configure(text=f"{count}개")
 
         if not pairs:
-            if self.search_url_auto and self._auto_url_fetching:
-                messagebox.showinfo("잠시만요", "네이버 검색 URL을 가져오는 중입니다. 잠시 후 다시 등록해주세요.")
-                return
             self._set_preview_text("URL을 입력하면 여기에 번호와 함께 표시됩니다.")
-            return
-
-        if self.search_url_auto and self._auto_url_fetching:
-            self._set_preview_text("네이버 실시간 검색 중 (미리보기용, 신고 시에도 매번 새로 검색)...")
             return
 
         lines = []
         for idx, (site, effective, custom, auto) in enumerate(pairs, 1):
             lines.append(f"  {idx:02d}  사이트: {self._short_url(site)}")
             if auto:
-                lines.append(f"       검색: {self._short_url(effective)} (자동)")
+                lines.append("       검색: 신고 시 유형으로 실시간 생성 (tqi·ackey 매번 신규)")
             elif custom:
                 lines.append(f"       검색: {self._short_url(effective)} (별도입력)")
             else:
@@ -805,14 +755,6 @@ class RegisterWindow:
             messagebox.showwarning("입력 필요", "유형을 입력해주세요.")
             return
 
-        if self.search_url_auto and not self.type_var.get().strip():
-            messagebox.showwarning("입력 필요", "자동 검색 URL을 만들려면 유형을 입력해주세요.")
-            return
-
-        if self.search_url_auto:
-            kw = report_type
-            self._live_auto_url = fetch_naver_search_url_live(kw, log=self.app.log)
-
         pairs = self._resolve_paired_sites()
         if not pairs:
             messagebox.showwarning("입력 필요", "사이트 주소를 입력해주세요.")
@@ -835,7 +777,10 @@ class RegisterWindow:
                 self.app.add_task(
                     site, report_type, template, template_choice,
                     search_url=effective, search_url_custom=custom, search_url_auto=auto,
+                    save=False,
                 )
+            self.app.save_tasks()
+            self.app.refresh_task_list()
             self.app.log(f"일괄 등록 완료: {len(pairs)}개 URL")
         self.app.root.update_idletasks()
         self.top.destroy()
@@ -2091,6 +2036,7 @@ class ReportApp:
     def add_task(
         self, site, report_type, template, template_name=None,
         search_url="", search_url_custom=False, search_url_auto=False,
+        *, save=True,
     ):
         if template_name is None:
             options = self.get_template_options()
@@ -2104,13 +2050,14 @@ class ReportApp:
             "search_url_custom": bool(search_url_custom),
             "search_url_auto": bool(search_url_auto),
         })
-        self.save_tasks()
-        self.refresh_task_list()
         mode = self.search_url_mode_label(search_url_custom, search_url_auto)
         if search_url_auto:
             self.log(f"등록: [{report_type}] {site} (검색URL: {mode}, 신고 시 실시간 생성)")
         else:
             self.log(f"등록: [{report_type}] {site} (검색URL: {mode})")
+        if save:
+            self.save_tasks()
+            self.refresh_task_list()
 
     def update_task(
         self, index, site, report_type, template, template_name,

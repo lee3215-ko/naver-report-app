@@ -15,8 +15,9 @@ from updater import (
     UpdateInfo,
     can_auto_update,
     check_for_update,
-    download_file,
+    download_file_with_fallbacks,
     fetch_version_payload,
+    format_network_error,
     get_update_log_path,
     schedule_apply_update,
     validate_zip_file,
@@ -127,21 +128,23 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
         log_path = get_update_log_path()
         try:
             log(f"[업데이트] 다운로드 시작: {info.version}")
-            download_file(
-                info.url,
+            urls = list(info.download_urls) if info.download_urls else [info.url]
+            used_url = download_file_with_fallbacks(
+                urls,
                 zip_path,
                 user_agent=f"{app_name}/{info.version}",
                 on_progress=on_progress,
             )
             validate_zip_file(zip_path, min_bytes=1024 * 1024)
-            log(f"[업데이트] 다운로드 완료 ({zip_path.stat().st_size // 1024 // 1024} MB)")
+            log(f"[업데이트] 다운로드 완료 ({zip_path.stat().st_size // 1024 // 1024} MB) via {used_url}")
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            detail = format_network_error(exc)
             root.after(0, dialog.destroy)
             root.after(
                 0,
                 lambda: messagebox.showerror(
                     "업데이트 실패",
-                    f"다운로드 실패:\n{exc}\n\n브라우저에서 수동으로 받아 주세요.",
+                    f"다운로드 실패:\n{detail}\n\n「아니오」로 브라우저에서 직접 받아 주세요.",
                     parent=root,
                 ),
             )

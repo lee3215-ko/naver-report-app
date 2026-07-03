@@ -58,15 +58,41 @@ function Bump-Version([string]$Version, [string]$Part) {
 }
 
 function Write-VersionJson($cfg, [string]$Version, [string]$ReleaseNotes) {
-    $downloadUrl = "https://github.com/$($cfg.github_owner)/$($cfg.github_repo)/releases/latest/download/$($cfg.release_asset)"
+    $tag = "v$Version"
+    $owner = $cfg.github_owner
+    $repo = $cfg.github_repo
+    $asset = $cfg.release_asset
+    $downloadUrlLatest = "https://github.com/$owner/$repo/releases/latest/download/$asset"
+    $downloadUrlVersioned = "https://github.com/$owner/$repo/releases/download/$tag/$asset"
+    $assetId = $null
+    try {
+        $assetId = gh api "repos/$owner/$repo/releases/tags/$tag" --jq ".assets[0].id" 2>$null
+    } catch {
+        $assetId = $null
+    }
+    $apiDownloadUrl = $null
+    if ($assetId) {
+        $apiDownloadUrl = "https://api.github.com/repos/$owner/$repo/releases/assets/$assetId"
+    }
     $payload = [ordered]@{
         version = $Version
-        url     = $downloadUrl
-        notes   = $ReleaseNotes
-    } | ConvertTo-Json -Depth 3
+        url = if ($apiDownloadUrl) { $apiDownloadUrl } else { $downloadUrlVersioned }
+        download_url = $downloadUrlVersioned
+        notes = $ReleaseNotes
+    }
+    if ($apiDownloadUrl) {
+        $payload.api_download_url = $apiDownloadUrl
+        $payload.asset_id = [int]$assetId
+    }
+    $payload.download_urls = @(
+        $(if ($apiDownloadUrl) { $apiDownloadUrl }),
+        $downloadUrlVersioned,
+        $downloadUrlLatest
+    ) | Where-Object { $_ }
+    $json = $payload | ConvertTo-Json -Depth 4
     $path = Join-Path $Root "version.json"
   $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-  [System.IO.File]::WriteAllText($path, $payload + "`n", $utf8NoBom)
+  [System.IO.File]::WriteAllText($path, $json + "`n", $utf8NoBom)
 }
 
 function Write-TextNoBom([string]$Path, [string]$Text) {

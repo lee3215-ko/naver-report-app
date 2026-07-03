@@ -58,6 +58,7 @@ class UpdateInfo:
     version: str
     url: str
     notes: str
+    download_urls: tuple[str, ...] = ()
 
 
 def parse_version(version: str) -> tuple[int, ...]:
@@ -145,10 +146,17 @@ def check_for_update(version_url: str, current_version: str, *, app_name: str = 
     remote_version = str(payload.get("version", "")).strip()
     if not remote_version or not is_newer(remote_version, current_version):
         return None
+    download_urls = collect_download_urls(
+        payload,
+        version_url=version_url,
+        user_agent=user_agent,
+    )
+    primary = download_urls[0] if download_urls else str(payload.get("url", "")).strip()
     return UpdateInfo(
         version=remote_version,
-        url=str(payload.get("url", "")).strip(),
+        url=primary,
         notes=str(payload.get("notes", "")).strip(),
+        download_urls=download_urls,
     )
 
 
@@ -181,6 +189,134 @@ def validate_zip_file(zip_path: Path, min_bytes: int = 1024) -> None:
         raise ValueError("다운로드 파일이 zip 형식이 아닙니다 (GitHub 오류 페이지일 수 있습니다).")
 
 
+def _github_repo_from_version_url(version_url: str) -> tuple[str, str] | None:
+    match = _RAW_GITHUB_RE.match(version_url.strip())
+    if match is None:
+        return None
+    return match.group("owner"), match.group("repo")
+
+
+def _release_tag(version: str) -> str:
+    version = version.strip()
+    return version if version.startswith("v") else f"v{version}"
+
+
+def _versioned_release_url(owner: str, repo: str, version: str, asset: str) -> str:
+    return (
+        f"https://github.com/{owner}/{repo}/releases/download/"
+        f"{_release_tag(version)}/{asset}"
+    )
+
+
+def _github_api_asset_url(owner: str, repo: str, asset_id: int) -> str:
+    return f"https://api.github.com/repos/{owner}/{repo}/releases/assets/{asset_id}"
+
+
+def _fetch_release_asset_id(
+    owner: str,
+    repo: str,
+    version: str,
+    asset_name: str,
+    user_agent: str,
+) -> int | None:
+    tag = _release_tag(version)
+    endpoints = (
+        f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}",
+        f"https://api.github.com/repos/{owner}/{repo}/releases/latest",
+    )
+    for endpoint in endpoints:
+        try:
+            request = urllib.request.Request(
+                endpoint,
+                headers={
+                    "User-Agent": user_agent,
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+            with _urlopen(request, timeout=20) as response:
+                release = json.loads(response.read().decode("utf-8-sig"))
+            for asset in release.get("assets") or []:
+                if asset.get("name") == asset_name and asset.get("id"):
+                    return int(asset["id"])
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, TypeError, KeyError):
+            continue
+    return None
+
+
+def _dedupe_urls(urls: list[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in urls:
+        url = raw.strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        ordered.append(url)
+    return tuple(ordered)
+
+
+def collect_download_urls(
+    payload: dict,
+    *,
+    version_url: str = "",
+    user_agent: str = "App",
+    asset_name: str = "NaverReport.zip",
+) -> tuple[str, ...]:
+    """다운로드 URL 후보. api.github.com 자산 URL을 우선해 github.com DNS 오류를 우회."""
+    urls: list[str] = []
+    version = str(payload.get("version", "")).strip()
+
+    for key in ("url", "download_url", "api_download_url"):
+        value = str(payload.get(key, "")).strip()
+        if value:
+            urls.append(value)
+    for item in payload.get("download_urls") or []:
+        value = str(item).strip()
+        if value:
+            urls.append(value)
+
+    owner_repo = _github_repo_from_version_url(version_url)
+    if owner_repo and version:
+        owner, repo = owner_repo
+        asset_id = payload.get("asset_id")
+        try:
+            asset_id = int(asset_id) if asset_id is not None else None
+        except (TypeError, ValueError):
+            asset_id = None
+        if asset_id is None:
+            asset_id = _fetch_release_asset_id(owner, repo, version, asset_name, user_agent)
+        if asset_id is not None:
+            urls.insert(0, _github_api_asset_url(owner, repo, asset_id))
+        urls.append(_versioned_release_url(owner, repo, version, asset_name))
+
+    return _dedupe_urls(urls)
+
+
+def format_network_error(exc: BaseException) -> str:
+    message = str(exc).strip()
+    lowered = message.lower()
+    if "getaddrinfo failed" in lowered or "11001" in message or "name or service not known" in lowered:
+        return (
+            "인터넷 연결 또는 DNS 설정을 확인해 주세요.\n"
+            "(GitHub 서버 주소를 찾지 못했습니다)\n\n"
+            "· Wi-Fi/유선 연결 확인\n"
+            "· 회사망·보안 프로그램이 GitHub 차단 여부 확인\n"
+            "· 「아니오」로 브라우저에서 직접 받기"
+        )
+    if "timed out" in lowered or "timeout" in lowered:
+        return "다운로드 시간이 초과되었습니다. 네트워크 상태를 확인한 뒤 다시 시도해 주세요."
+    if "certificate" in lowered or "ssl" in lowered:
+        return "보안 인증서(SSL) 오류입니다. PC 날짜/시간이 맞는지 확인해 주세요."
+    return message or repr(exc)
+
+
+def _download_request(url: str, user_agent: str) -> urllib.request.Request:
+    headers = {"User-Agent": user_agent}
+    if "api.github.com" in url and "/releases/assets/" in url:
+        headers["Accept"] = "application/octet-stream"
+    return urllib.request.Request(url.strip(), headers=headers)
+
+
 def download_file(
     url: str,
     dest: Path,
@@ -189,7 +325,7 @@ def download_file(
     on_progress: ProgressCallback | None = None,
     timeout: int = 600,
 ) -> None:
-    request = urllib.request.Request(url.strip(), headers={"User-Agent": user_agent})
+    request = _download_request(url, user_agent)
     with _urlopen(request, timeout=timeout) as response:
         total = int(response.headers.get("Content-Length", 0) or 0)
         downloaded = 0
@@ -203,6 +339,38 @@ def download_file(
                 downloaded += len(chunk)
                 if on_progress is not None:
                     on_progress(downloaded, total)
+
+
+def download_file_with_fallbacks(
+    urls: list[str] | tuple[str, ...],
+    dest: Path,
+    *,
+    user_agent: str,
+    on_progress: ProgressCallback | None = None,
+    timeout: int = 600,
+    retries: int = 1,
+) -> str:
+    candidates = _dedupe_urls(list(urls))
+    if not candidates:
+        raise ValueError("다운로드 URL이 없습니다.")
+
+    errors: list[str] = []
+    for url in candidates:
+        for attempt in range(retries + 1):
+            try:
+                if attempt > 0:
+                    time.sleep(1.5 * attempt)
+                download_file(
+                    url,
+                    dest,
+                    user_agent=user_agent,
+                    on_progress=on_progress,
+                    timeout=timeout,
+                )
+                return url
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                errors.append(f"{url} → {format_network_error(exc)}")
+    raise urllib.error.URLError("\n\n".join(errors))
 
 
 def extract_zip_to_staging(zip_path: Path, staging_dir: Path) -> Path:
