@@ -6,8 +6,10 @@ import re
 import threading
 import time
 from datetime import datetime
+from urllib.parse import quote
 
 from naver_reporter import NaverReporter
+from naver_search_url import build_naver_search_url as resolve_naver_search_url, fetch_naver_search_url_live
 from paths import data_path, APP_VERSION
 from ui_theme import (
     COLORS,
@@ -40,6 +42,8 @@ CAFE_KEYWORDS_FILE = data_path("cafe_keywords.json")
 CAFE_RESULTS_FILE = data_path("cafe_results.json")
 CAFE_COLLECTED_FILE = data_path("cafe_collected.json")
 
+SEARCH_URL_AUTO_PLACEHOLDER = "자동설정 중입니다"
+
 DEFAULT_TEMPLATES = [
     {
         "id": "카드깡원본",
@@ -67,7 +71,7 @@ DEFAULT_TEMPLATES = [
 class DetailWindow:
     def __init__(self, parent, site, report_type, original, rewritten,
                  account_id="", account_password="",
-                 search_url="", search_url_custom=False):
+                 search_url="", search_url_custom=False, search_url_auto=False):
         self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
         self.top.title("신고 내용 상세")
         self.top.geometry("860x720")
@@ -93,11 +97,11 @@ class DetailWindow:
         self.site_box.pack(fill=tk.X, pady=(6, 10))
         self._set_text(self.site_box, site)
         self.site_box.bind("<Double-Button-1>", self._on_url_double_click)
-        mode_label = "별도입력" if search_url_custom else "사이트동일"
+        mode_label = ReportApp.search_url_mode_label(search_url_custom, search_url_auto)
         ui_label(meta_inner, f"유형 · {report_type}", "small", COLORS["text_muted"]).pack(anchor="w", pady=(0, 4))
         ui_label(meta_inner, f"검색결과 URL · {mode_label}", "small", COLORS["text_muted"]).pack(anchor="w", pady=(0, 8))
         display_search = (search_url or site).strip()
-        if display_search and (search_url_custom or display_search != site):
+        if display_search and (search_url_auto or search_url_custom or display_search != site):
             self.search_url_box = self._url_textbox(meta_inner)
             self.search_url_box.pack(fill=tk.X, pady=(0, 10))
             self._set_text(self.search_url_box, display_search)
@@ -327,6 +331,7 @@ class RegisterWindow:
             )
         self.type_entry.grid(row=1, column=0, sticky="ew", pady=(0, 16))
         self.type_entry.bind("<Return>", lambda e: self.register())
+        self.type_entry.bind("<KeyRelease>", self._on_type_entry_release)
         self.type_entry.focus()
 
         ui_label(card_inner, "사이트 주소", "body_bold", COLORS["text_muted"]).grid(
@@ -358,14 +363,45 @@ class RegisterWindow:
             )
         self.site_text.grid(row=0, column=0, sticky="nsew")
 
-        ui_label(card_inner, "검색결과 URL", "body_bold", COLORS["text_muted"]).grid(
-            row=5, column=0, sticky="w", pady=(8, 4))
-        ui_label(
+        search_header = ui_frame(card_inner, COLORS["card"])
+        search_header.grid(row=5, column=0, sticky="ew", pady=(8, 4))
+        search_header.grid_columnconfigure(0, weight=1)
+        ui_label(search_header, "검색결과 URL", "body_bold", COLORS["text_muted"]).grid(
+            row=0, column=0, sticky="w")
+        self.search_url_auto = False
+        self._live_auto_url = ""
+        self._auto_url_fetching = False
+        self._auto_url_fetch_gen = 0
+        if ctk:
+            self.auto_search_btn = ctk.CTkButton(
+                search_header, text="자동", width=84, height=34,
+                font=FONTS["body_bold"],
+                fg_color=COLORS["input_bg"],
+                hover_color=COLORS["border"],
+                text_color=COLORS["text_muted"],
+                border_color=COLORS["warning"],
+                border_width=2,
+                corner_radius=10,
+                command=self._toggle_search_auto,
+            )
+        else:
+            self.auto_search_btn = tk.Button(
+                search_header, text="자동", width=8,
+                font=FONTS["body_bold"],
+                bg=COLORS["input_bg"], fg=COLORS["text_muted"],
+                activebackground=COLORS["border"],
+                relief=tk.GROOVE, bd=2,
+                command=self._toggle_search_auto,
+            )
+        self.auto_search_btn.grid(row=0, column=1, sticky="e", padx=(12, 0))
+
+        self.search_url_hint = ui_label(
             card_inner,
             "선택 · 줄 번호는 사이트 주소와 짝 · 미입력 시 사이트 주소가 검색결과 URL에 사용됨",
             "caption",
             COLORS["text_light"],
-        ).grid(row=6, column=0, sticky="w", pady=(0, 8))
+        )
+        self.search_url_hint.grid(row=6, column=0, sticky="w", pady=(0, 8))
 
         search_box = ui_frame(card_inner, COLORS["card"])
         search_box.grid(row=7, column=0, sticky="ew", pady=(0, 8), padx=16)
@@ -442,13 +478,128 @@ class RegisterWindow:
             widget.delete("1.0", tk.END)
             widget.insert(tk.END, text)
 
+    def _on_type_entry_release(self, event=None):
+        self._update_url_preview()
+        if self.search_url_auto:
+            self._schedule_auto_url_fetch()
+
+    def _toggle_search_auto(self):
+        self.search_url_auto = not self.search_url_auto
+        self._apply_search_auto_ui()
+        if self.search_url_auto:
+            self._schedule_auto_url_fetch()
+        else:
+            self._live_auto_url = ""
+        self._update_url_preview()
+
+    def _schedule_auto_url_fetch(self):
+        if not self.search_url_auto:
+            return
+        kw = self.type_var.get().strip()
+        if not kw:
+            self._live_auto_url = ""
+            self._update_url_preview()
+            return
+        self._auto_url_fetching = True
+        self._auto_url_fetch_gen += 1
+        gen = self._auto_url_fetch_gen
+        self._update_url_preview()
+
+        def work():
+            url = fetch_naver_search_url_live(kw, log=self.app.log)
+            def apply():
+                if gen == self._auto_url_fetch_gen:
+                    self._on_auto_url_fetched(url)
+            self.top.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_auto_url_fetched(self, url: str):
+        self._auto_url_fetching = False
+        self._live_auto_url = url
+        self._update_url_preview()
+
+    def _apply_search_auto_ui(self):
+        if self.search_url_auto:
+            if ctk and isinstance(self.auto_search_btn, ctk.CTkButton):
+                self.auto_search_btn.configure(
+                    fg_color=COLORS["warning"],
+                    hover_color=COLORS["warning_hover"],
+                    text_color="#ffffff",
+                    border_color=COLORS["warning_hover"],
+                    text="자동 ON",
+                )
+            else:
+                self.auto_search_btn.configure(
+                    bg=COLORS["warning"], fg="#ffffff", text="자동 ON",
+                )
+            self.search_url_hint.configure(
+                text="신고할 때마다 유형으로 네이버 실시간 검색 → tqi·ackey 매번 새로 발급",
+            )
+            self._set_search_url_disabled(True)
+        else:
+            if ctk and isinstance(self.auto_search_btn, ctk.CTkButton):
+                self.auto_search_btn.configure(
+                    fg_color=COLORS["input_bg"],
+                    hover_color=COLORS["border"],
+                    text_color=COLORS["text_muted"],
+                    border_color=COLORS["warning"],
+                    text="자동",
+                )
+            else:
+                self.auto_search_btn.configure(
+                    bg=COLORS["input_bg"], fg=COLORS["text_muted"], text="자동",
+                )
+            self.search_url_hint.configure(
+                text="선택 · 줄 번호는 사이트 주소와 짝 · 미입력 시 사이트 주소가 검색결과 URL에 사용됨",
+            )
+            self._set_search_url_disabled(False)
+
+    def _set_search_url_disabled(self, disabled: bool):
+        if disabled:
+            self._set_textbox(self.search_url_text, SEARCH_URL_AUTO_PLACEHOLDER)
+            if ctk and isinstance(self.search_url_text, ctk.CTkTextbox):
+                self.search_url_text.configure(
+                    state="disabled",
+                    fg_color="#e2e8f0",
+                    text_color=COLORS["text_muted"],
+                )
+            else:
+                self.search_url_text.configure(
+                    state=tk.DISABLED,
+                    bg="#e2e8f0",
+                    fg=COLORS["text_muted"],
+                )
+        else:
+            if ctk and isinstance(self.search_url_text, ctk.CTkTextbox):
+                self.search_url_text.configure(
+                    state="normal",
+                    fg_color=COLORS["input_bg"],
+                    text_color=COLORS["text"],
+                )
+            else:
+                self.search_url_text.configure(
+                    state=tk.NORMAL,
+                    bg=COLORS["input_bg"],
+                    fg=COLORS["text"],
+                )
+            if self._search_url_text_content() == SEARCH_URL_AUTO_PLACEHOLDER:
+                self._set_textbox(self.search_url_text, "")
+
     def _load_task(self, task: dict):
         self.type_var.set(task.get("report_type", ""))
         self._set_textbox(self.site_text, task.get("site", ""))
-        if task.get("search_url_custom"):
-            self._set_textbox(self.search_url_text, task.get("search_url", ""))
+        if task.get("search_url_auto"):
+            self.search_url_auto = True
+            self._apply_search_auto_ui()
+            self._schedule_auto_url_fetch()
         else:
-            self._set_textbox(self.search_url_text, "")
+            self.search_url_auto = False
+            self._apply_search_auto_ui()
+            if task.get("search_url_custom"):
+                self._set_textbox(self.search_url_text, task.get("search_url", ""))
+            else:
+                self._set_textbox(self.search_url_text, "")
         tn = task.get("template_name", "")
         if tn:
             self.template_var.set(tn)
@@ -517,7 +668,11 @@ class RegisterWindow:
         self._on_tpl_select(name)
 
     def _parse_search_url_lines(self):
+        if self.search_url_auto:
+            return []
         raw = self._search_url_text_content()
+        if raw == SEARCH_URL_AUTO_PLACEHOLDER:
+            return []
         urls = []
         for line in raw.splitlines():
             url = line.strip()
@@ -530,13 +685,25 @@ class RegisterWindow:
         return urls
 
     def _resolve_paired_sites(self):
-        """(site, effective_search_url, search_url_custom) — 검색 URL 미입력 시 사이트 주소 사용."""
+        """(site, effective_search_url, search_url_custom, search_url_auto)."""
+        sites = self._parse_site_lines()
+        if self.search_url_auto:
+            if self._auto_url_fetching:
+                auto_url = ""
+            else:
+                auto_url = self._live_auto_url or resolve_naver_search_url(
+                    self.type_var.get().strip(), live=False,
+                )
+            if not auto_url and not self._auto_url_fetching:
+                return []
+            return [(site, auto_url, True, True) for site in sites]
+
         raw_pairs = self._parse_paired_sites()
         resolved = []
         for site, search in raw_pairs:
             custom = bool(search)
             effective = search if custom else site
-            resolved.append((site, effective, custom))
+            resolved.append((site, effective, custom, False))
         return resolved
 
     def _parse_paired_sites(self):
@@ -588,13 +755,22 @@ class RegisterWindow:
             self.url_count_label.configure(text=f"{count}개")
 
         if not pairs:
+            if self.search_url_auto and self._auto_url_fetching:
+                messagebox.showinfo("잠시만요", "네이버 검색 URL을 가져오는 중입니다. 잠시 후 다시 등록해주세요.")
+                return
             self._set_preview_text("URL을 입력하면 여기에 번호와 함께 표시됩니다.")
             return
 
+        if self.search_url_auto and self._auto_url_fetching:
+            self._set_preview_text("네이버 실시간 검색 중 (미리보기용, 신고 시에도 매번 새로 검색)...")
+            return
+
         lines = []
-        for idx, (site, effective, custom) in enumerate(pairs, 1):
+        for idx, (site, effective, custom, auto) in enumerate(pairs, 1):
             lines.append(f"  {idx:02d}  사이트: {self._short_url(site)}")
-            if custom:
+            if auto:
+                lines.append(f"       검색: {self._short_url(effective)} (자동)")
+            elif custom:
                 lines.append(f"       검색: {self._short_url(effective)} (별도입력)")
             else:
                 lines.append(f"       검색: {self._short_url(effective)} (사이트와 동일)")
@@ -629,6 +805,14 @@ class RegisterWindow:
             messagebox.showwarning("입력 필요", "유형을 입력해주세요.")
             return
 
+        if self.search_url_auto and not self.type_var.get().strip():
+            messagebox.showwarning("입력 필요", "자동 검색 URL을 만들려면 유형을 입력해주세요.")
+            return
+
+        if self.search_url_auto:
+            kw = report_type
+            self._live_auto_url = fetch_naver_search_url_live(kw, log=self.app.log)
+
         pairs = self._resolve_paired_sites()
         if not pairs:
             messagebox.showwarning("입력 필요", "사이트 주소를 입력해주세요.")
@@ -640,17 +824,17 @@ class RegisterWindow:
             return
 
         if self.edit_mode:
-            site, effective, custom = pairs[0]
+            site, effective, custom, auto = pairs[0]
             self.app.update_task(
                 self.task_index, site, report_type, template, template_choice,
-                search_url=effective, search_url_custom=custom,
+                search_url=effective, search_url_custom=custom, search_url_auto=auto,
             )
             self.app.log(f"신고 항목 수정: [{report_type}] {site}")
         else:
-            for site, effective, custom in pairs:
+            for site, effective, custom, auto in pairs:
                 self.app.add_task(
                     site, report_type, template, template_choice,
-                    search_url=effective, search_url_custom=custom,
+                    search_url=effective, search_url_custom=custom, search_url_auto=auto,
                 )
             self.app.log(f"일괄 등록 완료: {len(pairs)}개 URL")
         self.app.root.update_idletasks()
@@ -1337,6 +1521,9 @@ class ReportApp:
         sb.grid(row=0, column=1, sticky="ns")
         self.account_tree.configure(yscrollcommand=sb.set)
         self.account_tree.bind("<Delete>", lambda e: self.delete_selected_account())
+        self.account_tree.bind("<Double-1>", self._on_account_tree_double_click)
+        self.account_tree.bind("<Button-1>", self._on_account_tree_click, add="+")
+        self._account_cell_entry = None
 
         bulk_frame = self._frame(account_card, COLORS["card"])
         bulk_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10))
@@ -1455,6 +1642,7 @@ class ReportApp:
                         "status": value.get("status", ""),
                         "search_url": value.get("search_url", ""),
                         "search_url_custom": value.get("search_url_custom", False),
+                        "search_url_auto": value.get("search_url_auto", False),
                     }
             except Exception:
                 self.hidden_results = {}
@@ -1473,6 +1661,7 @@ class ReportApp:
                 "status": value.get("status", ""),
                 "search_url": value.get("search_url", ""),
                 "search_url_custom": value.get("search_url_custom", False),
+                "search_url_auto": value.get("search_url_auto", False),
             }
         with open(RESULTS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1890,12 +2079,18 @@ class ReportApp:
         return widget.get("1.0", tk.END).strip()
 
     @staticmethod
-    def search_url_mode_label(search_url_custom: bool) -> str:
+    def build_naver_search_url(keyword: str, *, live: bool = True, log=None) -> str:
+        return resolve_naver_search_url(keyword, live=live, log=log)
+
+    @staticmethod
+    def search_url_mode_label(search_url_custom: bool = False, search_url_auto: bool = False) -> str:
+        if search_url_auto:
+            return "자동"
         return "별도입력" if search_url_custom else "사이트동일"
 
     def add_task(
         self, site, report_type, template, template_name=None,
-        search_url="", search_url_custom=False,
+        search_url="", search_url_custom=False, search_url_auto=False,
     ):
         if template_name is None:
             options = self.get_template_options()
@@ -1907,15 +2102,19 @@ class ReportApp:
             "template_name": template_name,
             "search_url": search_url or site,
             "search_url_custom": bool(search_url_custom),
+            "search_url_auto": bool(search_url_auto),
         })
         self.save_tasks()
         self.refresh_task_list()
-        mode = self.search_url_mode_label(search_url_custom)
-        self.log(f"등록: [{report_type}] {site} (검색URL: {mode})")
+        mode = self.search_url_mode_label(search_url_custom, search_url_auto)
+        if search_url_auto:
+            self.log(f"등록: [{report_type}] {site} (검색URL: {mode}, 신고 시 실시간 생성)")
+        else:
+            self.log(f"등록: [{report_type}] {site} (검색URL: {mode})")
 
     def update_task(
         self, index, site, report_type, template, template_name,
-        search_url="", search_url_custom=False,
+        search_url="", search_url_custom=False, search_url_auto=False,
     ):
         self.tasks[index] = {
             "site": site,
@@ -1924,6 +2123,7 @@ class ReportApp:
             "template_name": template_name,
             "search_url": search_url or site,
             "search_url_custom": bool(search_url_custom),
+            "search_url_auto": bool(search_url_auto),
         }
         self.save_tasks()
         self.refresh_task_list()
@@ -1967,6 +2167,63 @@ class ReportApp:
             self.account_tree.delete(item)
         for acc in self.accounts:
             self.account_tree.insert("", tk.END, values=(acc.get("id", ""), acc.get("password", "")))
+
+    def _destroy_account_cell_entry(self):
+        if self._account_cell_entry is not None:
+            self._account_cell_entry.destroy()
+            self._account_cell_entry = None
+
+    def _on_account_tree_click(self, event):
+        if self._account_cell_entry is not None:
+            try:
+                if self._account_cell_entry.winfo_exists():
+                    ex = self._account_cell_entry.winfo_rootx()
+                    ey = self._account_cell_entry.winfo_rooty()
+                    ew = self._account_cell_entry.winfo_width()
+                    eh = self._account_cell_entry.winfo_height()
+                    if ex <= event.x_root <= ex + ew and ey <= event.y_root <= ey + eh:
+                        return
+            except tk.TclError:
+                pass
+        self._destroy_account_cell_entry()
+
+    def _on_account_tree_double_click(self, event):
+        tree = self.account_tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        item = tree.identify_row(event.y)
+        col = tree.identify_column(event.x)
+        if not item or not col:
+            return
+        col_idx = int(col.lstrip("#")) - 1
+        values = tree.item(item, "values")
+        if col_idx < 0 or col_idx >= len(values):
+            return
+        text = str(values[col_idx])
+        bbox = tree.bbox(item, col)
+        if not bbox:
+            return
+
+        self._destroy_account_cell_entry()
+        x, y, w, h = bbox
+        entry = tk.Entry(
+            tree,
+            font=FONTS["mono"],
+            bg=COLORS["input_bg"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["accent"],
+            highlightbackground=COLORS["accent"],
+            highlightthickness=1,
+            relief=tk.SOLID,
+            borderwidth=1,
+        )
+        entry.insert(0, text)
+        entry.place(x=x, y=y, width=max(w, 80), height=h)
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
+        entry.bind("<FocusOut>", lambda e: self._destroy_account_cell_entry())
+        entry.bind("<Escape>", lambda e: (self._destroy_account_cell_entry(), "break"))
+        self._account_cell_entry = entry
 
     def open_register_window(self):
         RegisterWindow(self.root, self)
@@ -2129,7 +2386,7 @@ class ReportApp:
 
     def insert_preview(
         self, site, report_type, original, rewritten, dt=None, account_id=None,
-        status=None, search_url_custom=False,
+        status=None, search_url_custom=False, search_url_auto=False,
     ):
         if dt is None:
             dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2142,7 +2399,7 @@ class ReportApp:
             tags = ("protected", site, report_type, original, rewritten)
         stats = self.compute_site_report_stats()
         site_count = self._format_site_count_cell(site, status or "", stats)
-        search_label = self.search_url_mode_label(bool(search_url_custom))
+        search_label = self.search_url_mode_label(bool(search_url_custom), bool(search_url_auto))
         self.results_tree.insert("", tk.END, values=(
             dt, account_id, site, search_label, report_type, site_count,
             self._truncate(original, 45), self._truncate(display_rewritten, 45)),
@@ -2171,6 +2428,7 @@ class ReportApp:
             account_id=account_id, account_password=account_password,
             search_url=result_meta.get("search_url", ""),
             search_url_custom=result_meta.get("search_url_custom", False),
+            search_url_auto=result_meta.get("search_url_auto", False),
         )
 
     def get_result_meta(self, dt, account_id, site, report_type):
@@ -2276,6 +2534,7 @@ class ReportApp:
                 for url, data in results.items():
                     data["search_url"] = task.get("search_url", url)
                     data["search_url_custom"] = task.get("search_url_custom", False)
+                    data["search_url_auto"] = task.get("search_url_auto", False)
                     self._add_result(url, task["report_type"], data)
             self.root.after(0, self._enable_buttons)
             self.root.after(0, lambda: self.log("[미리보기] 완료"))
@@ -2429,14 +2688,15 @@ class ReportApp:
                 "account_password": item.get("account_password", ""),
                 "search_url": item.get("search_url", ""),
                 "search_url_custom": item.get("search_url_custom", False),
+                "search_url_auto": item.get("search_url_auto", False),
             }
             dt = self._add_result(item["site"], item["report_type"], data, item["account_id"])
             self.root.after(
                 0,
                 lambda s=item["site"], rt=item["report_type"], o=item["original"], r=item["rewritten"],
                        d=dt, a=item["account_id"], st=status,
-                       suc=item.get("search_url_custom", False):
-                self.insert_preview(s, rt, o, r, d, a, st, search_url_custom=suc)
+                       suc=item.get("search_url_custom", False), sa=item.get("search_url_auto", False):
+                self.insert_preview(s, rt, o, r, d, a, st, search_url_custom=suc, search_url_auto=sa)
             )
 
         current = [0]
@@ -2599,7 +2859,9 @@ class ReportApp:
             if status == "protected":
                 display_rewritten = "보호조치 해제 필요"
             site_count = self._format_site_count_cell(site, status, stats)
-            search_label = self.search_url_mode_label(bool(data.get("search_url_custom")))
+            search_label = self.search_url_mode_label(
+                bool(data.get("search_url_custom")), bool(data.get("search_url_auto")),
+            )
             tags = (data["site"], data["report_type"], data["original"], data["rewritten"])
             if status == "protected":
                 tags = ("protected", data["site"], data["report_type"], data["original"], data["rewritten"])

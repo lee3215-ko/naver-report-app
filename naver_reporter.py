@@ -18,6 +18,9 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from webdriver_manager.chrome import ChromeDriverManager
 
 
+from naver_search_url import fetch_naver_search_url_live
+
+
 class NaverReporter:
     """네이버 고객센터 불법성 신고 자동화 (Selenium)"""
 
@@ -223,7 +226,7 @@ class NaverReporter:
             )
             return self._clean_output(response.choices[0].message.content.strip())
         except Exception as e:
-            self.log(f"GPT 리라이트 오류: {e}")
+            self.log(f"GPT 리라이트 오류: {self._format_openai_error(e)}")
             return template
 
     @staticmethod
@@ -317,6 +320,20 @@ class NaverReporter:
             return c.toDataURL('image/png').split(',')[1];
         """, img_el)
 
+    def _format_openai_error(self, exc: Exception) -> str:
+        msg = str(exc)
+        lower = msg.lower()
+        if "insufficient_quota" in lower or "exceeded your current quota" in lower:
+            return (
+                "OpenAI API 사용 한도/잔액이 부족합니다. "
+                "platform.openai.com → Billing에서 결제·크레딧을 확인하세요."
+            )
+        if "429" in msg or "rate_limit" in lower:
+            return "OpenAI API 요청 한도 초과(429). 잠시 후 다시 시도하거나 요금제를 확인하세요."
+        if "invalid_api_key" in lower or "incorrect api key" in lower:
+            return "OpenAI API Key가 올바르지 않습니다. Settings에서 키를 확인하세요."
+        return msg
+
     def _vision_answer(self, prompt: str, b64: str | None = None) -> str:
         if not self.client:
             return ""
@@ -326,12 +343,16 @@ class NaverReporter:
                 "type": "image_url",
                 "image_url": {"url": f"data:image/png;base64,{b64}"},
             })
-        response = self.client.chat.completions.create(
-            model=self._vision_model(),
-            messages=[{"role": "user", "content": content}],
-            max_tokens=100,
-        )
-        return response.choices[0].message.content.strip()
+        try:
+            response = self.client.chat.completions.create(
+                model=self._vision_model(),
+                messages=[{"role": "user", "content": content}],
+                max_tokens=100,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            self.log(f"OpenAI Vision 오류: {self._format_openai_error(e)}")
+            raise
 
     def _reenter_password(self, naver_pw: str):
         try:
@@ -673,7 +694,7 @@ class NaverReporter:
             self.log("정답 입력 및 로그인 시도")
             return True
         except Exception as e:
-            self.log(f"보안 질문 처리 오류: {e}")
+            self.log(f"보안 질문 처리 오류: {self._format_openai_error(e)}")
             return False
 
     def solve_captcha(self) -> bool:
@@ -709,7 +730,7 @@ class NaverReporter:
         except NoSuchElementException:
             return True  # 캡챠 없음
         except Exception as e:
-            self.log(f"CAPTCHA 처리 오류: {e}")
+            self.log(f"CAPTCHA 처리 오류: {self._format_openai_error(e)}")
             return False
 
     def handle_login_challenges(self, naver_pw: str) -> bool:
@@ -980,7 +1001,10 @@ class NaverReporter:
     def _emit_protection_results(self, naver_id: str, naver_pw: str, tasks: list):
         for task in tasks:
             site = task.get("site", "")
+            report_type = task.get("report_type", "")
             search_url = task.get("search_url", "") or site
+            if task.get("search_url_auto") and report_type:
+                search_url = fetch_naver_search_url_live(report_type, driver=self.driver, log=self.log)
             item = {
                 "account_id": naver_id,
                 "account_password": naver_pw,
@@ -993,6 +1017,7 @@ class NaverReporter:
                 "status": "protected",
                 "search_url": search_url,
                 "search_url_custom": task.get("search_url_custom", False),
+                "search_url_auto": task.get("search_url_auto", False),
             }
             if self.result_callback:
                 self.result_callback(item)
@@ -1023,6 +1048,9 @@ class NaverReporter:
                 template = task.get("template", "")
                 search_url = task.get("search_url", "") or site
                 search_url_custom = task.get("search_url_custom", False)
+                search_url_auto = task.get("search_url_auto", False)
+                if search_url_auto and report_type:
+                    search_url = fetch_naver_search_url_live(report_type, driver=self.driver, log=self.log)
 
                 self._human_delay(1.0, 2.5)
                 rewritten = self._rewrite(template, naver_id, site, report_type)
@@ -1042,6 +1070,7 @@ class NaverReporter:
                     "success": success,
                     "search_url": search_url,
                     "search_url_custom": search_url_custom,
+                    "search_url_auto": search_url_auto,
                 })
                 if self.result_callback:
                     self.result_callback(results[-1])
