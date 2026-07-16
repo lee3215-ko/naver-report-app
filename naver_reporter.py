@@ -14,7 +14,13 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementNotInteractableException
+from selenium.common.exceptions import (
+    TimeoutException,
+    NoSuchElementException,
+    ElementNotInteractableException,
+    InvalidSessionIdException,
+    WebDriverException,
+)
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -282,13 +288,298 @@ class NaverReporter:
             return self.model
         return "gpt-4o"
 
-    def _is_logged_in(self) -> bool:
-        url = self.driver.current_url
-        if "inquiry/input.help" in url or "help.naver.com" in url:
+    def _build_login_url(self, target: str) -> str:
+        return (
+            "https://nid.naver.com/nidlogin.login"
+            f"?mode=form&locale=ko&url={quote(target, safe='')}"
+        )
+
+    def _has_naver_session_cookie(self) -> bool:
+        try:
+            for cookie in self.driver.get_cookies():
+                if cookie.get("name") in ("NID_AUT", "NID_SES", "NID_JKL"):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _ensure_password_encrypted(self, max_wait: float = 6.0) -> bool:
+        """login.js v4: pw 입력 후 eccpw 필드가 채워져야 폼 제출이 유효합니다."""
+        end = time.time() + max_wait
+        last_state: dict = {}
+        while time.time() < end:
+            last_state = self.driver.execute_script(
+                "var ecc=document.getElementById('eccpw');"
+                "var dyn=document.getElementById('dynamicKey');"
+                "var pw=document.getElementById('pw');"
+                "return {"
+                "  eccpw: !!(ecc && ecc.value),"
+                "  dynamicKey: !!(dyn && dyn.value),"
+                "  pwLen: pw && pw.value ? pw.value.length : 0"
+                "};"
+            ) or {}
+            if last_state.get("eccpw"):
+                return True
+            try:
+                pw_input = self._find_login_pw_input()
+                self.driver.execute_script(
+                    "var el=arguments[0];"
+                    "el.dispatchEvent(new KeyboardEvent('keydown',{bubbles:true,key:'a'}));"
+                    "el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:'a'}));"
+                    "el.dispatchEvent(new Event('input',{bubbles:true}));"
+                    "el.dispatchEvent(new Event('change',{bubbles:true}));"
+                    "el.blur();",
+                    pw_input,
+                )
+            except Exception:
+                pass
+            time.sleep(0.35)
+        ecc_ready = self.driver.execute_script(
+            "var ecc=document.getElementById('eccpw');"
+            "return !!(ecc && ecc.value);"
+        )
+        if ecc_ready:
             return True
-        if "nid.naver.com" not in url:
+        self.log(
+            "비밀번호 암호화(eccpw) 미완료"
+            f" (dynamicKey={last_state.get('dynamicKey')})"
+        )
+        return False
+
+    def _is_on_login_page(self) -> bool:
+        url = self.driver.current_url
+        return any(
+            token in url
+            for token in ("nidlogin.login", "nidlogin.passkey", "nidlogin.rcaptcha", "nidlogin.captcha")
+        )
+
+    def _is_receipt_captcha_question(self, text: str) -> bool:
+        if not text or self._is_char_captcha_instruction(text):
+            return False
+        return any(
+            k in text
+            for k in (
+                "입니까", "얼마", "무엇", "몇", "합계", "가격", "개수", "빈 칸",
+                "전화번호", "영수증", "가게", "제품", "번째 숫자", "번째숫자",
+            )
+        )
+
+    def _find_receipt_captcha_question(self) -> str:
+        """영수증/질문형 보안 화면의 질문 문구."""
+        xpaths = [
+            "//*[contains(text(),'무엇입니까')]",
+            "//*[contains(text(),'입니까')]",
+            "//*[contains(text(),'얼마')]",
+            "//*[contains(text(),'빈 칸')]",
+            "//*[contains(text(),'전화번호')]",
+            "//*[contains(text(),'번째 숫자')]",
+            "//*[contains(@class,'captcha')]//*[contains(text(),'입니까')]",
+        ]
+        for xpath in xpaths:
+            try:
+                for el in self.driver.find_elements(By.XPATH, xpath):
+                    if not el.is_displayed():
+                        continue
+                    text = (el.text or "").strip()
+                    if 8 < len(text) < 180 and self._is_receipt_captcha_question(text):
+                        return text
+            except Exception:
+                continue
+        return ""
+
+    def _find_receipt_captcha_image(self):
+        """영수증형 캡챠 이미지 (큰 영수증 이미지)."""
+        best = None
+        best_area = 0
+        for img in self.driver.find_elements(By.CSS_SELECTOR, "div.captcha img, .captcha_box img, .captcha_inner img"):
+            try:
+                if not img.is_displayed():
+                    continue
+                w = img.size.get("width", 0) or 0
+                h = img.size.get("height", 0) or 0
+                area = w * h
+                if area > best_area and w >= 100 and h >= 60:
+                    best = img
+                    best_area = area
+            except Exception:
+                continue
+        return best
+
+    def _find_char_captcha_image(self):
+        """문자 왜곡 캡챠 이미지 (좁은 문자열 이미지)."""
+        try:
+            img = self.driver.find_element(By.ID, "captchaimg")
+            if img.is_displayed():
+                return img
+        except NoSuchElementException:
+            pass
+        for img in self.driver.find_elements(By.CSS_SELECTOR, "img.captcha_img"):
+            try:
+                if not img.is_displayed():
+                    continue
+                w = img.size.get("width", 0) or 0
+                h = img.size.get("height", 0) or 0
+                if w <= 220 and h <= 80:
+                    return img
+            except Exception:
+                continue
+        return None
+
+    def _is_char_captcha_instruction(self, text: str) -> bool:
+        compact = (text or "").replace(" ", "").lower()
+        return any(
+            k in compact
+            for k in (
+                "자동입력방지",
+                "자동입력",
+                "문자를입력",
+                "캡차",
+                "captcha",
+            )
+        )
+
+    def _is_still_on_captcha_challenge(self) -> bool:
+        url = self.driver.current_url
+        if any(token in url for token in ("rcaptcha", "nidlogin.captcha")):
+            return True
+        if self._has_receipt_captcha() or self._has_char_captcha():
+            return True
+        err = self._read_login_page_errors()
+        if any(k in err for k in ("정답", "자동 입력", "일치하지", "다시 입력", "틀렸")):
             return True
         return False
+
+    def _is_active_captcha_challenge(self) -> bool:
+        """로그인 제출 대신 캡챠 확인이 필요한 화면인지 판별."""
+        if self._has_receipt_captcha():
+            return True
+        if self._has_char_captcha():
+            return True
+        return False
+
+    def _has_login_form(self) -> bool:
+        if not self._is_on_login_page():
+            return False
+        try:
+            for el in self.driver.find_elements(By.CSS_SELECTOR, "#id, input[name='id']"):
+                if el.is_displayed() and el.is_enabled():
+                    return True
+            for el in self.driver.find_elements(By.CSS_SELECTOR, "#pw, input[name='pw']"):
+                if el.is_displayed() and el.is_enabled():
+                    return True
+            for el in self.driver.find_elements(
+                By.CSS_SELECTOR, "#loginBtn_row, #loginBtn_column"
+            ):
+                if el.is_displayed():
+                    return True
+        except Exception:
+            pass
+        return self._is_on_login_page()
+
+    def _has_naver_logged_in_ui(self) -> bool:
+        checks = [
+            (By.CSS_SELECTOR, "#account"),
+            (By.CSS_SELECTOR, ".MyView-module__btn_logout___bsTOJ"),
+            (By.CSS_SELECTOR, ".MyView-module__my_info___GNmHz"),
+            (By.CSS_SELECTOR, "#gnb_logout_button"),
+            (By.XPATH, "//button[contains(.,'로그아웃')]"),
+            (By.XPATH, "//*[contains(@class,'btn_logout')]"),
+        ]
+        for by, sel in checks:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    if el.is_displayed():
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _is_logged_in(self) -> bool:
+        if self._is_on_login_page():
+            return False
+        if self._is_on_inquiry_form():
+            return self._has_naver_session_cookie()
+        url = self.driver.current_url
+        if "inquiry/input.help" in url or "help.naver.com/inquiry" in url:
+            return self._has_naver_session_cookie()
+        if "cafe.naver.com" in url:
+            return self._has_naver_session_cookie()
+        if "www.naver.com" in url:
+            return self._has_naver_logged_in_ui() or self._has_naver_session_cookie()
+        if "help.naver.com" in url and "nid.naver.com" not in url:
+            return self._has_naver_session_cookie()
+        if "nid.naver.com" in url:
+            return False
+        return self._has_naver_session_cookie()
+
+    def _wait_for_login_redirect(self, timeout: int = 25) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            if self._is_account_protected():
+                return False
+            if self._is_logged_in():
+                return True
+            time.sleep(0.5)
+        return self._is_logged_in()
+
+    def _finalize_login(self, target: str) -> bool:
+        current = self.driver.current_url
+        self.log(f"로그인 완료 확인 → {current[:100]}")
+        if self._is_on_inquiry_form() and self._has_naver_session_cookie():
+            return True
+        if "www.naver.com" not in current:
+            self.driver.get("https://www.naver.com")
+            self.log("네이버 메인에서 로그인 UI 확인")
+            self._human_delay(1.5, 2.5)
+        if not self._has_naver_logged_in_ui():
+            if not self._has_naver_session_cookie():
+                self.log("로그인 세션 쿠키 없음 — 로그인 미완료")
+                return False
+            self.log("로그인 UI 미표시 — 세션 쿠키만 확인됨")
+        self.driver.get(target)
+        self.log("신고 작성 페이지로 이동 (세션 확인)")
+        self._human_delay(2.0, 3.5)
+        if self._is_on_login_page() or self._has_login_form():
+            self.log("신고 페이지 접근 시 로그인 세션 없음 — 로그인 페이지로 이동됨")
+            return False
+        try:
+            self._wait(20).until(lambda d: self._is_on_inquiry_form())
+            return True
+        except TimeoutException:
+            if self._is_on_login_page():
+                self.log("신고 폼 대기 중 로그인 페이지로 돌아감")
+                return False
+            self.log("신고 작성 폼(requiredUrl1) 로드 실패")
+            return False
+
+    def _find_login_id_input(self):
+        wait = self._wait(15)
+        for by, sel in [
+            (By.ID, "id"),
+            (By.CSS_SELECTOR, "input[name='id'][type='text']"),
+            (By.CSS_SELECTOR, "input.input_text[type='text']"),
+        ]:
+            try:
+                el = wait.until(EC.element_to_be_clickable((by, sel)))
+                if el.is_displayed():
+                    return el
+            except TimeoutException:
+                continue
+        raise TimeoutException("로그인 아이디 입력란을 찾지 못했습니다")
+
+    def _find_login_pw_input(self):
+        for by, sel in [
+            (By.ID, "pw"),
+            (By.CSS_SELECTOR, "input[name='pw'][type='password']"),
+            (By.CSS_SELECTOR, "input.input_text[type='password']"),
+        ]:
+            try:
+                el = self.driver.find_element(by, sel)
+                if el.is_displayed() and el.is_enabled():
+                    return el
+            except NoSuchElementException:
+                continue
+        raise NoSuchElementException("로그인 비밀번호 입력란을 찾지 못했습니다")
 
     def _is_account_protected(self) -> bool:
         try:
@@ -334,15 +625,133 @@ class NaverReporter:
             return "OpenAI API Key가 올바르지 않습니다. Settings에서 키를 확인하세요."
         return msg
 
-    def _vision_answer(self, prompt: str, b64: str | None = None) -> str:
+    def _captcha_element_to_b64(self, img_el) -> str:
+        """캡챠 이미지를 고해상도로 캡처해 Vision 인식률을 높입니다."""
+        try:
+            raw = img_el.screenshot_as_base64
+            if raw:
+                return raw
+        except Exception:
+            pass
+        try:
+            return self.driver.execute_script(
+                "var img=arguments[0];"
+                "var scale=3;"
+                "var c=document.createElement('canvas');"
+                "var w=img.naturalWidth||img.width||120;"
+                "var h=img.naturalHeight||img.height||40;"
+                "c.width=w*scale;c.height=h*scale;"
+                "var ctx=c.getContext('2d');"
+                "ctx.imageSmoothingEnabled=false;"
+                "ctx.drawImage(img,0,0,c.width,c.height);"
+                "return c.toDataURL('image/png').split(',')[1];",
+                img_el,
+            )
+        except Exception:
+            return self._element_to_b64(img_el)
+
+    def _normalize_char_captcha_text(self, raw: str) -> str:
+        text = re.sub(r"[^A-Za-z0-9]", "", (raw or "").strip())
+        if not text:
+            return ""
+        if len(text) > 8:
+            self.log(f"CAPTCHA 인식값 비정상(길이 {len(text)}) — 무시")
+            return ""
+        if len(text) < 4:
+            return ""
+        return text
+
+    def _recognize_char_captcha(self, img_el) -> str:
+        b64 = self._captcha_element_to_b64(img_el)
+        prompts = [
+            (
+                "네이버 로그인 자동입력방지 캡챠입니다. 이미지에 보이는 왜곡된 문자는 "
+                "보통 6개입니다. 왼쪽부터 순서대로 영문 대소문자/숫자만 출력하세요. "
+                "공백·설명·다른 글자 없이 문자만."
+            ),
+            (
+                "CAPTCHA image with about 6 distorted letters/numbers. "
+                "Read each character left to right. Output ONLY the characters, nothing else."
+            ),
+        ]
+        for idx, prompt in enumerate(prompts, start=1):
+            raw = self._vision_answer(prompt, b64, detail="high")
+            text = self._normalize_char_captcha_text(raw.split("\n")[0])
+            if text:
+                if idx > 1:
+                    self.log(f"CAPTCHA 재인식 성공 (프롬프트 {idx})")
+                return text
+        return ""
+
+    def _click_captcha_refresh(self) -> bool:
+        """캡챠 새로고침 버튼 클릭 (확인/로그인 버튼 제외)."""
+        selectors = [
+            (By.ID, "captcha_reload"),
+            (By.ID, "btnCaptchaReload"),
+            (By.CSS_SELECTOR, "button.btn_reload"),
+            (By.CSS_SELECTOR, "button[class*='refresh']"),
+            (By.CSS_SELECTOR, "button[class*='reload']"),
+            (By.XPATH, "//button[contains(@class,'refresh') or contains(@class,'reload')]"),
+        ]
+        for by, sel in selectors:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    if not el.is_displayed() or not el.is_enabled():
+                        continue
+                    el_id = (el.get_attribute("id") or "").lower()
+                    if el_id in ("log.login", "loginbtn_row", "loginbtn_column"):
+                        continue
+                    classes = (el.get_attribute("class") or "").lower()
+                    if "btn_done" in classes:
+                        continue
+                    el.click()
+                    self.log("CAPTCHA 이미지 새로고침")
+                    self._human_delay(0.8, 1.2)
+                    return True
+            except Exception:
+                continue
+        try:
+            clicked = self.driver.execute_script(
+                "var btns=document.querySelectorAll('button');"
+                "for(var i=0;i<btns.length;i++){"
+                "  var b=btns[i];"
+                "  var cls=(b.className||'').toLowerCase();"
+                "  var id=(b.id||'').toLowerCase();"
+                "  if(id==='log.login'||id.indexOf('loginbtn')>=0) continue;"
+                "  if(cls.indexOf('btn_done')>=0) continue;"
+                "  if((cls.indexOf('refresh')>=0||cls.indexOf('reload')>=0)"
+                "     &&b.offsetParent!==null){b.click();return true;}"
+                "}"
+                "return false;"
+            )
+            if clicked:
+                self.log("CAPTCHA 이미지 새로고침 (JS)")
+                self._human_delay(0.8, 1.2)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _clear_char_captcha_input(self):
+        try:
+            inp = self._find_char_captcha_input()
+            if not inp:
+                return
+            inp.click()
+            inp.clear()
+            self.driver.execute_script("arguments[0].value='';", inp)
+        except Exception:
+            pass
+
+    def _vision_answer(self, prompt: str, b64: str | None = None, detail: str = "auto") -> str:
         if not self.client:
             return ""
         content = [{"type": "text", "text": prompt}]
         if b64:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
-            })
+            image_url: dict = {"url": f"data:image/png;base64,{b64}"}
+            if detail in ("low", "high", "auto"):
+                image_url["detail"] = detail
+            content.append({"type": "image_url", "image_url": image_url})
         try:
             response = self.client.chat.completions.create(
                 model=self._vision_model(),
@@ -356,12 +765,17 @@ class NaverReporter:
 
     def _reenter_password(self, naver_pw: str):
         try:
-            pw_input = self.driver.find_element(By.ID, "pw")
+            pw_input = self._find_login_pw_input()
             if not pw_input.is_displayed():
                 return
-            self._type_into_element(pw_input, naver_pw, label="비밀번호")
+            pw_input.click()
+            pw_input.clear()
+            self.driver.execute_script("arguments[0].value = '';", pw_input)
+            for char in naver_pw:
+                pw_input.send_keys(char)
+                time.sleep(random.uniform(0.05, 0.1))
             self.log("비밀번호 재입력 완료")
-        except NoSuchElementException:
+        except (NoSuchElementException, TimeoutException):
             pass
 
     def _read_element_value(self, element) -> str:
@@ -543,15 +957,24 @@ class NaverReporter:
         return None
 
     def _find_char_captcha_input(self):
-        try:
-            el = self.driver.find_element(By.ID, "chptcha")
-            if el.is_displayed() and el.is_enabled():
-                return el
-        except NoSuchElementException:
-            pass
+        for by, sel in [
+            (By.ID, "chptcha"),
+            (By.ID, "captcha"),
+            (By.CSS_SELECTOR, "input[name='captcha']"),
+            (By.CSS_SELECTOR, "input[placeholder*='정답']"),
+        ]:
+            try:
+                el = self.driver.find_element(by, sel)
+                if el.is_displayed() and el.is_enabled():
+                    return el
+            except NoSuchElementException:
+                continue
         return None
 
     def _find_captcha_question(self) -> str:
+        receipt_q = self._find_receipt_captcha_question()
+        if receipt_q:
+            return receipt_q
         try:
             for el in self.driver.find_elements(
                 By.XPATH,
@@ -579,100 +1002,398 @@ class NaverReporter:
                     return text
             except NoSuchElementException:
                 continue
-        # 질문 문장이 페이지에 직접 표시되는 경우
         try:
-            for el in self.driver.find_elements(By.XPATH, "//p | //strong | //span | //div"):
+            for el in self.driver.find_elements(By.XPATH, "//p | //strong | //span | //label | //div"):
                 text = el.text.strip()
                 if not text or len(text) > 200:
                     continue
-                if any(k in text for k in ("입니까", "얼마", "몇", "무엇", "어떤", "합계", "가격", "개수")):
+                if self._is_char_captcha_instruction(text):
+                    return text
+                if any(k in text for k in ("입니까", "얼마", "몇", "무엇", "어떤", "합계", "가격", "개수", "빈 칸")):
                     return text
         except Exception:
             pass
         return ""
 
     def _find_captcha_image(self):
-        selectors = ["#captchaimg", "img.captcha_img", "div.captcha img", "img[alt*='캡차']", "img[alt*='captcha']"]
-        for sel in selectors:
+        receipt_img = self._find_receipt_captcha_image()
+        if receipt_img:
+            return receipt_img
+        return self._find_char_captcha_image()
+
+    def _wait_login_page_ready(self):
+        wait = self._wait(20)
+        wait.until(EC.presence_of_element_located((By.ID, "frmNIDLogin")))
+        wait.until(EC.presence_of_element_located((By.ID, "loginBtn_row")))
+        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+        try:
+            wait.until(
+                lambda d: bool(
+                    d.execute_script(
+                        "var k=document.getElementById('dynamicKey');"
+                        "return !!(k && k.value);"
+                    )
+                )
+            )
+        except TimeoutException:
+            self.log("로그인 dynamicKey 대기 타임아웃 (계속 진행)")
+        self._human_delay(0.8, 1.2)
+
+    def _type_login_credentials(self, id_input, pw_input, naver_id: str, naver_pw: str):
+        """login.js v4는 실제 키 입력 후 eccpw 암호화·제출이 필요합니다 (JS value 주입만으로는 실패)."""
+        for element, text, label in (
+            (id_input, naver_id, "아이디"),
+            (pw_input, naver_pw, "비밀번호"),
+        ):
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+            self._human_delay(0.15, 0.3)
+            element.click()
             try:
-                return self.driver.find_element(By.CSS_SELECTOR, sel)
-            except NoSuchElementException:
+                element.clear()
+            except Exception:
+                pass
+            if label != "비밀번호":
+                self.driver.execute_script("arguments[0].value = '';", element)
+            for char in text:
+                element.send_keys(char)
+                time.sleep(random.uniform(0.05, 0.12))
+            if label == "비밀번호":
+                self.driver.execute_script(
+                    "var el=arguments[0];"
+                    "el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:'a'}));"
+                    "el.dispatchEvent(new Event('change',{bubbles:true}));",
+                    element,
+                )
+            actual = self._read_element_value(element)
+            shown = len(actual) if actual else len(text)
+            self.log(f"{label} 입력 ({shown}자)")
+
+    def _read_login_page_errors(self) -> str:
+        errors: list[str] = []
+        try:
+            for el in self.driver.find_elements(By.CSS_SELECTOR, ".form_message"):
+                if not el.is_displayed():
+                    continue
+                text_el = el
+                try:
+                    inner = el.find_elements(By.CSS_SELECTOR, ".text")
+                    if inner:
+                        text_el = inner[0]
+                except Exception:
+                    pass
+                text = (text_el.text or "").strip()
+                if text and text not in errors:
+                    errors.append(text)
+        except Exception:
+            pass
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body").text
+            for phrase in (
+                "아이디(로그인 전화번호, 로그인 전용 아이디) 또는 비밀번호",
+                "비밀번호가 잘못",
+                "존재하지 않는",
+                "로그인에 실패",
+            ):
+                if phrase in body and phrase not in errors:
+                    errors.append(phrase)
+        except Exception:
+            pass
+        return " / ".join(errors)
+
+    def _is_security_confirm_candidate(self, el) -> bool:
+        if not el.is_displayed() or not el.is_enabled():
+            return False
+        el_id = (el.get_attribute("id") or "").lower()
+        if el_id in ("loginbtn_row", "loginbtn_column"):
+            return False
+        if el_id == "log.login":
+            return True
+        classes = (el.get_attribute("class") or "").lower()
+        if any(k in classes for k in ("refresh", "voice", "reload", "captcha_refresh", "btn_refresh")):
+            return False
+        try:
+            if el.find_elements(By.CSS_SELECTOR, "span[data-i18n='btnConfirm']"):
+                return True
+        except Exception:
+            pass
+        text = (el.text or "").strip().replace("\n", "")
+        return text == "확인"
+
+    def _find_security_confirm_button(self):
+        """보안 추가 확인 화면의 '확인' 버튼 (#log.login 만)."""
+        selectors = [
+            (By.ID, "log.login"),
+            (By.XPATH, "//button[@id='log.login']"),
+            (By.XPATH, "//button[.//span[@data-i18n='btnConfirm']]"),
+            (By.XPATH, "//button[.//span[normalize-space()='확인'] and not(@id='loginBtn_row')]"),
+        ]
+        for by, sel in selectors:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    if self._is_security_confirm_candidate(el):
+                        return el
+            except Exception:
                 continue
         return None
 
-    def _submit_login(self):
-        wait = self._wait(8)
-        for by, sel in [
-            (By.ID, "log.login"),
-            (By.CSS_SELECTOR, "button.btn_login"),
-            (By.CSS_SELECTOR, "input.btn_login"),
-            (By.CSS_SELECTOR, "button[type='submit']"),
-        ]:
+    def _click_security_confirm(self) -> bool:
+        btn = self._find_security_confirm_button()
+        if btn:
             try:
-                btn = wait.until(EC.element_to_be_clickable((by, sel)))
+                btn_id = btn.get_attribute("id") or "btn_done"
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                self._human_delay(0.2, 0.4)
                 btn.click()
-                self.log("로그인 버튼 클릭")
-                return
-            except (NoSuchElementException, TimeoutException):
-                continue
+                self.log(f"보안 확인 버튼 클릭 ({btn_id})")
+                return True
+            except Exception:
+                try:
+                    btn_id = btn.get_attribute("id") or "btn_done"
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    self.log(f"보안 확인 버튼 클릭 (JS: {btn_id})")
+                    return True
+                except Exception:
+                    pass
         try:
-            self.driver.execute_script(
-                "var b = document.getElementById('log.login'); if (b) b.click();"
+            clicked = self.driver.execute_script(
+                "var ids=['log.login'];"
+                "for(var i=0;i<ids.length;i++){"
+                "  var b=document.getElementById(ids[i]);"
+                "  if(b&&b.offsetParent!==null){b.click();return ids[i];}"
+                "}"
+                "var done=document.querySelector('button.btn_done');"
+                "if(done&&done.offsetParent!==null){done.click();return 'btn_done';}"
+                "return '';"
             )
-            self.log("로그인 버튼 클릭 (JS)")
+            if clicked:
+                self.log(f"보안 확인 버튼 클릭 (JS: {clicked})")
+                return True
         except Exception:
             pass
+        return False
 
-    def _has_receipt_captcha(self) -> bool:
-        if self._find_captcha_question():
-            return True
+    def _has_visible_captcha_answer_input(self) -> bool:
         try:
-            return bool(self.driver.find_elements(By.CSS_SELECTOR, "input[placeholder*='정답']"))
+            for el in self.driver.find_elements(By.CSS_SELECTOR, "#captcha, input[name='captcha']"):
+                if not el.is_displayed() or not el.is_enabled():
+                    continue
+                ph = el.get_attribute("placeholder") or ""
+                if "정답" in ph:
+                    return True
         except Exception:
-            return False
+            pass
+        return False
 
-    def _has_char_captcha(self) -> bool:
+    def _is_post_captcha_login_form(self) -> bool:
+        """캡챠 통과 후 돌아온 일반 로그인 폼 — 비밀번호 재입력 후 로그인."""
+        url = self.driver.current_url
+        if "rcaptcha" in url:
+            return False
+        if not self._is_on_login_page():
+            return False
+        if self._find_receipt_captcha_image():
+            return False
+        if self._find_char_captcha_image():
+            return False
+        if self._has_visible_captcha_answer_input():
+            return False
         try:
-            return bool(self.driver.find_element(By.ID, "captchaimg"))
+            btn = self.driver.find_element(By.ID, "loginBtn_row")
+            id_input = self.driver.find_element(By.ID, "id")
+            if not (btn.is_displayed() and btn.is_enabled()):
+                return False
+            return bool(self._read_element_value(id_input))
         except NoSuchElementException:
             return False
 
+    def _click_login_button(self) -> bool:
+        for elem_id in ("loginBtn_row", "loginBtn_column"):
+            try:
+                btn = self.driver.find_element(By.ID, elem_id)
+                if btn.is_displayed() and btn.is_enabled():
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    self._human_delay(0.15, 0.3)
+                    btn.click()
+                    self.log(f"로그인 버튼 클릭 ({elem_id})")
+                    return True
+            except NoSuchElementException:
+                continue
+        try:
+            clicked = self.driver.execute_script(
+                "var ids=['loginBtn_row','loginBtn_column'];"
+                "for (var i=0;i<ids.length;i++){"
+                "  var b=document.getElementById(ids[i]);"
+                "  if(b && b.offsetParent!==null){ b.click(); return ids[i]; }"
+                "}"
+                "return '';"
+            )
+            if clicked:
+                self.log(f"로그인 버튼 클릭 (JS: {clicked})")
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _complete_password_login(self, naver_pw: str) -> bool:
+        """보안 확인 후 로그인 폼으로 돌아왔을 때 비밀번호 재입력 → 로그인."""
+        if not self._is_post_captcha_login_form():
+            return False
+        self.log("보안 확인 완료 — 비밀번호 재입력 후 로그인")
+        try:
+            pw_input = self._find_login_pw_input()
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pw_input)
+            self._human_delay(0.15, 0.3)
+            pw_input.click()
+            try:
+                pw_input.clear()
+            except Exception:
+                pass
+            self.driver.execute_script("arguments[0].value = '';", pw_input)
+            for char in naver_pw:
+                pw_input.send_keys(char)
+                time.sleep(random.uniform(0.05, 0.12))
+            self.log(f"비밀번호 재입력 ({len(naver_pw)}자)")
+            self._human_delay(0.5, 1.0)
+            if not self._ensure_password_encrypted():
+                self.log("비밀번호 암호화 대기 실패 — 로그인 버튼 제출 시도")
+            if self._click_login_button():
+                self.log("로그인 시도")
+                return True
+            self.log("로그인 버튼을 찾지 못했습니다")
+            return False
+        except Exception as e:
+            self.log(f"비밀번호 재로그인 오류: {e}")
+            return False
+
+    def _submit_login(self):
+        if self._is_active_captcha_challenge():
+            if self._click_security_confirm():
+                return
+        if self._click_login_button():
+            return
+        try:
+            pw_input = self._find_login_pw_input()
+            pw_input.send_keys(Keys.ENTER)
+            self.log("로그인 시도 (Enter)")
+            return
+        except NoSuchElementException:
+            pass
+        self.log("로그인 버튼을 찾지 못했습니다")
+
+    def _has_receipt_captcha(self) -> bool:
+        if not self._find_receipt_captcha_image():
+            return False
+        return bool(self._find_receipt_captcha_question())
+
+    def _has_char_captcha(self) -> bool:
+        if self._has_receipt_captcha():
+            return False
+        url = self.driver.current_url
+        if "rcaptcha" in url:
+            return True
+        question = self._find_captcha_question()
+        if question and self._is_char_captcha_instruction(question):
+            return True
+        img = self._find_char_captcha_image()
+        return img is not None
+
+    def _solve_receipt_answer(self, question: str, img_el) -> str:
+        """영수증 이미지 + 질문으로 정답 추출."""
+        if not img_el:
+            return ""
+        b64 = self._captcha_element_to_b64(img_el)
+
+        if question and re.search(r"(\d+)번째.*숫자", question):
+            phone_raw = self._vision_answer(
+                "영수증 이미지에서 가게 전화번호(☎ 표시 옆)를 찾아 숫자만 출력하세요. "
+                "기호 없이 숫자만. 예: 0242664",
+                b64,
+                detail="high",
+            )
+            digits = re.sub(r"\D", "", phone_raw.split("\n")[0])
+            pos_match = re.search(r"(\d+)번째", question)
+            if pos_match and digits:
+                pos = int(pos_match.group(1)) - 1
+                if 0 <= pos < len(digits):
+                    return digits[pos]
+
+        if question and any(k in question for k in ("가격", "얼마", "합계", "개수", "한 개")):
+            prompt = (
+                "네이버 로그인 영수증 보안 질문입니다.\n"
+                f"질문: {question}\n"
+                "영수증 표의 가격·개수·합계를 읽고 질문에 맞는 숫자 하나만 출력하세요."
+            )
+            answer = re.sub(r"\D", "", self._vision_answer(prompt, b64, detail="high").split("\n")[0])
+            if answer:
+                return answer
+
+        if question and "빈 칸" in question:
+            prompt = (
+                "네이버 로그인 영수증 보안 질문입니다.\n"
+                f"질문: {question}\n"
+                "영수증의 주소·지명 등에서 빈 칸에 들어갈 단어만 출력하세요."
+            )
+            answer = re.sub(r"[^\w가-힣]", "", self._vision_answer(prompt, b64, detail="high").split("\n")[0])
+            if answer:
+                return answer
+
+        if question and any(k in question for k in ("무엇", "이름", "제품", "물건")):
+            prompt = (
+                "네이버 로그인 영수증 보안 질문입니다.\n"
+                f"질문: {question}\n"
+                "영수증 내용을 읽고 질문에 맞는 단어(제품명 등)만 출력하세요."
+            )
+            answer = re.sub(r"[^\w가-힣]", "", self._vision_answer(prompt, b64, detail="high").split("\n")[0])
+            if answer:
+                return answer
+
+        prompt = (
+            "네이버 로그인 영수증 보안 질문입니다. 이미지의 영수증 내용을 읽고 질문에 답하세요.\n"
+            f"질문: {question or '이미지 내용을 바탕으로 요구된 정답을 찾으세요.'}\n"
+            "설명 없이 정답만 출력하세요. 숫자면 숫자만, 문자면 해당 문자만."
+        )
+        answer = self._vision_answer(prompt, b64, detail="high").split("\n")[0].strip()
+        if question and re.search(r"(\d+)번째.*숫자", question):
+            digits = re.sub(r"\D", "", answer)
+            pos_match = re.search(r"(\d+)번째", question)
+            if pos_match and digits:
+                pos = int(pos_match.group(1)) - 1
+                if 0 <= pos < len(digits):
+                    return digits[pos]
+        if question and any(k in question for k in ("가격", "얼마", "합계", "개수")):
+            digits = re.sub(r"\D", "", answer)
+            if digits:
+                return digits
+        return re.sub(r"[^\w가-힣0-9]", "", answer)
+
     def solve_receipt_captcha(self, naver_pw: str) -> bool:
-        """영수증/질문형 보안 화면: 비밀번호 → 정답란 → 로그인."""
+        """영수증/질문형 보안 화면: 비밀번호 → 정답란 → 확인."""
         if not self.client:
             self.log("OpenAI 클라이언트 없음 - 보안 질문을 해결할 수 없습니다.")
             return False
 
         try:
-            # 1) 비밀번호만 pw 칸에 입력
-            self._reenter_password(naver_pw)
-            time.sleep(0.3)
+            self._clear_char_captcha_input()
 
-            # 2) 질문 분석 및 답 생성
-            question = self._find_captcha_question()
-            img_el = self._find_captcha_image()
-            b64 = self._element_to_b64(img_el) if img_el else None
+            question = self._find_receipt_captcha_question() or self._find_captcha_question()
+            img_el = self._find_receipt_captcha_image()
+            if not img_el:
+                self.log("영수증 이미지 없음")
+                return False
 
             if question:
-                self.log(f"보안 질문: {question}")
+                self.log(f"영수증 보안 질문: {question}")
             else:
                 self.log("보안 질문 텍스트 추출 실패, 이미지만 분석합니다.")
 
-            prompt = (
-                "네이버 로그인 보안 질문입니다. 이미지(영수증/표 등)의 내용을 읽고 질문에 답하세요.\n"
-                f"질문: {question or '이미지 내용을 바탕으로 요구된 정답을 찾으세요.'}\n"
-                "설명 없이 정답만 출력하세요. 숫자면 숫자만, 문자면 해당 문자만."
-            )
-            answer = self._vision_answer(prompt, b64)
-            answer = answer.split("\n")[0].strip()
-            if question and any(k in question for k in ("가격", "얼마", "합계", "개수", "몇")):
-                digits = re.sub(r"\D", "", answer)
-                if digits:
-                    answer = digits
-            else:
-                answer = re.sub(r"[^\w가-힣]", "", answer)
+            answer = self._solve_receipt_answer(question, img_el)
+            if any(k in answer for k in ("죄송", "제공할수", "sorry", "cannot", "unable")):
+                self.log("보안 질문 답변 생성 실패 (거절 응답)")
+                self._click_captcha_refresh()
+                return False
             if not answer:
                 self.log("보안 질문 답변 생성 실패")
+                self._click_captcha_refresh()
                 return False
 
             self.log(f"보안 질문 답변: {answer}")
@@ -689,109 +1410,172 @@ class NaverReporter:
             self._type_into_element(answer_input, answer, label="정답")
             time.sleep(0.3)
 
-            # 4) 로그인 버튼
-            self._submit_login()
-            self.log("정답 입력 및 로그인 시도")
+            # 4) 보안 확인 버튼 (#log.login)
+            if not self._click_security_confirm():
+                self.log("보안 확인 버튼(#log.login)을 찾지 못했습니다")
+                return False
+            self.log("정답 입력 및 확인 시도")
+            self._human_delay(1.5, 2.5)
+            if self._is_post_captcha_login_form():
+                self.log("캡챠 통과 — 로그인 폼으로 이동")
+                return True
+            if self._is_still_on_captcha_challenge():
+                self.log("보안 질문 오답 — 새 질문으로 재시도")
+                self._clear_char_captcha_input()
+                self._click_captcha_refresh()
+                return False
             return True
         except Exception as e:
             self.log(f"보안 질문 처리 오류: {self._format_openai_error(e)}")
             return False
 
-    def solve_captcha(self) -> bool:
-        """표시된 문자 CAPTCHA 이미지를 API로 풀고 입력합니다."""
+    def solve_char_captcha_login(self, naver_pw: str) -> bool:
+        """문자 캡챠(자동입력방지) 화면 처리."""
         if not self.client:
-            self.log("OpenAI 클라이언트 없음 - 캡챠를 해결할 수 없습니다.")
+            self.log("OpenAI 클라이언트 없음 - 문자 CAPTCHA를 해결할 수 없습니다.")
             return False
-
-        if self._has_receipt_captcha():
-            return False  # 영수증형은 solve_receipt_captcha에서 처리
 
         try:
-            img_el = self.driver.find_element(By.ID, "captchaimg")
-            b64 = self._element_to_b64(img_el)
-            self.log("CAPTCHA 이미지 확인, GPT Vision으로 인식 중...")
-            captcha_text = re.sub(
-                r"[^A-Za-z0-9]",
-                "",
-                self._vision_answer("이미지에 표시된 문자(숫자/영문)만 정확히 알려주세요. 설명 없이 문자만 출력하세요.", b64),
-            )
+            self._clear_char_captcha_input()
+
+            img_el = self._find_char_captcha_image()
+            if not img_el:
+                self.log("문자 CAPTCHA 이미지 없음")
+                return False
+
+            self.log("문자 CAPTCHA 인식 중...")
+            captcha_text = self._recognize_char_captcha(img_el)
+            if not captcha_text:
+                self.log("CAPTCHA 인식 실패 — 새 이미지로 재시도")
+                self._click_captcha_refresh()
+                return False
             self.log(f"CAPTCHA 인식 결과: {captcha_text}")
 
-            chg_txt = self._find_char_captcha_input()
-            if not chg_txt:
-                self.log("문자 CAPTCHA 입력란 없음")
-                return True
+            answer_input = self._find_char_captcha_input()
+            if not answer_input:
+                self.log("CAPTCHA 입력란 없음")
+                return False
 
-            self._type_into_element(chg_txt, captcha_text, label="CAPTCHA")
-            time.sleep(0.2)
-            self._submit_login()
-            self.log("CAPTCHA 입력 및 제출")
+            aid = answer_input.get_attribute("id") or ""
+            placeholder = answer_input.get_attribute("placeholder") or ""
+            self.log(f"CAPTCHA 입력란: id={aid}, placeholder={placeholder}")
+            self._type_into_element(answer_input, captcha_text, label="CAPTCHA")
+            time.sleep(0.3)
+
+            if not self._click_security_confirm():
+                if not self._click_login_button():
+                    self.log("CAPTCHA 확인/로그인 버튼을 찾지 못했습니다")
+                    return False
+            self.log("CAPTCHA 입력 및 확인 시도")
+            self._human_delay(1.5, 2.5)
+            if self._is_still_on_captcha_challenge():
+                self.log("CAPTCHA 오답 — 새 이미지로 재시도")
+                self._clear_char_captcha_input()
+                self._click_captcha_refresh()
+                return False
             return True
-        except NoSuchElementException:
-            return True  # 캡챠 없음
-        except Exception as e:
-            self.log(f"CAPTCHA 처리 오류: {self._format_openai_error(e)}")
+        except (InvalidSessionIdException, WebDriverException) as e:
+            if "invalid session" in str(e).lower():
+                self.log("브라우저 세션 종료됨 — 로그인 중단")
+                raise
+            self.log(f"문자 CAPTCHA 처리 오류: {e}")
             return False
+        except Exception as e:
+            self.log(f"문자 CAPTCHA 처리 오류: {self._format_openai_error(e)}")
+            return False
+
+    def solve_captcha(self) -> bool:
+        """표시된 문자 CAPTCHA 이미지를 API로 풀고 입력합니다."""
+        return self.solve_char_captcha_login("")
 
     def handle_login_challenges(self, naver_pw: str) -> bool:
         """로그인 중 나타나는 보안 화면(문자/영수증 캡챠)을 처리합니다."""
         if self._has_receipt_captcha():
+            self.log("영수증형 보안 질문 감지")
             return self.solve_receipt_captcha(naver_pw)
         if self._has_char_captcha():
-            return self.solve_captcha()
+            self.log("문자 CAPTCHA 감지")
+            return self.solve_char_captcha_login(naver_pw)
         return True
 
     def login(self, naver_id: str, naver_pw: str, redirect_url: str | None = None) -> tuple[bool, str]:
         target = redirect_url or self.INQUIRY_FORM_URL
-        login_url = (
-            "https://nid.naver.com/nidlogin.login?url="
-            + quote(target, safe="")
-        )
+        login_url = self._build_login_url(target)
         self.driver.get(login_url)
         self.log(f"네이버 로그인 페이지 접속: {naver_id}")
         self._human_delay(1.0, 2.0)
 
-        wait = self._wait(15)
         try:
-            id_input = wait.until(EC.presence_of_element_located((By.ID, "id")))
-            pw_input = self.driver.find_element(By.ID, "pw")
+            self._wait_login_page_ready()
+            id_input = self._find_login_id_input()
+            pw_input = self._find_login_pw_input()
 
-            for char in naver_id:
-                id_input.send_keys(char)
-                time.sleep(random.uniform(0.03, 0.08))
-            for char in naver_pw:
-                pw_input.send_keys(char)
-                time.sleep(random.uniform(0.03, 0.08))
+            self._type_login_credentials(id_input, pw_input, naver_id, naver_pw)
             self.log("아이디/비밀번호 입력 완료")
-            self._human_delay(0.5, 1.2)
+            self._human_delay(0.5, 1.0)
+            if not self._ensure_password_encrypted():
+                self.log("비밀번호 암호화 대기 실패 — 로그인 버튼 제출 시도")
 
-            pw_input.send_keys(Keys.RETURN)
+            self._submit_login()
             self.log("로그인 시도")
-            self._human_delay(1.5, 3.0)
 
-            for attempt in range(5):
+            for attempt in range(8):
                 if self._is_account_protected():
                     self.log("계정 보호조치 화면 감지")
                     return False, "protected"
-                if self._is_logged_in():
-                    self.log("로그인 성공")
-                    return True, "ok"
 
-                if not self.handle_login_challenges(naver_pw):
-                    self.log(f"보안 화면 처리 실패 (시도 {attempt + 1}/5)")
-                self._human_delay(1.5, 3.0)
+                if self._wait_for_login_redirect(timeout=8):
+                    if self._finalize_login(target):
+                        return True, "ok"
+                    self.log("로그인 리다이렉트 후 세션 확인 실패")
+                    return False, "failed"
+
+                err = self._read_login_page_errors()
+                if err:
+                    self.log(f"로그인 화면 메시지: {err}")
+
+                if self._is_on_login_page():
+                    self.log(f"로그인 페이지 대기 중 (URL: {self.driver.current_url[:90]})")
+                    if self._is_post_captcha_login_form():
+                        if not self._complete_password_login(naver_pw):
+                            self.log(f"캡챠 통과 후 로그인 실패 (시도 {attempt + 1}/8)")
+                    elif self._has_receipt_captcha() or self._has_char_captcha():
+                        if not self.handle_login_challenges(naver_pw):
+                            self.log(f"보안 화면 처리 실패 — 재시도 ({attempt + 1}/8)")
+                        else:
+                            self._human_delay(1.0, 2.0)
+                            if self._is_post_captcha_login_form():
+                                if not self._complete_password_login(naver_pw):
+                                    self.log(f"캡챠 통과 후 로그인 실패 (시도 {attempt + 1}/8)")
+                            elif self._is_still_on_captcha_challenge():
+                                self.log(f"보안 화면 유지 — 재시도 ({attempt + 1}/8)")
+                    else:
+                        self.log(f"로그인 폼 대기 중 (시도 {attempt + 1}/8)")
+                self._human_delay(2.0, 3.5)
 
             if self._is_account_protected():
                 self.log("계정 보호조치 화면 감지")
                 return False, "protected"
-            if self._is_logged_in():
-                self.log("로그인 성공")
+            if self._wait_for_login_redirect(timeout=5) and self._finalize_login(target):
                 return True, "ok"
 
-            self.log("로그인 타임아웃")
+            err = self._read_login_page_errors()
+            if err:
+                self.log(f"로그인 실패: {err}")
+            else:
+                self.log(f"로그인 타임아웃 (현재 URL: {self.driver.current_url[:100]})")
             return False, "failed"
         except TimeoutException:
             self.log("로그인 타임아웃")
+            return False, "failed"
+        except InvalidSessionIdException:
+            self.log("브라우저 세션 종료됨")
+            return False, "failed"
+        except WebDriverException as e:
+            if "invalid session" in str(e).lower():
+                self.log("브라우저 세션 종료됨")
+                return False, "failed"
+            self.log(f"로그인 오류: {e}")
             return False, "failed"
         except Exception as e:
             self.log(f"로그인 오류: {e}")
