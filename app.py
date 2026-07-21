@@ -41,8 +41,25 @@ TEMPLATES_FILE = data_path("templates.json")
 CAFE_KEYWORDS_FILE = data_path("cafe_keywords.json")
 CAFE_RESULTS_FILE = data_path("cafe_results.json")
 CAFE_COLLECTED_FILE = data_path("cafe_collected.json")
+BLOG_URLS_FILE = data_path("blog_urls.json")
+BLOG_RESULTS_FILE = data_path("blog_results.json")
+
+BLOG_REPORT_REASONS = {
+    "0": "혐오/차별적/생명경시/욕설 표현입니다.",
+    "1": "스팸홍보/도배입니다.",
+    "2": "청소년에게 유해한 내용입니다.",
+    "3": "불법정보를 포함하고 있습니다.",
+    "4": "음란물입니다.",
+    "5": "불쾌한 표현이 있습니다.",
+}
 
 SEARCH_URL_AUTO_PLACEHOLDER = "자동설정 중입니다"
+
+DEFAULT_INQUIRY_CATEGORY = "illegal"
+INQUIRY_CATEGORY_LABELS = {
+    "illegal": "불법성",
+    "spam": "스팸성",
+}
 
 DEFAULT_TEMPLATES = [
     {
@@ -282,6 +299,156 @@ class DetailWindow:
         messagebox.showinfo("저장", "수정된 내용이 저장되었습니다.")
 
 
+class BlogResultDetailWindow:
+    STATUS_LABELS = {
+        "ok": "완료",
+        "already_reported": "이미신고(네이버)",
+        "previously_reported": "이미 신고했습니다",
+        "protected": "보호조치",
+        "login_failed": "로그인실패",
+        "stopped": "중단",
+        "failed": "실패",
+    }
+
+    COPYABLE_FIELDS = {"네이버 계정", "비밀번호", "게시물 URL"}
+
+    def __init__(self, parent, row: dict, report_count: int = 0):
+        self.row = row
+        self.report_count = report_count
+        self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
+        self.top.title("블로그 신고 상세")
+        self.top.geometry("660x580")
+        self.top.minsize(520, 420)
+        if ctk:
+            self.top.configure(fg_color=COLORS["bg"])
+        else:
+            self.top.configure(bg=COLORS["bg"])
+        self.top.transient(parent)
+
+        outer = ui_frame(self.top, COLORS["bg"])
+        outer.pack(fill=tk.BOTH, expand=True, padx=24, pady=24)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+
+        scroll_host = ui_frame(outer, COLORS["bg"])
+        scroll_host.grid(row=0, column=0, sticky="nsew")
+        scroll_host.grid_rowconfigure(0, weight=1)
+        scroll_host.grid_columnconfigure(0, weight=1)
+
+        if ctk:
+            scroll = ctk.CTkScrollableFrame(
+                scroll_host,
+                fg_color=COLORS["bg"],
+                scrollbar_button_color=COLORS["accent"],
+                scrollbar_button_hover_color=COLORS["accent_hover"],
+            )
+            scroll.grid(row=0, column=0, sticky="nsew")
+            content = scroll
+        else:
+            canvas = tk.Canvas(scroll_host, bg=COLORS["bg"], highlightthickness=0)
+            scrollbar = ttk.Scrollbar(scroll_host, orient=tk.VERTICAL, command=canvas.yview)
+            content = ui_frame(canvas, COLORS["bg"])
+            content.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+            )
+            canvas.create_window((0, 0), window=content, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            scrollbar.grid(row=0, column=1, sticky="ns")
+
+            def _on_mousewheel(event):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+            canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+            self.top.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        card = ui_card(content)
+        card.pack(fill=tk.BOTH, expand=True)
+
+        inner = ui_frame(card, COLORS["card"])
+        inner.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        status = row.get("status", "")
+        status_label = self.STATUS_LABELS.get(status, status or "-")
+
+        fields = [
+            ("네이버 계정", row.get("account_id", "")),
+            ("비밀번호", row.get("account_password", "")),
+            ("게시물 URL", row.get("url", "")),
+            ("게시물 제목", row.get("title", "") or "(제목 없음)"),
+            ("신고 사유", row.get("reason", "")),
+            ("상태", status_label),
+            ("일시", row.get("datetime", "")),
+        ]
+
+        for label, value in fields:
+            if label == "게시물 URL":
+                self._add_url_field(inner, value, self.report_count)
+            else:
+                self._add_field(inner, label, value)
+
+        btn_row = ui_frame(outer, COLORS["bg"])
+        btn_row.grid(row=1, column=0, sticky="e", pady=(12, 0))
+        ui_button(btn_row, "닫기", "ghost", height=38, command=self.top.destroy).pack(side=tk.RIGHT)
+
+    def _add_url_field(self, parent, url: str, report_count: int):
+        label_text = f"게시물 URL · 총 신고 {report_count}회"
+        ui_label(parent, label_text, "small", COLORS["text_muted"]).pack(anchor="w", pady=(10, 4))
+        row = ui_frame(parent, COLORS["card"])
+        row.pack(fill=tk.X, pady=(0, 2))
+        row.grid_columnconfigure(0, weight=1)
+        box = self._read_only_box(row, url, tall=True)
+        box.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ui_button(
+            row, "복사", "secondary", width=64, height=36,
+            command=lambda v=url: self._copy_value(v, "게시물 URL"),
+        ).grid(row=0, column=1, sticky="e")
+
+    def _add_field(self, parent, label: str, value: str):
+        ui_label(parent, label, "small", COLORS["text_muted"]).pack(anchor="w", pady=(10, 4))
+        row = ui_frame(parent, COLORS["card"])
+        row.pack(fill=tk.X, pady=(0, 2))
+        row.grid_columnconfigure(0, weight=1)
+
+        tall = label == "게시물 URL"
+        box = self._read_only_box(row, value, tall=tall)
+        box.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        if label in self.COPYABLE_FIELDS:
+            ui_button(
+                row, "복사", "secondary", width=64, height=36,
+                command=lambda v=value, n=label: self._copy_value(v, n),
+            ).grid(row=0, column=1, sticky="e")
+
+    def _read_only_box(self, parent, text: str, tall: bool = False):
+        height = 72 if tall else 38
+        if ctk:
+            tb = ctk.CTkTextbox(
+                parent, wrap="char", font=FONTS["mono"], height=height,
+                fg_color=COLORS["input_bg"], text_color=COLORS["text"],
+                border_color=COLORS["input_border"], border_width=1,
+                corner_radius=8, activate_scrollbars=tall,
+            )
+            tb.insert("1.0", text or "")
+            tb.configure(state="disabled")
+            return tb
+        tb = tk.Text(
+            parent, wrap=tk.CHAR, font=FONTS["mono"], height=4 if tall else 2,
+            bg=COLORS["input_bg"], fg=COLORS["text"],
+            highlightbackground=COLORS["input_border"], highlightthickness=1,
+            padx=10, pady=6, relief=tk.FLAT,
+        )
+        tb.insert(tk.END, text or "")
+        tb.configure(state=tk.DISABLED)
+        return tb
+
+    def _copy_value(self, text: str, label: str):
+        self.top.clipboard_clear()
+        self.top.clipboard_append(text or "")
+        self.top.update_idletasks()
+
+
 class RegisterWindow:
     def __init__(self, parent, app, task_index=None):
         self.task_index = task_index
@@ -329,23 +496,56 @@ class RegisterWindow:
                 bg=COLORS["input_bg"], fg=COLORS["text"],
                 highlightbackground=COLORS["input_border"], highlightthickness=1,
             )
-        self.type_entry.grid(row=1, column=0, sticky="ew", pady=(0, 16))
+        self.type_entry.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.type_entry.bind("<Return>", lambda e: self.register())
         self.type_entry.bind("<KeyRelease>", self._schedule_url_preview)
         self.type_entry.bind("<FocusOut>", self._on_type_focus_out)
         self.type_entry.focus()
 
+        reason_row = ui_frame(card_inner, COLORS["card"])
+        reason_row.grid(row=2, column=0, sticky="w", pady=(0, 16))
+        self.use_spam_category = False
+        if ctk:
+            self.spam_category_btn = ctk.CTkButton(
+                reason_row, text="스팸성", width=96, height=34,
+                font=FONTS["body_bold"],
+                fg_color=COLORS["input_bg"],
+                hover_color=COLORS["border"],
+                text_color=COLORS["text_muted"],
+                border_color=COLORS["accent"],
+                border_width=2,
+                corner_radius=10,
+                command=self._toggle_spam_category,
+            )
+        else:
+            self.spam_category_btn = tk.Button(
+                reason_row, text="스팸성", width=10,
+                font=FONTS["body_bold"],
+                bg=COLORS["input_bg"], fg=COLORS["text_muted"],
+                activebackground=COLORS["border"],
+                relief=tk.GROOVE, bd=2,
+                command=self._toggle_spam_category,
+            )
+        self.spam_category_btn.pack(side=tk.LEFT)
+        self.spam_category_hint = ui_label(
+            reason_row,
+            "OFF · 불법성(기본)  /  ON · 스팸성",
+            "caption",
+            COLORS["text_light"],
+        )
+        self.spam_category_hint.pack(side=tk.LEFT, padx=(10, 0))
+
         ui_label(card_inner, "사이트 주소", "body_bold", COLORS["text_muted"]).grid(
-            row=2, column=0, sticky="w", pady=(0, 4))
+            row=3, column=0, sticky="w", pady=(0, 4))
         ui_label(
             card_inner,
             "한 줄에 URL 하나 · Enter 줄바꿈 · Ctrl+Enter 등록",
             "caption",
             COLORS["text_light"],
-        ).grid(row=3, column=0, sticky="w", pady=(0, 8))
+        ).grid(row=4, column=0, sticky="w", pady=(0, 8))
 
         url_box = ui_frame(card_inner, COLORS["card"])
-        url_box.grid(row=4, column=0, sticky="ew", pady=(0, 8), padx=16)
+        url_box.grid(row=5, column=0, sticky="ew", pady=(0, 8), padx=16)
         url_box.grid_columnconfigure(0, weight=1)
 
         if ctk:
@@ -365,7 +565,7 @@ class RegisterWindow:
         self.site_text.grid(row=0, column=0, sticky="nsew")
 
         search_header = ui_frame(card_inner, COLORS["card"])
-        search_header.grid(row=5, column=0, sticky="ew", pady=(8, 4))
+        search_header.grid(row=6, column=0, sticky="ew", pady=(8, 4))
         search_header.grid_columnconfigure(0, weight=1)
         ui_label(search_header, "검색결과 URL", "body_bold", COLORS["text_muted"]).grid(
             row=0, column=0, sticky="w")
@@ -399,10 +599,10 @@ class RegisterWindow:
             "caption",
             COLORS["text_light"],
         )
-        self.search_url_hint.grid(row=6, column=0, sticky="w", pady=(0, 8))
+        self.search_url_hint.grid(row=7, column=0, sticky="w", pady=(0, 8))
 
         search_box = ui_frame(card_inner, COLORS["card"])
-        search_box.grid(row=7, column=0, sticky="ew", pady=(0, 8), padx=16)
+        search_box.grid(row=8, column=0, sticky="ew", pady=(0, 8), padx=16)
         search_box.grid_columnconfigure(0, weight=1)
 
         if ctk:
@@ -422,7 +622,7 @@ class RegisterWindow:
         self.search_url_text.grid(row=0, column=0, sticky="nsew")
 
         preview_header = ui_frame(card_inner, COLORS["card"])
-        preview_header.grid(row=8, column=0, sticky="ew", pady=(4, 6))
+        preview_header.grid(row=9, column=0, sticky="ew", pady=(4, 6))
         ui_label(preview_header, "등록 예정 URL", "body_bold", COLORS["text_muted"]).pack(side=tk.LEFT)
         self.url_count_label = ui_label(preview_header, "0개", "badge", COLORS["accent"])
         self.url_count_label.pack(side=tk.RIGHT)
@@ -441,11 +641,11 @@ class RegisterWindow:
                 highlightbackground=COLORS["card_border"], highlightthickness=1,
                 padx=12, pady=10, relief=tk.FLAT, state=tk.DISABLED,
             )
-        self.url_preview.grid(row=9, column=0, sticky="ew", pady=(0, 16), padx=16)
+        self.url_preview.grid(row=10, column=0, sticky="ew", pady=(0, 16), padx=16)
 
-        ui_label(card_inner, "신고 원고", "body_bold", COLORS["text_muted"]).grid(row=10, column=0, sticky="w", pady=(0, 10))
+        ui_label(card_inner, "신고 원고", "body_bold", COLORS["text_muted"]).grid(row=11, column=0, sticky="w", pady=(0, 10))
         tpl_frame = ui_frame(card_inner, COLORS["card"])
-        tpl_frame.grid(row=11, column=0, sticky="ew", pady=(0, 8))
+        tpl_frame.grid(row=12, column=0, sticky="ew", pady=(0, 8))
         tpl_frame.grid_columnconfigure(0, weight=1)
         tpl_frame.grid_columnconfigure(1, weight=1)
 
@@ -509,6 +709,33 @@ class RegisterWindow:
         self.search_url_auto = not self.search_url_auto
         self._apply_search_auto_ui()
         self._update_url_preview()
+
+    def _toggle_spam_category(self):
+        self.use_spam_category = not self.use_spam_category
+        self._apply_spam_category_ui()
+
+    def _apply_spam_category_ui(self):
+        active = self.use_spam_category
+        if ctk and isinstance(self.spam_category_btn, ctk.CTkButton):
+            self.spam_category_btn.configure(
+                fg_color=COLORS["accent"] if active else COLORS["input_bg"],
+                hover_color=COLORS["accent_hover"] if active else COLORS["border"],
+                text_color="#ffffff" if active else COLORS["text_muted"],
+                border_color=COLORS["accent_hover"] if active else COLORS["accent"],
+                text="스팸성 ON" if active else "스팸성",
+            )
+        else:
+            self.spam_category_btn.configure(
+                bg=COLORS["accent"] if active else COLORS["input_bg"],
+                fg="#ffffff" if active else COLORS["text_muted"],
+                text="스팸성 ON" if active else "스팸성",
+            )
+        self.spam_category_hint.configure(
+            text="신고 시 스팸성 선택" if active else "OFF · 불법성(기본)  /  ON · 스팸성",
+        )
+
+    def _get_inquiry_category(self) -> str:
+        return "spam" if self.use_spam_category else DEFAULT_INQUIRY_CATEGORY
 
     def _apply_search_auto_ui(self):
         if self.search_url_auto:
@@ -579,6 +806,8 @@ class RegisterWindow:
 
     def _load_task(self, task: dict):
         self._set_type_text(task.get("report_type", ""))
+        self.use_spam_category = task.get("inquiry_category", DEFAULT_INQUIRY_CATEGORY) == "spam"
+        self._apply_spam_category_ui()
         self._set_textbox(self.site_text, task.get("site", ""))
         if task.get("search_url_auto"):
             self.search_url_auto = True
@@ -797,13 +1026,16 @@ class RegisterWindow:
             self.app.update_task(
                 self.task_index, site, report_type, template, template_choice,
                 search_url=effective, search_url_custom=custom, search_url_auto=auto,
+                inquiry_category=self._get_inquiry_category(),
             )
             self.app.log(f"신고 항목 수정: [{report_type}] {site}")
         else:
+            category = self._get_inquiry_category()
             for site, effective, custom, auto in pairs:
                 self.app.add_task(
                     site, report_type, template, template_choice,
                     search_url=effective, search_url_custom=custom, search_url_auto=auto,
+                    inquiry_category=category,
                     save=False,
                 )
             self.app.save_tasks()
@@ -831,6 +1063,7 @@ class ReportApp:
         configure_treeview("Account.Treeview")
         configure_treeview("Template.Treeview")
         configure_treeview("Cafe.Treeview")
+        configure_treeview("Blog.Treeview")
 
         self.hidden_results = {}
         self.tasks = []
@@ -851,7 +1084,7 @@ class ReportApp:
         self.pages_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
 
         self.pages = {}
-        for name in ["웹사이트신고", "카페신고", "카페수집리스트", "신고 원본", "리라이트 결과", "Settings", "실행 로그"]:
+        for name in ["웹사이트신고", "카페신고", "블로그신고", "카페수집리스트", "신고 원본", "리라이트 결과", "Settings", "실행 로그"]:
             page = ui_frame(self.pages_container, COLORS["bg"])
             page.pack(fill=tk.BOTH, expand=True)
             self.pages[name] = page
@@ -859,6 +1092,7 @@ class ReportApp:
         self.load_templates()
         self.build_home_tab(self.pages["웹사이트신고"])
         self.build_cafe_tab(self.pages["카페신고"])
+        self.build_blog_tab(self.pages["블로그신고"])
         self.build_cafe_collected_tab(self.pages["카페수집리스트"])
         self.build_templates_tab(self.pages["신고 원본"])
         self.build_results_tab(self.pages["리라이트 결과"])
@@ -879,8 +1113,11 @@ class ReportApp:
         self.load_cafe_keywords()
         self.load_cafe_results()
         self.load_cafe_collected()
+        self.load_blog_urls()
+        self.load_blog_results()
         self._report_running = False
         self._cafe_running = False
+        self._blog_running = False
         self._report_stop_requested = False
         self._active_reporter = None
         self.page_header.set("웹사이트신고")
@@ -900,6 +1137,9 @@ class ReportApp:
         if name == "카페신고":
             self.refresh_cafe_keyword_list()
             self.refresh_cafe_results_tree()
+        if name == "블로그신고":
+            self.refresh_blog_url_list()
+            self.refresh_blog_results_tree()
         if name == "카페수집리스트":
             self.refresh_cafe_collected_tree()
 
@@ -1125,6 +1365,117 @@ class ReportApp:
             cafe_prog, mode="determinate", maximum=100, style="Modern.Horizontal.TProgressbar",
         )
         self.cafe_progress.pack(fill=tk.X)
+
+    # ===================== Blog Report Tab =====================
+    def build_blog_tab(self, parent):
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        top_card = self._card(parent)
+        top_card.grid(row=0, column=0, sticky="nsew", pady=(0, 12))
+        top_card.grid_rowconfigure(2, weight=1)
+        top_card.grid_columnconfigure(0, weight=1)
+
+        self._section_label(top_card, "블로그 게시물 URL", row=0, pady=(16, 8))
+        hint = self._frame(top_card, COLORS["card"])
+        hint.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
+        ui_label(
+            hint,
+            "네이버 블로그 게시물 URL과 신고 사유를 등록합니다. "
+            "한 계정으로 등록된 모든 URL을 순차 신고하며, "
+            "이미 신고한 URL·계정 조합은 「이미 신고했습니다」로 표시됩니다.",
+            "small",
+            COLORS["text_muted"],
+        ).pack(anchor="w")
+
+        url_container = self._frame(top_card, COLORS["card"])
+        url_container.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 12))
+        url_container.grid_rowconfigure(0, weight=1)
+        url_container.grid_columnconfigure(0, weight=1)
+
+        self.blog_url_tree = ttk.Treeview(
+            url_container, columns=("url", "reason"), show="headings", style="Blog.Treeview", height=5,
+        )
+        self.blog_url_tree.heading("url", text="블로그 URL")
+        self.blog_url_tree.heading("reason", text="신고 사유")
+        self.blog_url_tree.column("url", width=380, anchor="w")
+        self.blog_url_tree.column("reason", width=260, anchor="w")
+        self.blog_url_tree.grid(row=0, column=0, sticky="nsew")
+        url_sb = ttk.Scrollbar(url_container, orient=tk.VERTICAL, command=self.blog_url_tree.yview)
+        url_sb.grid(row=0, column=1, sticky="ns")
+        self.blog_url_tree.configure(yscrollcommand=url_sb.set)
+
+        url_btn = self._frame(top_card, COLORS["card"])
+        url_btn.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+        ui_button(url_btn, "+ URL 추가", "primary", height=40, command=self.add_blog_url).pack(side=tk.LEFT, padx=(0, 8))
+        ui_button(url_btn, "선택 삭제", "danger", height=40, command=self.delete_blog_url).pack(side=tk.LEFT)
+
+        bottom_card = self._card(parent)
+        bottom_card.grid(row=1, column=0, sticky="nsew")
+        bottom_card.grid_rowconfigure(1, weight=1)
+        bottom_card.grid_columnconfigure(0, weight=1)
+
+        self._section_label(bottom_card, "블로그 신고 결과", row=0, pady=(16, 10))
+
+        res_container = self._frame(bottom_card, COLORS["card"])
+        res_container.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 12))
+        res_container.grid_rowconfigure(0, weight=1)
+        res_container.grid_columnconfigure(0, weight=1)
+
+        self.blog_result_tree = ttk.Treeview(
+            res_container,
+            columns=("account", "url", "reason", "status", "datetime"),
+            show="headings",
+            style="Blog.Treeview",
+            height=8,
+        )
+        for col, title, width in [
+            ("account", "계정", 100),
+            ("url", "게시물 URL", 320),
+            ("reason", "신고 사유", 180),
+            ("status", "상태", 90),
+            ("datetime", "일시", 130),
+        ]:
+            self.blog_result_tree.heading(col, text=title)
+            self.blog_result_tree.column(col, width=width, anchor="w")
+        self.blog_result_tree.grid(row=0, column=0, sticky="nsew")
+        res_sb = ttk.Scrollbar(res_container, orient=tk.VERTICAL, command=self.blog_result_tree.yview)
+        res_sb.grid(row=0, column=1, sticky="ns")
+        self.blog_result_tree.configure(yscrollcommand=res_sb.set)
+        self.blog_result_tree.bind("<Delete>", lambda e: self.delete_selected_blog_result())
+        self.blog_result_tree.bind("<Double-1>", self.open_blog_result_detail)
+
+        blog_btn_frame = self._frame(bottom_card, COLORS["card"])
+        blog_btn_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
+        if ctk:
+            ctk.CTkCheckBox(
+                blog_btn_frame, text="해그리드 모드 (브라우저 숨김)",
+                variable=self.hagrid_mode_var, font=FONTS["body"],
+                text_color=COLORS["text"],
+            ).pack(side=tk.LEFT, padx=(0, 12))
+        else:
+            tk.Checkbutton(
+                blog_btn_frame, text="해그리드 모드 (브라우저 숨김)",
+                variable=self.hagrid_mode_var, font=FONTS["body"],
+                bg=COLORS["card"], fg=COLORS["text"],
+            ).pack(side=tk.LEFT, padx=(0, 12))
+        self.blog_report_btn = ui_button(
+            blog_btn_frame, "블로그 신고 시작", "success", height=44, command=self.start_blog_report,
+        )
+        self.blog_report_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.blog_stop_btn = ui_button(
+            blog_btn_frame, "신고 정지", "danger", height=44, command=self.stop_report,
+        )
+        self.blog_stop_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.blog_stop_btn.configure(state=tk.DISABLED)
+
+        blog_prog = self._frame(bottom_card, COLORS["card"])
+        blog_prog.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+        self.blog_progress = ttk.Progressbar(
+            blog_prog, mode="determinate", maximum=100, style="Modern.Horizontal.TProgressbar",
+        )
+        self.blog_progress.pack(fill=tk.X)
 
     def build_cafe_collected_tab(self, parent):
         parent.grid_rowconfigure(0, weight=1)
@@ -1672,6 +2023,8 @@ class ReportApp:
                     task["search_url"] = site
             elif not (task.get("search_url") or "").strip():
                 task["search_url"] = site
+            if "inquiry_category" not in task:
+                task["inquiry_category"] = DEFAULT_INQUIRY_CATEGORY
         self.refresh_task_list()
 
     def save_tasks(self):
@@ -1708,6 +2061,286 @@ class ReportApp:
     def save_cafe_results(self):
         with open(CAFE_RESULTS_FILE, "w", encoding="utf-8") as f:
             json.dump(self.cafe_results, f, ensure_ascii=False, indent=2)
+
+    def load_blog_urls(self):
+        self.blog_urls = []
+        if os.path.exists(BLOG_URLS_FILE):
+            try:
+                with open(BLOG_URLS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("url"):
+                            self.blog_urls.append({
+                                "url": self._normalize_blog_url(item["url"]),
+                                "reason_id": str(item.get("reason_id", "3")),
+                            })
+                        elif isinstance(item, str) and item.strip():
+                            self.blog_urls.append({
+                                "url": self._normalize_blog_url(item),
+                                "reason_id": "3",
+                            })
+            except Exception:
+                self.blog_urls = []
+        self.refresh_blog_url_list()
+
+    def save_blog_urls(self):
+        with open(BLOG_URLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.blog_urls, f, ensure_ascii=False, indent=2)
+
+    def load_blog_results(self):
+        self.blog_results = []
+        if os.path.exists(BLOG_RESULTS_FILE):
+            try:
+                with open(BLOG_RESULTS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self.blog_results = data
+            except Exception:
+                self.blog_results = []
+
+    def save_blog_results(self):
+        with open(BLOG_RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.blog_results, f, ensure_ascii=False, indent=2)
+
+    def _normalize_blog_url(self, url: str) -> str:
+        url = (url or "").strip()
+        m = re.search(
+            r"blog\.naver\.com/(?:([^/?#]+)/(\d+)|PostView\.naver\?[^#]*?blogId=([^&]+)[^#]*?logNo=(\d+))",
+            url,
+            re.IGNORECASE,
+        )
+        if not m:
+            return url
+        if m.group(1) and m.group(2):
+            return f"https://blog.naver.com/{m.group(1)}/{m.group(2)}"
+        return f"https://blog.naver.com/{m.group(3)}/{m.group(4)}"
+
+    def _is_valid_blog_url(self, url: str) -> bool:
+        return bool(re.search(r"blog\.naver\.com/", self._normalize_blog_url(url), re.IGNORECASE))
+
+    def _blog_entry_url(self, entry) -> str:
+        if isinstance(entry, dict):
+            return entry.get("url", "")
+        return str(entry or "")
+
+    def refresh_blog_url_list(self):
+        if not hasattr(self, "blog_url_tree"):
+            return
+        for item in self.blog_url_tree.get_children():
+            self.blog_url_tree.delete(item)
+        for entry in self.blog_urls:
+            url = self._blog_entry_url(entry)
+            reason_id = str(entry.get("reason_id", "3")) if isinstance(entry, dict) else "3"
+            reason = BLOG_REPORT_REASONS.get(reason_id, reason_id)
+            self.blog_url_tree.insert("", tk.END, values=(url, reason))
+
+    def refresh_blog_results_tree(self):
+        if not hasattr(self, "blog_result_tree"):
+            return
+        for item in self.blog_result_tree.get_children():
+            self.blog_result_tree.delete(item)
+        status_labels = {
+            "ok": "완료",
+            "already_reported": "이미신고",
+            "previously_reported": "이미 신고했습니다",
+            "protected": "보호조치",
+            "login_failed": "로그인실패",
+            "stopped": "중단",
+            "failed": "실패",
+        }
+        for row in reversed(self.blog_results):
+            st = row.get("status", "")
+            label = status_labels.get(st, st or "-")
+            popup = (row.get("popup_message") or "").strip()
+            if popup and st in ("ok", "already_reported", "failed"):
+                label = f"{label} · {self._truncate(popup, 36)}"
+            restriction = (row.get("restriction_reason") or "").strip()
+            if restriction and st in ("protected", "login_failed"):
+                label = f"{label} · {self._truncate(restriction, 36)}"
+            self.blog_result_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.get("account_id", ""),
+                    self._truncate(row.get("url", ""), 80),
+                    self._truncate(row.get("reason", ""), 40),
+                    label,
+                    row.get("datetime", ""),
+                ),
+                tags=(
+                    row.get("account_id", ""),
+                    row.get("url", ""),
+                    row.get("datetime", ""),
+                ),
+            )
+
+    def add_blog_url(self):
+        dialog = ctk.CTkToplevel(self.root) if ctk else tk.Toplevel(self.root)
+        dialog.title("블로그 URL 추가")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        if ctk:
+            dialog.configure(fg_color=COLORS["bg"])
+        else:
+            dialog.configure(bg=COLORS["bg"])
+
+        width, height = 560, 520
+        self._center_toplevel(dialog, width, height)
+
+        container = self._frame(dialog, COLORS["bg"])
+        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        ui_label(container, "블로그 게시물 URL", "body_bold", COLORS["text"]).pack(anchor="w")
+        url_var = tk.StringVar()
+        if ctk:
+            entry = ctk.CTkEntry(
+                container, textvariable=url_var, height=38,
+                fg_color=COLORS["input_bg"], text_color=COLORS["text"],
+                border_color=COLORS["input_border"],
+            )
+        else:
+            entry = tk.Entry(container, textvariable=url_var, font=FONTS["body"])
+        entry.pack(fill=tk.X, pady=(8, 16))
+        entry.focus_set()
+
+        ui_label(container, "사유선택", "body_bold", COLORS["text"]).pack(anchor="w", pady=(0, 8))
+
+        if ctk:
+            reason_box = ctk.CTkFrame(
+                container, fg_color=COLORS["card"],
+                border_color=COLORS["card_border"], border_width=1,
+            )
+        else:
+            reason_box = tk.Frame(
+                container, bg=COLORS["card"],
+                highlightbackground=COLORS["card_border"],
+                highlightthickness=1,
+            )
+        reason_box.pack(fill=tk.BOTH, expand=True, pady=(0, 16))
+
+        reason_var = tk.StringVar(value="3")
+        for rid, label in BLOG_REPORT_REASONS.items():
+            row = self._frame(reason_box, COLORS["card"])
+            row.pack(fill=tk.X, padx=12, pady=6)
+            if ctk:
+                rb = ctk.CTkRadioButton(
+                    row, text=label, variable=reason_var, value=rid,
+                    font=FONTS["body"], text_color=COLORS["text"],
+                    fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+                    border_color=COLORS["input_border"],
+                )
+            else:
+                rb = tk.Radiobutton(
+                    row, text=label, variable=reason_var, value=rid,
+                    font=FONTS["body"], bg=COLORS["card"], fg=COLORS["text"],
+                    activebackground=COLORS["card"], activeforeground=COLORS["text"],
+                    selectcolor=COLORS["input_bg"], anchor="w", justify=tk.LEFT,
+                )
+            rb.pack(anchor="w", fill=tk.X)
+
+        btn_row = self._frame(container, COLORS["bg"])
+        btn_row.pack(fill=tk.X)
+
+        def ok():
+            raw = url_var.get().strip()
+            if not raw:
+                messagebox.showwarning("입력 필요", "블로그 URL을 입력해주세요.", parent=dialog)
+                return
+            norm = self._normalize_blog_url(raw)
+            if not self._is_valid_blog_url(norm):
+                messagebox.showwarning(
+                    "URL 형식 오류",
+                    "네이버 블로그 게시물 URL 형식이 아닙니다.\n예: https://blog.naver.com/아이디/글번호",
+                    parent=dialog,
+                )
+                return
+            existing = {self._normalize_blog_url(self._blog_entry_url(e)) for e in self.blog_urls}
+            if norm in existing:
+                messagebox.showinfo("중복", "이미 등록된 URL입니다.", parent=dialog)
+                return
+            self.blog_urls.append({
+                "url": norm,
+                "reason_id": str(reason_var.get() or "3"),
+            })
+            self.save_blog_urls()
+            self.refresh_blog_url_list()
+            dialog.destroy()
+
+        ui_button(btn_row, "추가", "primary", height=38, command=ok).pack(side=tk.RIGHT)
+        ui_button(btn_row, "취소", "secondary", height=38, command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+        entry.bind("<Return>", lambda e: ok())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+    def delete_blog_url(self):
+        selected = self.blog_url_tree.selection()
+        if not selected:
+            messagebox.showinfo("선택 필요", "삭제할 URL을 선택해주세요.")
+            return
+        for item in selected:
+            vals = self.blog_url_tree.item(item, "values")
+            if vals:
+                url = vals[0]
+                self.blog_urls = [
+                    e for e in self.blog_urls
+                    if self._normalize_blog_url(self._blog_entry_url(e)) != self._normalize_blog_url(url)
+                ]
+        self.save_blog_urls()
+        self.refresh_blog_url_list()
+
+    def delete_selected_blog_result(self):
+        selected = self.blog_result_tree.selection()
+        if not selected:
+            return
+        tags = self.blog_result_tree.item(selected[0])["tags"]
+        if len(tags) < 3:
+            return
+        account, url, dt = tags[0], tags[1], tags[2]
+        self.blog_results = [
+            r for r in self.blog_results
+            if not (
+                r.get("account_id") == account
+                and r.get("url") == url
+                and r.get("datetime") == dt
+            )
+        ]
+        self.save_blog_results()
+        self.refresh_blog_results_tree()
+        self.log(f"블로그 신고 결과 삭제: {self._truncate(url, 60)}")
+
+    def _find_blog_result_row(self, account_id: str, url: str, dt: str) -> dict | None:
+        norm = self._normalize_blog_url(url)
+        for row in self.blog_results:
+            if (
+                row.get("account_id") == account_id
+                and self._normalize_blog_url(row.get("url", "")) == norm
+                and row.get("datetime") == dt
+            ):
+                return row
+        return None
+
+    def _blog_url_report_count(self, url: str) -> int:
+        norm = self._normalize_blog_url(url)
+        return sum(
+            1 for r in self.blog_results
+            if self._normalize_blog_url(r.get("url", "")) == norm
+            and r.get("status") in ("ok", "already_reported", "previously_reported")
+        )
+
+    def open_blog_result_detail(self, event=None):
+        selected = self.blog_result_tree.selection()
+        if not selected:
+            return
+        tags = self.blog_result_tree.item(selected[0])["tags"]
+        if len(tags) < 3:
+            return
+        account, url, dt = tags[0], tags[1], tags[2]
+        row = self._find_blog_result_row(account, url, dt)
+        if not row:
+            return
+        report_count = self._blog_url_report_count(row.get("url", ""))
+        BlogResultDetailWindow(self.root, row, report_count=report_count)
 
     def _cafe_article_key(self, url: str) -> str:
         m = re.search(r"/([A-Za-z0-9_-]+)/(\d+)", url or "", re.IGNORECASE)
@@ -1834,6 +2467,9 @@ class ReportApp:
         for row in reversed(self.cafe_results):
             st = row.get("status", "")
             label = status_labels.get(st, st or "-")
+            restriction = (row.get("restriction_reason") or "").strip()
+            if restriction and st in ("protected", "login_failed"):
+                label = f"{label} · {self._truncate(restriction, 36)}"
             self.cafe_result_tree.insert(
                 "",
                 tk.END,
@@ -2078,11 +2714,13 @@ class ReportApp:
     def add_task(
         self, site, report_type, template, template_name=None,
         search_url="", search_url_custom=False, search_url_auto=False,
+        inquiry_category=DEFAULT_INQUIRY_CATEGORY,
         *, save=True,
     ):
         if template_name is None:
             options = self.get_template_options()
             template_name = options[0][0] if options else ""
+        category = inquiry_category if inquiry_category in INQUIRY_CATEGORY_LABELS else DEFAULT_INQUIRY_CATEGORY
         self.tasks.append({
             "site": site,
             "report_type": report_type,
@@ -2091,12 +2729,14 @@ class ReportApp:
             "search_url": search_url or site,
             "search_url_custom": bool(search_url_custom),
             "search_url_auto": bool(search_url_auto),
+            "inquiry_category": category,
         })
         mode = self.search_url_mode_label(search_url_custom, search_url_auto)
+        reason_label = INQUIRY_CATEGORY_LABELS.get(category, "불법성")
         if search_url_auto:
-            self.log(f"등록: [{report_type}] {site} (검색URL: {mode}, 신고 시 실시간 생성)")
+            self.log(f"등록: [{report_type}] {site} (사유:{reason_label}, 검색URL: {mode}, 신고 시 실시간 생성)")
         else:
-            self.log(f"등록: [{report_type}] {site} (검색URL: {mode})")
+            self.log(f"등록: [{report_type}] {site} (사유:{reason_label}, 검색URL: {mode})")
         if save:
             self.save_tasks()
             self.refresh_task_list()
@@ -2104,7 +2744,9 @@ class ReportApp:
     def update_task(
         self, index, site, report_type, template, template_name,
         search_url="", search_url_custom=False, search_url_auto=False,
+        inquiry_category=DEFAULT_INQUIRY_CATEGORY,
     ):
+        category = inquiry_category if inquiry_category in INQUIRY_CATEGORY_LABELS else DEFAULT_INQUIRY_CATEGORY
         self.tasks[index] = {
             "site": site,
             "report_type": report_type,
@@ -2113,6 +2755,7 @@ class ReportApp:
             "search_url": search_url or site,
             "search_url_custom": bool(search_url_custom),
             "search_url_auto": bool(search_url_auto),
+            "inquiry_category": category,
         }
         self.save_tasks()
         self.refresh_task_list()
@@ -2606,7 +3249,7 @@ class ReportApp:
                 return acc.get("password", "")
         return ""
 
-    def _disable_buttons(self, for_report: bool = False, for_cafe: bool = False):
+    def _disable_buttons(self, for_report: bool = False, for_cafe: bool = False, for_blog: bool = False):
         try:
             self.preview_btn.configure(state=tk.DISABLED)
         except Exception:
@@ -2619,13 +3262,21 @@ class ReportApp:
             self.cafe_report_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
-        if for_report or for_cafe:
+        try:
+            self.blog_report_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        if for_report or for_cafe or for_blog:
             try:
                 self.stop_report_btn.configure(state=tk.NORMAL)
             except Exception:
                 pass
             try:
                 self.cafe_stop_btn.configure(state=tk.NORMAL)
+            except Exception:
+                pass
+            try:
+                self.blog_stop_btn.configure(state=tk.NORMAL)
             except Exception:
                 pass
 
@@ -2643,22 +3294,31 @@ class ReportApp:
         except Exception:
             pass
         try:
+            self.blog_report_btn.configure(state=tk.NORMAL)
+        except Exception:
+            pass
+        try:
             self.stop_report_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
         try:
             self.cafe_stop_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        try:
+            self.blog_stop_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
 
     def stop_report(self):
-        if not self._report_running and not self._cafe_running:
+        if not self._report_running and not self._cafe_running and not self._blog_running:
             return
         self._report_stop_requested = True
-        self.log("[정지] 신고 작업을 중단합니다...")
+        self.log("[정지] 브라우저를 즉시 종료합니다...")
         try:
             self.stop_report_btn.configure(state=tk.DISABLED)
             self.cafe_stop_btn.configure(state=tk.DISABLED)
+            self.blog_stop_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
         if self._active_reporter:
@@ -2800,6 +3460,142 @@ class ReportApp:
         self.save_cafe_results()
         self.refresh_cafe_results_tree()
         self.tabs.select("카페신고")
+
+    def start_blog_report(self):
+        if not self.accounts:
+            messagebox.showwarning("계정 필요", "네이버 계정을 하나 이상 등록해주세요.")
+            self.tabs.select("Settings")
+            return
+        if not self.blog_urls:
+            messagebox.showwarning("URL 필요", "블로그 URL을 하나 이상 등록해주세요.")
+            return
+
+        total_accounts = len(self.accounts)
+
+        self.log("=" * 55)
+        self.log(
+            f"블로그 신고 시작 | URL:{len(self.blog_urls)}개, 계정:{total_accounts}개"
+        )
+        self._blog_running = True
+        self._report_stop_requested = False
+        self._active_reporter = None
+        self._disable_buttons(for_blog=True)
+        self.blog_progress["value"] = 0
+
+        skip_pairs = {
+            (r.get("account_id"), self._normalize_blog_url(r.get("url", "")))
+            for r in self.blog_results
+            if r.get("url") and r.get("account_id")
+            and r.get("status") in ("ok", "already_reported", "previously_reported")
+        }
+        known_titles = {
+            (r.get("account_id"), self._normalize_blog_url(r.get("url", ""))): r.get("title", "")
+            for r in self.blog_results
+            if r.get("url") and r.get("account_id") and r.get("title")
+        }
+
+        def on_log(message):
+            self.root.after(0, lambda: self.log(message))
+
+        def on_result(item):
+            aid = item.get("account_id", "")
+            url = self._normalize_blog_url(item.get("url", ""))
+            updated = False
+            for row in self.blog_results:
+                if (
+                    row.get("account_id") == aid
+                    and self._normalize_blog_url(row.get("url", "")) == url
+                ):
+                    prev = row.get("status", "")
+                    new_st = item.get("status", "")
+                    if new_st == "previously_reported":
+                        row["status"] = "previously_reported"
+                    elif prev == "failed" and new_st in ("ok", "already_reported"):
+                        row["status"] = new_st
+                        row["success"] = item.get("success", new_st == "ok")
+                    elif prev not in ("ok", "already_reported", "previously_reported"):
+                        row["status"] = new_st
+                        row["success"] = item.get("success", row.get("success", False))
+                    if item.get("title"):
+                        row["title"] = item["title"]
+                    if item.get("reason"):
+                        row["reason"] = item["reason"]
+                    if item.get("popup_message"):
+                        row["popup_message"] = item["popup_message"]
+                    if item.get("restriction_reason"):
+                        row["restriction_reason"] = item["restriction_reason"]
+                    if item.get("restriction_date"):
+                        row["restriction_date"] = item["restriction_date"]
+                    row["datetime"] = item.get("datetime", row.get("datetime"))
+                    updated = True
+                    break
+            if not updated:
+                self.blog_results.append(item)
+            self.root.after(0, self.save_blog_results)
+            self.root.after(0, self.refresh_blog_results_tree)
+
+        current = [0]
+        total_work = [max(len(self.accounts) * len(self.blog_urls), 1)]
+
+        def on_progress(delta):
+            current[0] += delta
+            self.root.after(
+                0,
+                lambda c=current[0]: self.blog_progress.configure(
+                    value=min(c / total_work[0] * 100, 100)
+                ),
+            )
+
+        api_key = self.api_key_var.get().strip()
+
+        def run():
+            stopped = False
+            reporter = NaverReporter(
+                api_key=api_key or "blog-only",
+                model=self.model_var.get(),
+                headless=bool(self.hagrid_mode_var.get()),
+                log_callback=on_log,
+                result_callback=on_result,
+                progress_callback=on_progress,
+            )
+            self._active_reporter = reporter
+            try:
+                on_log(
+                    f"진행 예정: 계정 {len(self.accounts)}개 × URL {len(self.blog_urls)}개 "
+                    f"(이미 신고한 항목은 스킵)"
+                )
+                reporter.report_blog_batch(
+                    self.accounts,
+                    self.blog_urls,
+                    skip_pairs,
+                    known_titles,
+                )
+                if reporter.cancel_requested or self._report_stop_requested:
+                    stopped = True
+            except Exception as e:
+                on_log(f"[블로그] 처리 오류: {e}")
+            finally:
+                self._active_reporter = None
+            self.root.after(0, lambda: self.blog_report_finished(stopped=stopped))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def blog_report_finished(self, stopped: bool = False):
+        self._blog_running = False
+        self._report_stop_requested = False
+        self._active_reporter = None
+        self._enable_buttons()
+        if not stopped:
+            self.blog_progress.configure(value=100)
+        self.log("=" * 55)
+        if stopped:
+            self.log("블로그 신고 작업이 중단되었습니다.")
+        else:
+            ok_count = sum(1 for r in self.blog_results if r.get("success"))
+            self.log(f"블로그 신고 완료 — 성공 {ok_count}건")
+        self.save_blog_results()
+        self.refresh_blog_results_tree()
+        self.tabs.select("블로그신고")
 
     def generate_variants(self, site_url, report_type, templates, api_key, model):
         return self.generate_variants_with_account(site_url, report_type, templates, api_key, model, "default")

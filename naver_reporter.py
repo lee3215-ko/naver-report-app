@@ -17,9 +17,11 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     TimeoutException,
     NoSuchElementException,
+    NoAlertPresentException,
     ElementNotInteractableException,
     InvalidSessionIdException,
     WebDriverException,
+    UnexpectedAlertPresentException,
 )
 from webdriver_manager.chrome import ChromeDriverManager
 
@@ -49,16 +51,34 @@ class NaverReporter:
         self.progress_callback = progress_callback
         self.driver = None
         self.cancel_requested = False
+        self._last_popup_message = ""
+        self._last_login_restriction_reason = ""
+        self._last_login_restriction_date = ""
         self.client = self._openai_client()
 
     def request_cancel(self):
         self.cancel_requested = True
         if self.driver:
             self.log("작업 중단 — 브라우저 종료")
-            self.quit_driver()
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
 
     def _should_stop(self) -> bool:
         return self.cancel_requested
+
+    def _interruptible_sleep(self, seconds: float) -> bool:
+        """취소 시 즉시 반환. True = 중단됨."""
+        if seconds <= 0:
+            return self._should_stop()
+        end = time.time() + seconds
+        while time.time() < end:
+            if self._should_stop():
+                return True
+            time.sleep(min(0.08, end - time.time()))
+        return self._should_stop()
 
     def _openai_client(self):
         try:
@@ -73,11 +93,30 @@ class NaverReporter:
         self.log_callback(f"[{ts}] {message}")
 
     def _human_delay(self, min_sec: float = 0.8, max_sec: float = 2.5):
-        time.sleep(random.uniform(min_sec, max_sec))
+        self._interruptible_sleep(random.uniform(min_sec, max_sec))
 
     def _cafe_fast_delay(self, min_sec: float = 0.08, max_sec: float = 0.22):
         """카페 신고 팝업 — 짧은 대기."""
-        time.sleep(random.uniform(min_sec, max_sec))
+        self._interruptible_sleep(random.uniform(min_sec, max_sec))
+
+    def _wait_until(self, predicate, timeout: float = 15, interval: float = 0.2) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            if self._should_stop() or not self.driver:
+                return False
+            try:
+                if predicate():
+                    return True
+            except (InvalidSessionIdException, WebDriverException):
+                if self._should_stop() or not self.driver:
+                    return False
+                raise
+            except Exception:
+                if self._should_stop() or not self.driver:
+                    return False
+            if self._interruptible_sleep(interval):
+                return False
+        return False
 
     def _is_on_inquiry_form(self) -> bool:
         try:
@@ -100,20 +139,454 @@ class NaverReporter:
     def _wait_after_submit(self, timeout: int = 30) -> bool:
         return self._wait_submit_success(timeout)
 
-    def _accept_alert(self, timeout: float = 3) -> str | None:
+    def _ensure_default_content(self):
         try:
-            WebDriverWait(self.driver, timeout).until(EC.alert_is_present())
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+
+    def _alert_present_on_current(self) -> bool:
+        try:
+            self._ensure_default_content()
+            _ = self.driver.switch_to.alert.text
+            return True
+        except NoAlertPresentException:
+            return False
+        except Exception:
+            return False
+
+    def _read_alert_if_present(self, dismiss: bool = True) -> str | None:
+        """현재 창 JS alert 즉시 읽기."""
+        try:
             alert = self.driver.switch_to.alert
-            text = alert.text or ""
-            alert.accept()
+            text = (alert.text or "").strip()
+            if dismiss:
+                alert.accept()
+                if text:
+                    self.log(f"팝업 확인: {text}")
+            return text or None
+        except NoAlertPresentException:
+            return None
+        except Exception:
+            return None
+
+    def _normalize_popup_text(self, text: str) -> str:
+        return (text or "").replace(" ", "").replace("\u00a0", "").replace(".", "").replace("。", "")
+
+    def _read_popup_message(self, timeout: float = 2.0, dismiss: bool = True) -> str | None:
+        """alert / HTML 확인 팝업 메시지 읽기."""
+        end = time.time() + max(timeout, 0)
+        while time.time() < end:
+            if self._should_stop():
+                return None
+
+            text = self._read_alert_if_present(dismiss=dismiss)
             if text:
-                self.log(f"팝업 확인: {text}")
-            return text
-        except TimeoutException:
-            return None
-        except Exception as e:
-            self.log(f"팝업 처리 오류: {e}")
-            return None
+                return text
+
+            self._ensure_default_content()
+            wait_sec = min(0.6, max(end - time.time(), 0.05))
+            try:
+                WebDriverWait(self.driver, wait_sec).until(EC.alert_is_present())
+                text = self._read_alert_if_present(dismiss=dismiss)
+                if text:
+                    return text
+            except TimeoutException:
+                pass
+            except UnexpectedAlertPresentException:
+                text = self._read_alert_if_present(dismiss=dismiss)
+                if text:
+                    return text
+            except NoAlertPresentException:
+                pass
+            except WebDriverException as e:
+                if "alert" in str(e).lower():
+                    text = self._read_alert_if_present(dismiss=dismiss)
+                    if text:
+                        return text
+            except Exception as e:
+                err = str(e).lower()
+                if "alert" in err or "unexpected alert" in err:
+                    text = self._read_alert_if_present(dismiss=dismiss)
+                    if text:
+                        return text
+                    continue
+                if "no alert" not in err and "no such alert" not in err:
+                    break
+
+            html_text = self._try_read_html_confirm_popup(dismiss=dismiss)
+            if html_text:
+                return html_text
+
+            layer = self._try_dismiss_naver_blog_alert_layer() if dismiss else None
+            if layer:
+                return layer
+
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            if self._interruptible_sleep(min(0.1, remaining)):
+                return None
+        return None
+
+    def _try_read_html_confirm_popup(self, dismiss: bool = True) -> str | None:
+        try:
+            text = self.driver.execute_script(
+                """
+                var dismiss = arguments[0];
+                function readDoc(doc) {
+                    if (!doc || !doc.body) return '';
+                    var selectors = [
+                        '[role="dialog"]', '.modal', '.layer_popup', '.popup', '.ly_pop',
+                        'div[class*="popup"]', 'div[class*="layer"]', 'div[class*="alert"]'
+                    ];
+                    for (var si = 0; si < selectors.length; si++) {
+                        var nodes = doc.querySelectorAll(selectors[si]);
+                        for (var i = 0; i < nodes.length; i++) {
+                            var el = nodes[i];
+                            var style = doc.defaultView.getComputedStyle(el);
+                            if (style.display === 'none' || style.visibility === 'hidden') continue;
+                            var t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                            if (!t || t.length > 400) continue;
+                            var btns = el.querySelectorAll('button, a, input[type="button"]');
+                            for (var b = 0; b < btns.length; b++) {
+                                var btn = btns[b];
+                                var bt = (btn.innerText || btn.value || btn.textContent || '').replace(/\\s+/g, '').trim();
+                                if (bt === '확인' || bt === 'OK' || bt.indexOf('확인') === 0) {
+                                    if (dismiss) btn.click();
+                                    return t.slice(0, 300);
+                                }
+                            }
+                        }
+                    }
+                    return '';
+                }
+                var found = readDoc(document);
+                if (found) return found;
+                var frames = document.querySelectorAll('iframe');
+                for (var f = 0; f < frames.length; f++) {
+                    try {
+                        var doc = frames[f].contentDocument || frames[f].contentWindow.document;
+                        found = readDoc(doc);
+                        if (found) return found;
+                    } catch (e) {}
+                }
+                return '';
+                """,
+                dismiss,
+            )
+            if text and text.strip() not in ("확인", "OK"):
+                if dismiss:
+                    self.log(f"팝업 확인(HTML): {text[:80]}")
+                return text.strip()
+        except WebDriverException as e:
+            if "alert" in str(e).lower():
+                return self._read_alert_if_present(dismiss=dismiss)
+        except UnexpectedAlertPresentException:
+            return self._read_alert_if_present(dismiss=dismiss)
+        except Exception:
+            pass
+        return None
+
+    def _is_already_reported_alert(self, text: str) -> bool:
+        if not text or text.strip() in ("확인", "OK", "dialog"):
+            return False
+        raw = text.strip()
+        if "이미 신고" in raw or "이미신고" in raw:
+            return True
+        normalized = self._normalize_popup_text(text)
+        return any(
+            k in normalized
+            for k in (
+                "이미신고",
+                "이미신고되",
+                "이미신고되었",
+                "이미신고한",
+                "이미신고하",
+                "신고하셨",
+                "신고된",
+            )
+        ) and "성공" not in normalized
+
+    def _is_blog_report_success_alert(self, text: str) -> bool:
+        if not text:
+            return False
+        normalized = self._normalize_popup_text(text)
+        if self._is_already_reported_alert(text):
+            return False
+        return (
+            "성공적으로접수" in normalized
+            or "신고를성공적으로" in normalized
+            or "신고가성공" in normalized
+            or ("신고" in normalized and "성공" in normalized and "접수" in normalized)
+            or ("접수" in normalized and "완료" in normalized)
+            or ("접수" in normalized and "성공" in normalized)
+            or "접수했습니다" in normalized
+        )
+
+    def _classify_popup_message(self, text: str | None) -> str:
+        """ok | already | failed | unknown"""
+        if not text or text.strip() in ("확인", "OK", "dialog"):
+            return "unknown"
+        if self._is_already_reported_alert(text):
+            return "already"
+        if self._is_blog_report_success_alert(text):
+            return "ok"
+        if self._is_blog_report_validation_alert(text):
+            return "failed"
+        if any(k in text for k in ("불가", "제한", "실패", "오류")):
+            return "failed"
+        return "unknown"
+
+    def _handle_report_popup_if_any(self, timeout: float = 3.0) -> str | None:
+        """팝업 문자열을 읽어 ok / already 반환."""
+        end = time.time() + timeout
+        while time.time() < end:
+            if self._should_stop():
+                return None
+            msg = self._read_popup_message(timeout=min(1.0, end - time.time()), dismiss=True)
+            if msg:
+                self._last_popup_message = msg
+                status = self._classify_popup_message(msg)
+                self.log(f"팝업 분류: [{status}] {msg[:120]}")
+                if status == "already":
+                    return "already"
+                if status == "ok":
+                    return "ok"
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            if self._interruptible_sleep(min(0.08, remaining)):
+                return None
+        return None
+
+    def _wait_report_popup_outcome(self, timeout: float = 12.0) -> str | None:
+        """srp2 신고창: JS alert(이미 신고/성공) 또는 사유폼 로드 대기.
+
+        ok / already / failed → 즉시 반환, None → 사유폼 준비됨(신고 진행).
+        """
+        end = time.time() + max(timeout, 0)
+        self.log("신고 팝업 — alert 또는 사유폼 대기...")
+        while time.time() < end:
+            if self._should_stop() or not self.driver:
+                return "stopped"
+
+            text = self._read_alert_if_present(dismiss=True)
+            if text:
+                self._last_popup_message = text
+                status = self._classify_popup_message(text)
+                self.log(f"팝업 분류: [{status}] {text[:120]}")
+                if status in ("ok", "already", "failed"):
+                    return status
+
+            try:
+                if self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "input.report_reason, .lst_reason, .list_type, a.btn_submit",
+                ):
+                    self.log("신고 사유 선택 UI 확인")
+                    return None
+            except UnexpectedAlertPresentException:
+                continue
+            except WebDriverException as e:
+                if "alert" in str(e).lower():
+                    continue
+
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            if self._interruptible_sleep(min(0.12, remaining)):
+                return "stopped"
+
+        text = self._read_popup_message(timeout=2.5, dismiss=True)
+        if text:
+            self._last_popup_message = text
+            status = self._classify_popup_message(text)
+            self.log(f"팝업 분류(최종): [{status}] {text[:120]}")
+            if status in ("ok", "already", "failed"):
+                return status
+        return None
+
+    def _accept_alert_on_current(self, timeout: float = 3) -> str | None:
+        """현재 창 alert 확인 (창 전환 없음)."""
+        return self._read_popup_message(timeout=timeout, dismiss=True)
+
+    def _accept_already_reported_on_current(self) -> bool:
+        """현재 창에서 '이미 신고' alert만 확인."""
+        if not self._alert_present_on_current():
+            return False
+        try:
+            self._ensure_default_content()
+            alert = self.driver.switch_to.alert
+            text = (alert.text or "").strip()
+            if not self._is_already_reported_alert(text):
+                return False
+            alert.accept()
+            self._last_popup_message = text
+            self.log(f"이미 신고된 게시물 — 확인: {text}")
+            return True
+        except Exception:
+            return False
+
+    def _try_accept_alert_now(self) -> str | None:
+        return self._accept_alert_on_current(timeout=0)
+
+    def _dismiss_blocking_alert_now(self) -> str | None:
+        return self._accept_alert_on_current(timeout=0.05)
+
+    def _try_dismiss_naver_blog_alert_layer(self) -> str | None:
+        """네이버 블로그 커스텀 확인 레이어(alert 형태) 처리."""
+        self._ensure_default_content()
+        try:
+            text = self.driver.execute_script(
+                """
+                function clickAlreadyReported(doc) {
+                    if (!doc || !doc.body) return '';
+                    var candidates = doc.querySelectorAll(
+                        'p, div, span, strong, li, td, .msg, .text, [class*="alert"], [class*="Alert"], [class*="popup"], [class*="layer"]'
+                    );
+                    for (var i = 0; i < candidates.length; i++) {
+                        var el = candidates[i];
+                        if (!el.offsetParent && el.getBoundingClientRect().height === 0) continue;
+                        var t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (!t || t.length > 120) continue;
+                        if (t.indexOf('이미 신고') < 0 && t.indexOf('이미신고') < 0) continue;
+                        var root = el;
+                        for (var up = 0; up < 12 && root; up++) {
+                            var btns = root.querySelectorAll
+                                ? root.querySelectorAll('button, a, span, div[role="button"], input[type="button"]')
+                                : [];
+                            for (var b = 0; b < btns.length; b++) {
+                                var btn = btns[b];
+                                var bt = (btn.innerText || btn.value || btn.textContent || '').replace(/\\s+/g, '').trim();
+                                if (bt === '확인' || bt === 'OK' || bt.indexOf('확인') === 0) {
+                                    btn.click();
+                                    return t.slice(0, 200);
+                                }
+                            }
+                            root = root.parentElement;
+                        }
+                    }
+                    return '';
+                }
+                var found = clickAlreadyReported(document);
+                if (found) return found;
+                var frames = document.querySelectorAll('iframe#mainFrame, iframe#mainframe, iframe.name_blog, iframe');
+                for (var f = 0; f < frames.length; f++) {
+                    try {
+                        var doc = frames[f].contentDocument || frames[f].contentWindow.document;
+                        found = clickAlreadyReported(doc);
+                        if (found) return found;
+                    } catch (e) {}
+                }
+                return '';
+                """
+            )
+            if text and self._is_already_reported_alert(text):
+                self.log(f"이미 신고 레이어 확인: {text[:80]}")
+                return text
+        except WebDriverException as e:
+            if "alert" in str(e).lower():
+                dismissed = self._dismiss_blocking_alert_now()
+                if dismissed and self._is_already_reported_alert(dismissed):
+                    return dismissed
+        except Exception:
+            pass
+        return None
+
+    def _dismiss_already_reported_on_any_window(self) -> bool:
+        """(레거시) 현재 창 alert만 확인 — 창 전환하지 않음."""
+        return self._accept_already_reported_on_current()
+
+    def _try_dismiss_already_reported_modal(self) -> str | None:
+        """alert가 아닌 HTML 모달에서 '이미 신고' 확인."""
+        try:
+            text = self.driver.execute_script(
+                """
+                function tryDoc(doc) {
+                    if (!doc || !doc.body) return '';
+                    var nodes = doc.querySelectorAll(
+                        '.layer_popup, .popup, .ly_pop, [role="dialog"], .modal, div[class*="popup"], div[class*="layer"]'
+                    );
+                    for (var i = 0; i < nodes.length; i++) {
+                        var el = nodes[i];
+                        var style = doc.defaultView.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+                        var t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (!t || t.length > 300) continue;
+                        if (t.indexOf('이미 신고') < 0 && t.indexOf('이미신고') < 0) continue;
+                        var btns = el.querySelectorAll('button, a, input[type="button"]');
+                        for (var j = 0; j < btns.length; j++) {
+                            var btn = btns[j];
+                            var bt = (btn.innerText || btn.value || btn.textContent || '').trim();
+                            if (bt === '확인' || bt.indexOf('확인') >= 0) {
+                                btn.click();
+                                return t.slice(0, 200);
+                            }
+                        }
+                    }
+                    return '';
+                }
+                var found = tryDoc(document);
+                if (found) return found;
+                var frames = document.querySelectorAll('iframe#mainFrame, iframe#mainframe, iframe.name_blog, iframe');
+                for (var f = 0; f < frames.length; f++) {
+                    try {
+                        var doc = frames[f].contentDocument || frames[f].contentWindow.document;
+                        found = tryDoc(doc);
+                        if (found) return found;
+                    } catch (e) {}
+                }
+                return '';
+                """
+            )
+            if text and self._is_already_reported_alert(text):
+                self.log(f"이미 신고 모달 확인: {text[:80]}")
+                return text
+        except Exception:
+            pass
+        return None
+
+    def _poll_once_already_reported(self) -> str | None:
+        """현재 창 팝업 1회 확인 → ok / already / None."""
+        msg = self._read_popup_message(timeout=1.2, dismiss=True)
+        if msg:
+            self._last_popup_message = msg
+            status = self._classify_popup_message(msg)
+            if status == "already":
+                self.log(f"이미 신고된 게시물 — 확인: {msg[:80]}")
+                return "already"
+            if status == "ok":
+                self.log(f"신고 접수 완료 — 확인: {msg[:80]}")
+                return "ok"
+        layer = self._try_dismiss_naver_blog_alert_layer()
+        if layer:
+            self._last_popup_message = layer
+            self.log("이미 신고된 게시물 — 확인 후 다음 진행")
+            return "already"
+        modal = self._try_dismiss_already_reported_modal()
+        if modal:
+            self._last_popup_message = modal
+            self.log("이미 신고된 게시물 — 확인 후 다음 진행")
+            return "already"
+        return None
+
+    def _dismiss_alert_any_window(self, timeout: float = 5.0) -> str | None:
+        """현재 창 alert 확인 (창 전환 없음)."""
+        return self._accept_alert_on_current(timeout=timeout)
+
+    def _handle_already_reported_if_any(self, timeout: float = 6.0) -> str | None:
+        """팝업 문자열 읽기 → ok / already / None."""
+        return self._handle_report_popup_if_any(timeout=timeout)
+
+    def _accept_alert(self, timeout: float = 3) -> str | None:
+        end = time.time() + timeout
+        while time.time() < end:
+            text = self._try_accept_alert_now()
+            if text:
+                return text
+            time.sleep(0.1)
+        return None
 
     def _is_wrong_captcha_alert(self, text: str) -> bool:
         if not text:
@@ -180,7 +653,13 @@ class NaverReporter:
         except Exception:
             self.driver.execute_script("arguments[0].click();", element)
 
-    def _select_illegal_type(self, wait) -> bool:
+    INQUIRY_CATEGORY_LABELS: dict[str, str] = {
+        "illegal": "불법성",
+        "spam": "스팸성",
+    }
+
+    def _select_inquiry_category(self, wait, category: str = "illegal") -> bool:
+        label = self.INQUIRY_CATEGORY_LABELS.get(category, "불법성")
         try:
             select_btn = wait.until(EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "button.InquiryInput_select_btn__d28Te")
@@ -188,16 +667,19 @@ class NaverReporter:
             self._click_element(select_btn)
             self.log("유형 선택 버튼 클릭")
             self._human_delay(0.6, 1.2)
-            illegal_opt = wait.until(EC.presence_of_element_located(
-                (By.XPATH, "//button[@role='option' and contains(text(),'불법성')]")
+            option = wait.until(EC.presence_of_element_located(
+                (By.XPATH, f"//button[@role='option' and contains(text(),'{label}')]")
             ))
-            self._click_element(illegal_opt)
-            self.log("'불법성' 선택")
+            self._click_element(option)
+            self.log(f"'{label}' 선택")
             self._human_delay(0.8, 1.5)
             return True
         except Exception as e:
-            self.log(f"유형 '불법성' 선택 오류: {e}")
+            self.log(f"유형 '{label}' 선택 오류: {e}")
             return False
+
+    def _select_illegal_type(self, wait) -> bool:
+        return self._select_inquiry_category(wait, "illegal")
 
     @staticmethod
     def _rewrite_rules() -> str:
@@ -504,6 +986,8 @@ class NaverReporter:
             return self._has_naver_session_cookie()
         if "cafe.naver.com" in url:
             return self._has_naver_session_cookie()
+        if "blog.naver.com" in url:
+            return self._has_naver_session_cookie() and not self._is_on_login_page()
         if "www.naver.com" in url:
             return self._has_naver_logged_in_ui() or self._has_naver_session_cookie()
         if "help.naver.com" in url and "nid.naver.com" not in url:
@@ -515,14 +999,58 @@ class NaverReporter:
     def _wait_for_login_redirect(self, timeout: int = 25) -> bool:
         end = time.time() + timeout
         while time.time() < end:
+            if self._should_stop() or not self.driver:
+                return False
             if self._is_account_protected():
                 return False
             if self._is_logged_in():
                 return True
-            time.sleep(0.5)
+            if self._interruptible_sleep(0.5):
+                return False
         return self._is_logged_in()
 
+    def _is_blog_target(self, url: str) -> bool:
+        return "blog.naver.com" in (url or "")
+
+    def _finalize_blog_login(self, target: str) -> bool:
+        norm = self._normalize_blog_url(target)
+        if not self._has_naver_session_cookie():
+            self.log("블로그 로그인 — 세션 쿠키 없음")
+            return False
+
+        current = self.driver.current_url
+        if self._is_on_login_page() or self._has_login_form():
+            self.log("블로그 로그인 — 로그인 페이지에 머무름")
+            return False
+
+        target_log = self._blog_log_no(norm)
+        current_log = self._blog_log_no(current)
+        if target_log and current_log == target_log and "blog.naver.com" in current:
+            self.log("블로그 게시물 페이지 로그인 확인")
+            self._human_delay(1.5, 2.5)
+            self._wait_blog_post_ui(target_log, timeout=15)
+            return True
+
+        self.driver.get(norm)
+        self.log(f"블로그 게시물 이동: {self._truncate_url(norm)}")
+        self._human_delay(2.5, 4.0)
+        self.driver.switch_to.default_content()
+
+        if self._is_on_login_page() or self._has_login_form():
+            self.log("블로그 접근 시 로그인 페이지로 이동됨")
+            return False
+        if not self._has_naver_session_cookie():
+            self.log("블로그 접근 후 세션 없음")
+            return False
+
+        self._wait_blog_post_ui(target_log, timeout=15)
+        self.log("블로그 로그인 완료")
+        return True
+
     def _finalize_login(self, target: str) -> bool:
+        if self._is_blog_target(target):
+            return self._finalize_blog_login(target)
+
         current = self.driver.current_url
         self.log(f"로그인 완료 확인 → {current[:100]}")
         if self._is_on_inquiry_form() and self._has_naver_session_cookie():
@@ -581,7 +1109,87 @@ class NaverReporter:
                 continue
         raise NoSuchElementException("로그인 비밀번호 입력란을 찾지 못했습니다")
 
-    def _is_account_protected(self) -> bool:
+    def _extract_login_restriction(self) -> dict | None:
+        """로그인 제한 화면에서 제한일자·제한사유 추출."""
+        try:
+            info = self.driver.execute_script(
+                """
+                function cellAfter(header) {
+                    var ths = document.querySelectorAll('th');
+                    for (var i = 0; i < ths.length; i++) {
+                        var t = (ths[i].innerText || ths[i].textContent || '').replace(/\\s+/g, '').trim();
+                        if (t.indexOf(header) >= 0) {
+                            var row = ths[i].closest('tr');
+                            if (row) {
+                                var td = row.querySelector('td');
+                                if (td) {
+                                    return (td.innerText || td.textContent || '').replace(/\\s+/g, ' ').trim();
+                                }
+                            }
+                        }
+                    }
+                    return '';
+                }
+                var body = document.body ? (document.body.innerText || '') : '';
+                if (body.indexOf('제한사유') < 0 && body.indexOf('로그인 제한') < 0
+                    && body.indexOf('로그인제한') < 0 && body.indexOf('제한일자') < 0) {
+                    return null;
+                }
+                var reason = cellAfter('제한사유');
+                var date = cellAfter('제한일자');
+                if (!reason && !date) return null;
+                return {reason: reason || '', date: date || ''};
+                """
+            )
+            if info and (info.get("reason") or info.get("date")):
+                return info
+        except Exception:
+            pass
+        try:
+            reason = ""
+            date = ""
+            for row in self.driver.find_elements(By.CSS_SELECTOR, "tr"):
+                try:
+                    row_text = (row.text or "").replace("\n", " ").strip()
+                    if "제한사유" in row_text:
+                        tds = row.find_elements(By.TAG_NAME, "td")
+                        if tds:
+                            reason = (tds[0].text or "").strip()
+                    if "제한일자" in row_text:
+                        tds = row.find_elements(By.TAG_NAME, "td")
+                        if tds:
+                            date = (tds[0].text or "").strip()
+                except Exception:
+                    continue
+            if reason or date:
+                return {"reason": reason, "date": date}
+        except Exception:
+            pass
+        return None
+
+    def _login_restriction_detail(self) -> str:
+        parts: list[str] = []
+        if self._last_login_restriction_date:
+            parts.append(f"제한일자: {self._last_login_restriction_date}")
+        if self._last_login_restriction_reason:
+            parts.append(f"제한사유: {self._last_login_restriction_reason}")
+        return ", ".join(parts)
+
+    def _check_login_blocked(self) -> str | None:
+        """로그인 제한/보호조치 감지. 차단 시 'protected' 반환 및 로그."""
+        info = self._extract_login_restriction()
+        if info:
+            self._last_login_restriction_reason = (info.get("reason") or "").strip()
+            self._last_login_restriction_date = (info.get("date") or "").strip()
+            detail = self._login_restriction_detail()
+            self.log(f"로그인 제한 — {detail}" if detail else "로그인 제한 화면 감지")
+            return "protected"
+        if self._is_account_protection_page():
+            self.log("계정 보호조치 화면 감지")
+            return "protected"
+        return None
+
+    def _is_account_protection_page(self) -> bool:
         try:
             body = self.driver.find_element(By.TAG_NAME, "body").text
             if "회원님의 아이디를 보호하고 있습니다" in body:
@@ -597,6 +1205,9 @@ class NaverReporter:
         except Exception:
             pass
         return False
+
+    def _is_account_protected(self) -> bool:
+        return bool(self._extract_login_restriction()) or self._is_account_protection_page()
 
     def _element_to_b64(self, img_el) -> str:
         src = img_el.get_attribute("src")
@@ -1098,6 +1709,19 @@ class NaverReporter:
                     errors.append(phrase)
         except Exception:
             pass
+        restriction = self._extract_login_restriction()
+        if restriction:
+            reason = (restriction.get("reason") or "").strip()
+            date = (restriction.get("date") or "").strip()
+            parts = []
+            if date:
+                parts.append(f"제한일자: {date}")
+            if reason:
+                parts.append(f"제한사유: {reason}")
+            if parts:
+                msg = ", ".join(parts)
+                if msg not in errors:
+                    errors.append(msg)
         return " / ".join(errors)
 
     def _is_security_confirm_candidate(self, el) -> bool:
@@ -1499,11 +2123,17 @@ class NaverReporter:
         return True
 
     def login(self, naver_id: str, naver_pw: str, redirect_url: str | None = None) -> tuple[bool, str]:
+        if self._should_stop() or not self.driver:
+            return False, "stopped"
         target = redirect_url or self.INQUIRY_FORM_URL
         login_url = self._build_login_url(target)
+        self._last_login_restriction_reason = ""
+        self._last_login_restriction_date = ""
         self.driver.get(login_url)
         self.log(f"네이버 로그인 페이지 접속: {naver_id}")
         self._human_delay(1.0, 2.0)
+        if self._should_stop() or not self.driver:
+            return False, "stopped"
 
         try:
             self._wait_login_page_ready()
@@ -1520,9 +2150,11 @@ class NaverReporter:
             self.log("로그인 시도")
 
             for attempt in range(8):
-                if self._is_account_protected():
-                    self.log("계정 보호조치 화면 감지")
-                    return False, "protected"
+                if self._should_stop() or not self.driver:
+                    return False, "stopped"
+                blocked = self._check_login_blocked()
+                if blocked:
+                    return False, blocked
 
                 if self._wait_for_login_redirect(timeout=8):
                     if self._finalize_login(target):
@@ -1551,11 +2183,15 @@ class NaverReporter:
                                 self.log(f"보안 화면 유지 — 재시도 ({attempt + 1}/8)")
                     else:
                         self.log(f"로그인 폼 대기 중 (시도 {attempt + 1}/8)")
+                if self._should_stop() or not self.driver:
+                    return False, "stopped"
                 self._human_delay(2.0, 3.5)
 
-            if self._is_account_protected():
-                self.log("계정 보호조치 화면 감지")
-                return False, "protected"
+            if self._should_stop() or not self.driver:
+                return False, "stopped"
+            blocked = self._check_login_blocked()
+            if blocked:
+                return False, blocked
             if self._wait_for_login_redirect(timeout=5) and self._finalize_login(target):
                 return True, "ok"
 
@@ -1566,15 +2202,18 @@ class NaverReporter:
                 self.log(f"로그인 타임아웃 (현재 URL: {self.driver.current_url[:100]})")
             return False, "failed"
         except TimeoutException:
+            blocked = self._check_login_blocked()
+            if blocked:
+                return False, blocked
             self.log("로그인 타임아웃")
             return False, "failed"
         except InvalidSessionIdException:
             self.log("브라우저 세션 종료됨")
-            return False, "failed"
+            return False, "stopped" if self._should_stop() else "failed"
         except WebDriverException as e:
             if "invalid session" in str(e).lower():
                 self.log("브라우저 세션 종료됨")
-                return False, "failed"
+                return False, "stopped" if self._should_stop() else "failed"
             self.log(f"로그인 오류: {e}")
             return False, "failed"
         except Exception as e:
@@ -1722,10 +2361,19 @@ class NaverReporter:
         self.log("문의 제출 실패 (최대 재시도 초과)")
         return False
 
-    def fill_form(self, site: str, report_type: str, content: str, search_url: str = "") -> bool:
+    def fill_form(
+        self,
+        site: str,
+        report_type: str,
+        content: str,
+        search_url: str = "",
+        inquiry_category: str = "illegal",
+    ) -> bool:
         """문의 작성 폼을 채웁니다."""
         if self._should_stop():
             return False
+        category = inquiry_category if inquiry_category in self.INQUIRY_CATEGORY_LABELS else "illegal"
+        category_label = self.INQUIRY_CATEGORY_LABELS[category]
         effective_search = (search_url or site).strip()
         try:
             self._go_to_inquiry_page()
@@ -1764,8 +2412,8 @@ class NaverReporter:
             self._human_delay(0.5, 1.2)
 
             try:
-                if not self._select_illegal_type(wait):
-                    self.log("불법성 유형 선택 실패")
+                if not self._select_inquiry_category(wait, category):
+                    self.log(f"{category_label} 유형 선택 실패")
                     return False
                 if not self._solve_inquiry_followup():
                     self.log("추가 질문 처리 실패")
@@ -1783,6 +2431,8 @@ class NaverReporter:
             return False
 
     def _emit_protection_results(self, naver_id: str, naver_pw: str, tasks: list):
+        detail = self._login_restriction_detail()
+        rewritten = detail or "보호조치/로그인 제한 — 해제 필요"
         for task in tasks:
             site = task.get("site", "")
             report_type = task.get("report_type", "")
@@ -1795,10 +2445,12 @@ class NaverReporter:
                 "site": site,
                 "report_type": task.get("report_type", ""),
                 "original": task.get("template", ""),
-                "rewritten": "보호조치 해제 필요",
+                "rewritten": rewritten,
                 "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "success": False,
                 "status": "protected",
+                "restriction_reason": self._last_login_restriction_reason,
+                "restriction_date": self._last_login_restriction_date,
                 "search_url": search_url,
                 "search_url_custom": task.get("search_url_custom", False),
                 "search_url_auto": task.get("search_url_auto", False),
@@ -1816,10 +2468,18 @@ class NaverReporter:
             ok, reason = self.login(naver_id, naver_pw)
             if not ok:
                 if reason == "protected":
-                    self.log(f"[{naver_id}] 보호조치 화면 — 결과에 기록")
+                    detail = self._login_restriction_detail()
+                    if detail:
+                        self.log(f"[{naver_id}] 로그인 제한 — {detail}")
+                    else:
+                        self.log(f"[{naver_id}] 보호조치 화면 — 결과에 기록")
                     self._emit_protection_results(naver_id, naver_pw, tasks)
                 else:
-                    self.log(f"[{naver_id}] 로그인 실패로 중단")
+                    err_detail = self._login_restriction_detail() or self._read_login_page_errors()
+                    if err_detail:
+                        self.log(f"[{naver_id}] 로그인 실패 — {err_detail}")
+                    else:
+                        self.log(f"[{naver_id}] 로그인 실패로 중단")
                 return results
 
             for idx, task in enumerate(tasks):
@@ -1833,6 +2493,7 @@ class NaverReporter:
                 search_url = task.get("search_url", "") or site
                 search_url_custom = task.get("search_url_custom", False)
                 search_url_auto = task.get("search_url_auto", False)
+                inquiry_category = task.get("inquiry_category", "illegal")
                 if search_url_auto and report_type:
                     search_url = fetch_naver_search_url_live(report_type, driver=self.driver, log=self.log)
 
@@ -1841,7 +2502,11 @@ class NaverReporter:
                 self.log(f"[{naver_id}] {idx + 1}/{len(tasks)} 리라이트 완료 ({len(rewritten)}자)")
                 self._human_delay(0.8, 1.8)
 
-                success = self.fill_form(site, report_type, rewritten, search_url=search_url)
+                success = self.fill_form(
+                    site, report_type, rewritten,
+                    search_url=search_url,
+                    inquiry_category=inquiry_category,
+                )
                 dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 results.append({
                     "account_id": naver_id,
@@ -2041,38 +2706,20 @@ class NaverReporter:
         self.log("신고하기 버튼을 찾지 못했습니다")
         return False
 
-    def _is_already_reported_alert(self, text: str) -> bool:
-        if not text:
-            return False
-        return any(
-            k in text
-            for k in ("이미 신고", "이미 신고되", "이미 신고한", "이미 신고 하", "신고하셨")
-        )
-
     def _dismiss_cafe_popup(self, timeout: float = 2) -> str | None:
-        """alert 또는 「확인」 팝업 닫기. 표시된 메시지 반환."""
-        text = self._accept_alert(timeout=timeout)
-        if text:
-            return text
-        for by, sel in [
-            (By.XPATH, "//button[contains(.,'확인')]"),
-            (By.XPATH, "//a[contains(.,'확인')]"),
-            (By.CSS_SELECTOR, "button.btn_confirm, a.btn_confirm"),
-        ]:
-            try:
-                el = self.driver.find_element(by, sel)
-                if el.is_displayed():
-                    body = ""
-                    try:
-                        body = self.driver.find_element(By.TAG_NAME, "body").text
-                    except Exception:
-                        pass
-                    self._click_element(el)
-                    if body:
-                        self.log(f"팝업 확인 클릭: {body[:80]}")
-                    return body[:200] if body else "확인"
-            except NoSuchElementException:
-                continue
+        """alert / HTML 확인 팝업 닫기. 표시된 메시지 반환."""
+        end = time.time() + max(timeout, 0)
+        while time.time() < end:
+            if self._should_stop():
+                return None
+            msg = self._read_popup_message(timeout=min(0.8, end - time.time()), dismiss=True)
+            if msg:
+                return msg
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            if self._interruptible_sleep(min(0.1, remaining)):
+                return None
         return None
 
     def _close_extra_windows(self, main_handle: str) -> None:
@@ -2096,10 +2743,16 @@ class NaverReporter:
         """신고 클릭 후 열린 새 창(handle) 대기."""
         end = time.time() + timeout
         while time.time() < end:
-            new_handles = set(self.driver.window_handles) - before_handles
-            if new_handles:
-                return next(iter(new_handles))
-            time.sleep(0.1)
+            if self._should_stop() or not self.driver:
+                return None
+            try:
+                new_handles = set(self.driver.window_handles) - before_handles
+                if new_handles:
+                    return next(iter(new_handles))
+            except WebDriverException:
+                pass
+            if self._interruptible_sleep(0.15):
+                return None
         return None
 
     def _finish_cafe_report_in_active_window(self) -> str:
@@ -2112,24 +2765,25 @@ class NaverReporter:
             pass
 
         popup_text = self._dismiss_cafe_popup(timeout=0.8)
-        if popup_text and self._is_already_reported_alert(popup_text):
-            self.log("이미 신고된 게시물 — 확인 후 다음 진행")
-            return "already"
+        if popup_text:
+            result = self._parse_blog_report_popup(popup_text)
+            if result in ("ok", "already"):
+                return result
 
         if not self._select_cafe_illegal_reason_in_context():
             return "failed"
         self._cafe_fast_delay(0.05, 0.15)
         if not self._submit_cafe_report_in_context():
+            popup = self._handle_report_popup_if_any(timeout=2)
+            if popup in ("ok", "already"):
+                return popup
             return "failed"
         self._cafe_fast_delay(0.3, 0.6)
         popup_text = self._dismiss_cafe_popup(timeout=3)
         if popup_text:
-            if self._is_already_reported_alert(popup_text):
-                self.log("이미 신고됨 — 확인 후 다음 진행")
-                return "already"
-            if any(k in popup_text for k in ("불가", "제한")):
-                self.log(f"신고 불가: {popup_text}")
-                return "failed"
+            result = self._parse_blog_report_popup(popup_text)
+            if result in ("ok", "already", "failed"):
+                return result
         self.log("카페 신고 접수")
         return "ok"
 
@@ -2250,6 +2904,8 @@ class NaverReporter:
         url: str,
         success: bool,
         status: str,
+        restriction_reason: str = "",
+        restriction_date: str = "",
     ) -> dict:
         return {
             "account_id": account_id,
@@ -2258,6 +2914,8 @@ class NaverReporter:
             "url": url,
             "success": success,
             "status": status,
+            "restriction_reason": restriction_reason or getattr(self, "_last_login_restriction_reason", "") or "",
+            "restriction_date": restriction_date or getattr(self, "_last_login_restriction_date", "") or "",
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -2298,6 +2956,8 @@ class NaverReporter:
         redirect = f"{self.CAFE_SEARCH_URL}{quote(first_kw)}"
         ok, reason = self.login(naver_id, naver_pw, redirect_url=redirect)
         if not ok:
+            if reason == "stopped" or self._should_stop():
+                return results
             status = "protected" if reason == "protected" else "login_failed"
             item = self._cafe_result(naver_id, naver_pw, "", "", False, status)
             results.append(item)
@@ -2376,4 +3036,981 @@ class NaverReporter:
                 self.log(f"[카페] 계정 완료: {account_id}")
         finally:
             self.quit_driver()
+        return all_results
+
+    # ── 블로그 신고 ─────────────────────────────────────────────
+
+    BLOG_REPORT_REASONS: dict[str, str] = {
+        "0": "혐오/차별적/생명경시/욕설 표현입니다.",
+        "1": "스팸홍보/도배입니다.",
+        "2": "청소년에게 유해한 내용입니다.",
+        "3": "불법정보를 포함하고 있습니다.",
+        "4": "음란물입니다.",
+        "5": "불쾌한 표현이 있습니다.",
+    }
+
+    BLOG_POST_URL_RE = re.compile(
+        r"blog\.naver\.com/(?:([^/?#]+)/(\d+)|PostView\.naver\?[^#]*?blogId=([^&]+)[^#]*?logNo=(\d+))",
+        re.IGNORECASE,
+    )
+
+    def _normalize_blog_url(self, url: str) -> str:
+        url = (url or "").strip()
+        m = self.BLOG_POST_URL_RE.search(url)
+        if not m:
+            return url
+        if m.group(1) and m.group(2):
+            return f"https://blog.naver.com/{m.group(1)}/{m.group(2)}"
+        blog_id = m.group(3)
+        log_no = m.group(4)
+        return f"https://blog.naver.com/{blog_id}/{log_no}"
+
+    def _blog_log_no(self, url: str) -> str | None:
+        m = self.BLOG_POST_URL_RE.search(self._normalize_blog_url(url))
+        if not m:
+            return None
+        return m.group(2) or m.group(4)
+
+    def _blog_ids_from_url(self, url: str) -> tuple[str | None, str | None]:
+        m = self.BLOG_POST_URL_RE.search(self._normalize_blog_url(url))
+        if not m:
+            return None, None
+        if m.group(1) and m.group(2):
+            return m.group(1), m.group(2)
+        return m.group(3), m.group(4)
+
+    def _blog_post_view_url(self, url: str) -> str | None:
+        blog_id, log_no = self._blog_ids_from_url(url)
+        if blog_id and log_no:
+            return f"https://blog.naver.com/PostView.naver?blogId={blog_id}&logNo={log_no}"
+        return None
+
+    def _switch_to_blog_main_frame(self) -> bool:
+        self.driver.switch_to.default_content()
+        for sel in ("iframe#mainFrame", "iframe#mainframe", "iframe.name_blog"):
+            try:
+                frame = self.driver.find_element(By.CSS_SELECTOR, sel)
+                self.driver.switch_to.frame(frame)
+                return True
+            except NoSuchElementException:
+                continue
+        return False
+
+    def _find_blog_overflow_el(self, log_no: str | None = None):
+        selectors: list[tuple[str, str]] = []
+        if log_no:
+            selectors.extend([
+                (By.XPATH, f"//a[contains(@class,'btn_overflow_menu') and contains(@class,'_param({log_no})')]"),
+                (By.XPATH, f"//a[contains(@class,'_open_overflowmenu') and contains(@class,'_param({log_no})')]"),
+                (By.CSS_SELECTOR, f"a[class*='_param({log_no})']"),
+            ])
+        selectors.extend([
+            (By.CSS_SELECTOR, "a.btn_overflow_menu._open_overflowmenu"),
+            (By.CSS_SELECTOR, "a.btn_overflow_menu"),
+            (By.CSS_SELECTOR, "a._open_overflowmenu"),
+            (By.XPATH, "//a[contains(@class,'btn_overflow_menu')]"),
+            (By.XPATH, "//a[.//span[contains(@class,'blind') and contains(.,'본문 기타 기능')]]"),
+        ])
+        for by, sel in selectors:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    try:
+                        if el.is_displayed():
+                            return el
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        try:
+            return self.driver.execute_script(
+                """
+                var logNo = arguments[0] || '';
+                var nodes = document.querySelectorAll(
+                    'a.btn_overflow_menu, a._open_overflowmenu, a[class*="_open_overflowmenu"]'
+                );
+                function visible(el) {
+                    if (!el) return false;
+                    var r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                }
+                for (var i = 0; i < nodes.length; i++) {
+                    var el = nodes[i];
+                    if (logNo && (el.className || '').indexOf('_param(' + logNo + ')') < 0) continue;
+                    if (visible(el)) return el;
+                }
+                for (var j = 0; j < nodes.length; j++) {
+                    if (visible(nodes[j])) return nodes[j];
+                }
+                return null;
+                """,
+                log_no or "",
+            )
+        except Exception:
+            return None
+
+    def _blog_overflow_exists(self, log_no: str | None = None) -> bool:
+        try:
+            return bool(self.driver.execute_script(
+                """
+                var logNo = arguments[0] || '';
+                function hasBtn(doc) {
+                    var nodes = doc.querySelectorAll('a.btn_overflow_menu, a._open_overflowmenu');
+                    for (var i = 0; i < nodes.length; i++) {
+                        var el = nodes[i];
+                        if (logNo && (el.className || '').indexOf('_param(' + logNo + ')') < 0) continue;
+                        var r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return true;
+                    }
+                    for (var j = 0; j < nodes.length; j++) {
+                        var rect = nodes[j].getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) return true;
+                    }
+                    return false;
+                }
+                var frames = document.querySelectorAll(
+                    'iframe#mainFrame, iframe#mainframe, iframe.name_blog, iframe'
+                );
+                for (var fi = 0; fi < frames.length; fi++) {
+                    try {
+                        var doc = frames[fi].contentDocument || frames[fi].contentWindow.document;
+                        if (doc && hasBtn(doc)) return true;
+                    } catch (e) {}
+                }
+                return hasBtn(document);
+                """,
+                log_no or "",
+            ))
+        except Exception:
+            return False
+
+    def _wait_blog_post_ui(self, log_no: str | None = None, timeout: int = 15) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            if self._should_stop() or not self.driver:
+                return False
+            self.driver.switch_to.default_content()
+            if self._blog_overflow_exists(log_no):
+                return True
+            if self._interruptible_sleep(0.5):
+                return False
+        self.log("블로그 게시물 UI(⋯ 메뉴) 로드 대기 타임아웃")
+        return False
+
+    def _click_blog_overflow_via_parent_js(self, log_no: str | None = None) -> bool:
+        if not self._wait_until(lambda: self._blog_overflow_exists(log_no), timeout=15):
+            return False
+
+        clicked = self.driver.execute_script(
+            """
+            var logNo = arguments[0] || '';
+            function tryClick(doc, win) {
+                var nodes = doc.querySelectorAll('a.btn_overflow_menu, a._open_overflowmenu');
+                for (var i = 0; i < nodes.length; i++) {
+                    var el = nodes[i];
+                    if (logNo && (el.className || '').indexOf('_param(' + logNo + ')') < 0) continue;
+                    var r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    el.scrollIntoView({block: 'center', inline: 'center'});
+                    var view = win || window;
+                    el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: view}));
+                    el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: view}));
+                    el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: view}));
+                    if (typeof el.click === 'function') el.click();
+                    return true;
+                }
+                for (var j = 0; j < nodes.length; j++) {
+                    var e = nodes[j];
+                    var rect = e.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        e.scrollIntoView({block: 'center'});
+                        e.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+            var frames = document.querySelectorAll('iframe#mainFrame, iframe#mainframe, iframe.name_blog');
+            for (var fi = 0; fi < frames.length; fi++) {
+                try {
+                    var doc = frames[fi].contentDocument || frames[fi].contentWindow.document;
+                    var win = frames[fi].contentWindow;
+                    if (doc && tryClick(doc, win)) return 'iframe';
+                } catch (e) {}
+            }
+            if (tryClick(document, window)) return 'direct';
+            return '';
+            """,
+            log_no or "",
+        )
+        if clicked:
+            self.log(f"블로그 ⋯ 메뉴 클릭 ({clicked})")
+            self._switch_to_blog_main_frame()
+            self._cafe_fast_delay(0.5, 1.0)
+            return True
+        return False
+
+    def _click_blog_report_via_parent_js(self) -> bool:
+        clicked = self.driver.execute_script(
+            """
+            function tryClick(doc) {
+                var links = doc.querySelectorAll('a._report, a[class*="_report"]');
+                for (var i = 0; i < links.length; i++) {
+                    var el = links[i];
+                    var text = (el.textContent || '').replace(/\\s+/g, '');
+                    if (text.indexOf('신고') < 0) continue;
+                    var r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return true;
+                }
+                return false;
+            }
+            var frames = document.querySelectorAll('iframe#mainFrame, iframe#mainframe, iframe.name_blog');
+            for (var fi = 0; fi < frames.length; fi++) {
+                try {
+                    var doc = frames[fi].contentDocument || frames[fi].contentWindow.document;
+                    if (doc && tryClick(doc)) return true;
+                } catch (e) {}
+            }
+            return tryClick(document);
+            """
+        )
+        if clicked:
+            self.log("신고하기 메뉴 클릭 (iframe JS)")
+            return True
+        return False
+
+    def _blog_frame_candidates(self) -> list:
+        frames: list = []
+        try:
+            preferred = self.driver.find_elements(
+                By.CSS_SELECTOR, "iframe#mainFrame, iframe#mainframe, iframe.name_blog",
+            )
+            others = self.driver.find_elements(By.CSS_SELECTOR, "iframe")
+            seen = set()
+            for frame in preferred + others:
+                fid = frame.id or frame.get_attribute("name") or frame.get_attribute("src")
+                if fid in seen:
+                    continue
+                seen.add(fid)
+                frames.append(frame)
+        except Exception:
+            pass
+        frames.append(None)
+        return frames
+
+    def _click_blog_overflow_menu(self, log_no: str | None = None) -> bool:
+        self.driver.switch_to.default_content()
+        if self._click_blog_overflow_via_parent_js(log_no):
+            return True
+
+        for frame in self._blog_frame_candidates():
+            try:
+                self.driver.switch_to.default_content()
+                if frame is not None:
+                    self.driver.switch_to.frame(frame)
+
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        lambda d: self._find_blog_overflow_el(log_no) is not None
+                    )
+                except TimeoutException:
+                    continue
+
+                btn = self._find_blog_overflow_el(log_no)
+                if not btn:
+                    continue
+
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center', inline:'center'});", btn,
+                )
+                self._cafe_fast_delay(0.2, 0.4)
+                try:
+                    self.driver.execute_script(
+                        """
+                        var el = arguments[0];
+                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+                        el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                        if (typeof el.click === 'function') el.click();
+                        return true;
+                        """,
+                        btn,
+                    )
+                except Exception:
+                    self._click_element(btn)
+
+                self._cafe_fast_delay(0.4, 0.8)
+                try:
+                    WebDriverWait(self.driver, 4).until(
+                        EC.presence_of_element_located((
+                            By.CSS_SELECTOR, "a._report, a[class*='_report']",
+                        ))
+                    )
+                except TimeoutException:
+                    pass
+
+                self.log("블로그 ⋯ 메뉴 클릭")
+                return True
+            except Exception:
+                continue
+
+        self.log("블로그 ⋯ 메뉴를 찾지 못했습니다")
+        return False
+
+    def _click_blog_report_menu_item(self) -> bool:
+        self.driver.switch_to.default_content()
+        if self._click_blog_report_via_parent_js():
+            return True
+
+        if self._switch_to_blog_main_frame():
+            pass
+        else:
+            self.driver.switch_to.default_content()
+
+        wait = self._wait(8)
+        for by, sel in [
+            (By.CSS_SELECTOR, "a._report"),
+            (By.CSS_SELECTOR, "a[class*='_report']"),
+            (By.XPATH, "//a[contains(@class,'_report') and contains(.,'신고')]"),
+            (By.XPATH, "//a[contains(.,'신고하기')]"),
+        ]:
+            try:
+                link = wait.until(EC.presence_of_element_located((by, sel)))
+                if link.is_displayed():
+                    self._click_element(link)
+                    self.log("신고하기 메뉴 클릭")
+                    return True
+            except TimeoutException:
+                continue
+            except Exception:
+                continue
+        try:
+            clicked = self.driver.execute_script(
+                """
+                var links = document.querySelectorAll('a._report, a[class*="_report"]');
+                for (var i = 0; i < links.length; i++) {
+                    var el = links[i];
+                    var text = (el.textContent || '').replace(/\\s+/g, '');
+                    if (text.indexOf('신고') >= 0) {
+                        el.scrollIntoView({block:'center'});
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+                """
+            )
+            if clicked:
+                self.log("신고하기 메뉴 클릭")
+                return True
+        except Exception:
+            pass
+        self.log("신고하기 메뉴를 찾지 못했습니다")
+        return False
+
+    def _verify_blog_report_reason_selected(self, reason_id: str) -> bool:
+        reason_id = str(reason_id or "3")
+        try:
+            return bool(self.driver.execute_script(
+                """
+                var rid = arguments[0];
+                var radio = document.getElementById(rid);
+                return !!(radio && radio.checked);
+                """,
+                reason_id,
+            ))
+        except Exception:
+            return False
+
+    def _select_blog_report_reason(self, reason_id: str = "3") -> str:
+        """selected | already | ok | failed | stopped"""
+        popup = self._poll_once_already_reported()
+        if popup in ("already", "ok"):
+            return popup
+        reason_id = str(reason_id or "3")
+        label_text = self.BLOG_REPORT_REASONS.get(reason_id, "")
+
+        end = time.time() + 8
+        loaded = False
+        while time.time() < end:
+            if self._should_stop() or not self.driver:
+                return "stopped"
+            popup = self._poll_once_already_reported()
+            if popup in ("already", "ok"):
+                return popup
+            try:
+                if self.driver.find_elements(
+                    By.CSS_SELECTOR, "input.report_reason, .lst_reason, .list_type",
+                ):
+                    loaded = True
+                    break
+            except UnexpectedAlertPresentException:
+                popup = self._poll_once_already_reported()
+                if popup in ("already", "ok"):
+                    return popup
+            except WebDriverException as e:
+                if "alert" in str(e).lower():
+                    popup = self._poll_once_already_reported()
+                    if popup:
+                        return popup
+            if self._interruptible_sleep(0.12):
+                return "stopped"
+        if not loaded:
+            popup = self._handle_already_reported_if_any(timeout=5)
+            if popup in ("already", "ok"):
+                return popup
+            self.log("신고 사유 선택 UI 로드 실패")
+            return "failed"
+
+        for attempt in range(3):
+            popup = self._poll_once_already_reported()
+            if popup in ("already", "ok"):
+                return popup
+            for by, sel in [
+                (By.CSS_SELECTOR, f"label[for='{reason_id}']"),
+                (By.CSS_SELECTOR, f"div.check_area label[for='{reason_id}']"),
+                (By.CSS_SELECTOR, f"input#{reason_id}.report_reason"),
+                (By.XPATH, f"//label[@for='{reason_id}']"),
+                (By.XPATH, f"//label[contains(.,'{label_text[:10]}')]") if label_text else (By.ID, "__none__"),
+            ]:
+                if sel == "__none__":
+                    continue
+                try:
+                    el = self.driver.find_element(by, sel)
+                    if not el.is_displayed():
+                        continue
+                    self._click_element(el)
+                    self._cafe_fast_delay(0.15, 0.35)
+                    if self._verify_blog_report_reason_selected(reason_id):
+                        self.log(f"신고 사유 선택: {label_text or reason_id}")
+                        return "selected"
+                except Exception:
+                    continue
+
+            try:
+                selected = self.driver.execute_script(
+                    """
+                    var rid = arguments[0];
+                    var labelText = arguments[1];
+                    var label = document.querySelector('label[for="' + rid + '"]');
+                    if (label) {
+                        label.scrollIntoView({block: 'center'});
+                        label.click();
+                        var radio = document.getElementById(rid);
+                        if (radio) {
+                            radio.checked = true;
+                            radio.dispatchEvent(new Event('input', {bubbles: true}));
+                            radio.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                        return !!(radio && radio.checked);
+                    }
+                    var labels = document.querySelectorAll('label');
+                    for (var i = 0; i < labels.length; i++) {
+                        var t = (labels[i].textContent || '').replace(/\\s+/g, '');
+                        if (labelText && t.indexOf(labelText.replace(/\\s+/g, '').slice(0, 6)) >= 0) {
+                            labels[i].click();
+                            var forId = labels[i].getAttribute('for');
+                            var r = forId ? document.getElementById(forId) : null;
+                            return !!(r && r.checked);
+                        }
+                    }
+                    return false;
+                    """,
+                    reason_id,
+                    label_text,
+                )
+                if selected and self._verify_blog_report_reason_selected(reason_id):
+                    self.log(f"신고 사유 선택: {label_text or reason_id}")
+                    return "selected"
+            except Exception:
+                pass
+            self._cafe_fast_delay(0.2, 0.4)
+
+        popup = self._poll_once_already_reported()
+        if popup in ("already", "ok"):
+            return popup
+        self.log("신고 사유 선택 실패")
+        return "failed"
+
+    def _submit_blog_report_popup(self) -> str:
+        """clicked | ok | already | failed"""
+        popup = self._poll_once_already_reported()
+        if popup in ("ok", "already"):
+            return popup
+        end = time.time() + 6
+        while time.time() < end:
+            popup = self._poll_once_already_reported()
+            if popup in ("ok", "already"):
+                return popup
+            for by, sel in [
+                (By.CSS_SELECTOR, "a.btn_submit"),
+                (By.XPATH, "//a[contains(@class,'btn_submit')]"),
+                (By.XPATH, "//a[contains(.,'신고하기') and contains(@class,'btn')]"),
+            ]:
+                try:
+                    btn = self.driver.find_element(by, sel)
+                    if btn.is_displayed() and btn.is_enabled():
+                        self._click_element(btn)
+                        self.log("신고 팝업 — 신고하기 클릭")
+                        return "clicked"
+                except WebDriverException as e:
+                    if "alert" in str(e).lower():
+                        popup = self._poll_once_already_reported()
+                        if popup in ("ok", "already"):
+                            return popup
+                except Exception:
+                    continue
+            if self._interruptible_sleep(0.15):
+                return "failed"
+        self.log("신고 팝업 신고하기 버튼을 찾지 못했습니다")
+        return "failed"
+
+    def _is_blog_report_validation_alert(self, text: str) -> bool:
+        if not text:
+            return False
+        return any(
+            k in text
+            for k in ("신고 유형", "사유를 선택", "사유 선택", "유형을 선택", "선택하세요", "선택해")
+        )
+
+    def _parse_blog_report_popup(self, popup_text: str | None) -> str:
+        """팝업 메시지 → already / ok / failed."""
+        if popup_text:
+            self._last_popup_message = popup_text
+        status = self._classify_popup_message(popup_text)
+        if status == "already":
+            self.log("이미 신고됨 — 확인 후 다음 진행")
+            return "already"
+        if status == "ok":
+            self.log("블로그 신고 접수 완료")
+            return "ok"
+        if status == "failed":
+            self.log(f"신고 실패: {popup_text}")
+            return "failed"
+        if not popup_text:
+            return "failed"
+        self.log(f"신고 결과 미확인: {popup_text}")
+        return "failed"
+
+    def _finish_blog_report_in_popup(self, reason_id: str = "3", *, skip_initial_wait: bool = False) -> str:
+        """신고 팝업 창에서 사유 선택 → 제출 1회. ok / already / failed."""
+        if self._should_stop() or not self.driver:
+            return "stopped"
+
+        if not skip_initial_wait:
+            popup = self._wait_report_popup_outcome(timeout=10)
+            if popup in ("ok", "already", "failed", "stopped"):
+                return "stopped" if popup == "stopped" else popup
+
+        for attempt in range(2):
+            if self._should_stop() or not self.driver:
+                return "stopped"
+
+            select_result = self._select_blog_report_reason(reason_id)
+            if select_result in ("already", "ok"):
+                return select_result
+            if select_result == "stopped":
+                return "stopped"
+            if select_result != "selected":
+                popup = self._handle_already_reported_if_any(timeout=1.5)
+                if popup in ("ok", "already"):
+                    return popup
+                return "failed"
+            if not self._verify_blog_report_reason_selected(reason_id):
+                self.log(f"신고 사유 선택 확인 실패 (시도 {attempt + 1}/2)")
+                if attempt == 0:
+                    continue
+                return "failed"
+
+            self._cafe_fast_delay(0.2, 0.4)
+            submit_result = self._submit_blog_report_popup()
+            if submit_result in ("ok", "already"):
+                return submit_result
+            if submit_result != "clicked":
+                popup = self._handle_already_reported_if_any(timeout=2)
+                if popup in ("ok", "already"):
+                    return popup
+                return "failed"
+
+            self._cafe_fast_delay(0.4, 0.8)
+            popup_text = self._dismiss_cafe_popup(timeout=4)
+            if not popup_text:
+                popup = self._handle_already_reported_if_any(timeout=2)
+                if popup in ("ok", "already"):
+                    return popup
+            result = self._parse_blog_report_popup(popup_text)
+            if result in ("ok", "already"):
+                return result
+            if result == "failed" and popup_text and self._is_blog_report_validation_alert(popup_text):
+                if attempt == 0:
+                    self.log("신고 사유 재선택 후 재시도")
+                    continue
+            return result
+
+        return "failed"
+
+    def _report_blog_in_current_context(self, reason_id: str = "3", log_no: str | None = None) -> str:
+        if self._should_stop() or not self.driver:
+            return "stopped"
+        before_handles = set(self.driver.window_handles)
+        main_handle = self.driver.current_window_handle
+
+        if not self._click_blog_overflow_menu(log_no):
+            return "failed"
+        if not self._click_blog_report_menu_item():
+            return "failed"
+
+        popup_handle = self._wait_for_new_window(before_handles)
+        if popup_handle:
+            try:
+                self.driver.switch_to.window(popup_handle)
+                self.log("신고 팝업 창으로 전환")
+                outcome = self._wait_report_popup_outcome(timeout=12)
+                if outcome in ("ok", "already"):
+                    self._close_extra_windows(main_handle)
+                    return outcome
+                if outcome == "stopped":
+                    self._close_extra_windows(main_handle)
+                    return "stopped"
+                if outcome == "failed":
+                    self._close_extra_windows(main_handle)
+                    return "failed"
+                result = self._finish_blog_report_in_popup(reason_id, skip_initial_wait=True)
+            except WebDriverException as e:
+                err = str(e).lower()
+                if "alert" in err:
+                    popup = self._handle_already_reported_if_any(timeout=2)
+                    result = popup if popup in ("ok", "already") else "failed"
+                    if result == "failed":
+                        self.log(f"신고 팝업 alert 처리: {e}")
+                else:
+                    self.log(f"신고 팝업 처리 오류: {e}")
+                    result = "failed"
+            except Exception as e:
+                self.log(f"신고 팝업 처리 오류: {e}")
+                result = "failed"
+            self._close_extra_windows(main_handle)
+            try:
+                self.driver.switch_to.window(main_handle)
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+            return result
+
+        self.log("신고 팝업 창이 열리지 않았습니다")
+        popup = self._handle_already_reported_if_any(timeout=1)
+        if popup in ("ok", "already"):
+            self._close_extra_windows(main_handle)
+            return popup
+        return "failed"
+
+    def report_blog_post(self, url: str, reason_id: str = "3") -> str:
+        if self._should_stop() or not self.driver:
+            return "stopped"
+        norm = self._normalize_blog_url(url)
+        log_no = self._blog_log_no(norm)
+        if not log_no:
+            self.log(f"블로그 URL 형식 오류: {url}")
+            return "failed"
+
+        self._last_blog_title = ""
+        page_urls = [norm]
+        post_view = self._blog_post_view_url(norm)
+        if post_view and post_view not in page_urls:
+            page_urls.append(post_view)
+
+        try:
+            for page_url in page_urls:
+                if self._should_stop() or not self.driver:
+                    return "stopped"
+                current = self.driver.current_url
+                current_log = self._blog_log_no(current)
+                if current_log == log_no and "blog.naver.com" in current:
+                    self.log(f"블로그 게시물 이미 열림: {self._truncate_url(current)}")
+                    self._human_delay(1.0, 2.0)
+                else:
+                    self.log(f"블로그 접속: {self._truncate_url(page_url)}")
+                    self.driver.get(page_url)
+                    self._human_delay(3.0, 5.0)
+                if self._should_stop() or not self.driver:
+                    return "stopped"
+
+                self.driver.switch_to.default_content()
+                if not self._wait_blog_post_ui(log_no, timeout=15):
+                    if self._should_stop() or not self.driver:
+                        return "stopped"
+                    continue
+                self._last_blog_title = self._extract_blog_post_title()
+                if self._last_blog_title:
+                    self.log(f"게시물 제목: {self._last_blog_title[:60]}")
+                result = self._report_blog_in_current_context(reason_id, log_no)
+                if result == "stopped":
+                    return "stopped"
+                if result in ("ok", "already"):
+                    return result
+
+            self.log("블로그 신고 UI를 찾지 못했습니다")
+            return "failed"
+        except InvalidSessionIdException:
+            return "stopped" if self._should_stop() else "failed"
+        except WebDriverException as e:
+            if "invalid session" in str(e).lower() or self._should_stop():
+                return "stopped"
+            self.log(f"블로그 신고 오류: {e}")
+            return "failed"
+        except Exception as e:
+            self.log(f"블로그 신고 오류: {e}")
+            return "failed"
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+
+    def _extract_blog_post_title(self) -> str:
+        self.driver.switch_to.default_content()
+        try:
+            title = self.driver.execute_script(
+                """
+                function fromDoc(doc) {
+                    if (!doc) return '';
+                    var box = doc.querySelector(
+                        '.se-title-text, div.se-module-text.se-title-text, .se_module_title'
+                    );
+                    if (box) {
+                        var t = (box.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (t) return t;
+                    }
+                    var legacy = doc.querySelector('.pcol1 .htitle, .tit_h3, .se-title');
+                    return legacy ? (legacy.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+                }
+                var frames = document.querySelectorAll('iframe#mainFrame, iframe#mainframe, iframe.name_blog');
+                for (var i = 0; i < frames.length; i++) {
+                    try {
+                        var doc = frames[i].contentDocument || frames[i].contentWindow.document;
+                        var t = fromDoc(doc);
+                        if (t) return t;
+                    } catch (e) {}
+                }
+                return fromDoc(document);
+                """
+            )
+            return (title or "").strip()
+        except Exception:
+            return ""
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+
+    def _blog_result(
+        self,
+        account_id: str,
+        account_pw: str,
+        url: str,
+        reason_id: str,
+        success: bool,
+        status: str,
+        title: str = "",
+        popup_message: str = "",
+        restriction_reason: str = "",
+        restriction_date: str = "",
+    ) -> dict:
+        return {
+            "account_id": account_id,
+            "account_password": account_pw,
+            "url": url,
+            "title": title or "",
+            "reason_id": reason_id,
+            "reason": self.BLOG_REPORT_REASONS.get(str(reason_id), ""),
+            "success": success,
+            "status": status,
+            "popup_message": popup_message or getattr(self, "_last_popup_message", "") or "",
+            "restriction_reason": restriction_reason or getattr(self, "_last_login_restriction_reason", "") or "",
+            "restriction_date": restriction_date or getattr(self, "_last_login_restriction_date", "") or "",
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _normalize_blog_entries(self, entries: list) -> list[dict]:
+        normalized: list[dict] = []
+        for item in entries or []:
+            if isinstance(item, dict) and item.get("url"):
+                normalized.append({
+                    "url": self._normalize_blog_url(item["url"]),
+                    "reason_id": str(item.get("reason_id", "3")),
+                })
+            elif isinstance(item, str) and item.strip():
+                normalized.append({
+                    "url": self._normalize_blog_url(item),
+                    "reason_id": "3",
+                })
+        return normalized
+
+    def _assign_blog_url_accounts(
+        self,
+        accounts: list[dict],
+        entries: list,
+        skip_pairs: set[tuple[str, str]],
+    ) -> list[tuple[dict, dict]]:
+        """(구) 게시물당 계정 1개 배정 — report_blog_batch에서 미사용."""
+        tasks = self._normalize_blog_entries(entries)
+        if not accounts or not tasks:
+            return []
+        pairs: list[tuple[dict, dict]] = []
+        acc_idx = 0
+        for entry in tasks:
+            norm = entry["url"]
+            assigned = False
+            for _ in range(len(accounts)):
+                acc = accounts[acc_idx % len(accounts)]
+                acc_idx += 1
+                aid = acc.get("id", "")
+                if (aid, norm) in skip_pairs:
+                    continue
+                pairs.append((acc, entry))
+                assigned = True
+                break
+            if not assigned:
+                self.log(f"스킵(모든 계정이 이미 신고): {self._truncate_url(norm)}")
+        return pairs
+
+    def report_blog_urls_for_account(
+        self,
+        naver_id: str,
+        naver_pw: str,
+        entries: list[dict],
+        skip_pairs: set[tuple[str, str]],
+        known_titles: dict[tuple[str, str], str] | None = None,
+    ) -> list[dict]:
+        results: list[dict] = []
+        known_titles = known_titles or {}
+        all_entries = self._normalize_blog_entries(entries)
+        pending: list[dict] = []
+
+        for entry in all_entries:
+            url = entry["url"]
+            reason_id = entry["reason_id"]
+            pair = (naver_id, url)
+            if pair in skip_pairs:
+                title = known_titles.get(pair, "")
+                item = self._blog_result(
+                    naver_id, naver_pw, url, reason_id, False, "previously_reported", title=title,
+                )
+                results.append(item)
+                self.log(f"[{naver_id}] 이미 신고 기록 — 스킵: {self._truncate_url(url)}")
+                if self.result_callback:
+                    self.result_callback(item)
+                if self.progress_callback:
+                    self.progress_callback(1)
+                continue
+            pending.append(entry)
+
+        if not pending:
+            return results
+
+        ok, reason = self.login(naver_id, naver_pw, redirect_url=pending[0]["url"])
+        if not ok:
+            if reason == "stopped" or self._should_stop():
+                return results
+            status = "protected" if reason == "protected" else "login_failed"
+            for entry in pending:
+                item = self._blog_result(
+                    naver_id, naver_pw, entry["url"], entry["reason_id"], False, status,
+                )
+                results.append(item)
+                if self.result_callback:
+                    self.result_callback(item)
+                if self.progress_callback:
+                    self.progress_callback(1)
+            return results
+
+        self.log(f"[{naver_id}] 블로그 {len(pending)}건 순차 신고")
+        session_done: set[tuple[str, str]] = set()
+        for idx, entry in enumerate(pending):
+            if self._should_stop():
+                break
+            url = entry["url"]
+            reason_id = entry["reason_id"]
+            pair = (naver_id, url)
+            if pair in session_done:
+                self.log(f"[{naver_id}] 이번 실행 중 처리됨 — 스킵: {self._truncate_url(url)}")
+                if self.progress_callback:
+                    self.progress_callback(1)
+                continue
+            self.log(f"[{naver_id}] {idx + 1}/{len(pending)} — {self._truncate_url(url)}")
+            self._last_popup_message = ""
+            result = self.report_blog_post(url, reason_id=reason_id)
+            if result == "stopped" or self._should_stop():
+                break
+            title = getattr(self, "_last_blog_title", "") or ""
+            popup_message = getattr(self, "_last_popup_message", "") or ""
+            if result == "ok":
+                success, status = True, "ok"
+                session_done.add(pair)
+            elif result == "already":
+                success, status = False, "already_reported"
+                session_done.add(pair)
+            else:
+                success, status = False, "failed"
+            item = self._blog_result(
+                naver_id, naver_pw, url, reason_id, success, status,
+                title=title, popup_message=popup_message,
+            )
+            results.append(item)
+            if self.result_callback:
+                self.result_callback(item)
+            if self.progress_callback:
+                self.progress_callback(1)
+            self._human_delay(1.5, 3.0)
+        return results
+
+    def report_blog_batch(
+        self,
+        accounts: list[dict],
+        entries: list,
+        skip_pairs: set[tuple[str, str]],
+        known_titles: dict[tuple[str, str], str] | None = None,
+    ) -> list[dict]:
+        """계정당 등록된 모든 URL을 순차 신고 (URL·계정당 1회)."""
+        all_results: list[dict] = []
+        tasks = self._normalize_blog_entries(entries)
+        if not accounts or not tasks:
+            self.log("신고할 블로그 URL이 없습니다.")
+            return all_results
+
+        self.log(
+            f"블로그 신고: URL {len(tasks)}개, 계정 {len(accounts)}개 "
+            f"(계정당 전체 URL 순차 신고)"
+        )
+
+        for acc in accounts:
+            if self._should_stop():
+                break
+            aid = acc.get("id", "")
+            has_pending = any((aid, e["url"]) not in skip_pairs for e in tasks)
+            if not has_pending:
+                self.log(f"[{aid}] 모든 URL 이미 신고됨 — 로그인 생략, 다음 계정으로")
+                if self.progress_callback:
+                    for _ in tasks:
+                        self.progress_callback(1)
+                continue
+
+            self.log(f"[블로그] 계정 시작: {aid}")
+            self.start_driver()
+            try:
+                batch = self.report_blog_urls_for_account(
+                    aid,
+                    acc.get("password", ""),
+                    tasks,
+                    skip_pairs,
+                    known_titles,
+                )
+                all_results.extend(batch)
+            finally:
+                self.quit_driver()
+            self._human_delay(1.5, 2.5)
+            self.log(f"[블로그] 계정 완료: {aid}")
         return all_results
