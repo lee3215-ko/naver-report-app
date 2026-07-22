@@ -38,6 +38,10 @@ COLORS = {
     "input_bg": "#f8fafc",
     "input_border": "#cbd5e1",
     "preview_bg": "#f8fafc",
+    "log_bg": "#ffffff",
+    "log_fg": "#0f172a",
+    "log_border": "#64748b",
+    "log_muted": "#475569",
     "table_header": "#f1f5f9",
     "table_selected": "#c7d2fe",
 }
@@ -53,21 +57,36 @@ FONTS = {
     "small": (FONT_FAMILY, 10),
     "caption": (FONT_FAMILY, 9),
     "mono": ("Consolas", 10),
+    "log": ("Consolas", 13),
+    "log_bold": ("맑은 고딕", 13, "bold"),
     "nav": (FONT_FAMILY, 13),
     "nav_active": (FONT_FAMILY, 13, "bold"),
     "badge": (FONT_FAMILY, 11, "bold"),
 }
 
-NAV_ITEMS = [
+NAV_ITEMS_PUBLIC = [
     ("웹사이트신고", "웹사이트신고"),
-    ("카페신고", "카페신고"),
     ("블로그신고", "블로그 신고"),
-    ("카페수집리스트", "카페 수집 리스트"),
     ("신고 원본", "신고 원본"),
     ("리라이트 결과", "리라이트 결과"),
     ("Settings", "설정"),
     ("실행 로그", "실행 로그"),
 ]
+
+NAV_ITEMS_ADMIN = [
+    ("카페신고", "카페신고"),
+    ("카페수집리스트", "카페 수집 리스트"),
+]
+
+# 하위 호환
+NAV_ITEMS = NAV_ITEMS_PUBLIC + NAV_ITEMS_ADMIN
+
+
+def get_nav_items(admin_mode: bool = False) -> list[tuple[str, str]]:
+    items = list(NAV_ITEMS_PUBLIC)
+    if admin_mode:
+        items.extend(NAV_ITEMS_ADMIN)
+    return items
 
 PAGE_META = {
     "웹사이트신고": ("웹사이트신고", "등록된 사이트 신고 목록 및 작업 실행"),
@@ -190,10 +209,11 @@ def configure_treeview(style_name: str):
 class SidebarNav:
     """Left sidebar navigation."""
 
-    def __init__(self, parent, command, app_version: str = ""):
+    def __init__(self, parent, command, app_version: str = "", nav_items: list[tuple[str, str]] | None = None):
         self.command = command
+        self.nav_items = nav_items or NAV_ITEMS_PUBLIC
         self.buttons = {}
-        self.current = NAV_ITEMS[0][0]
+        self.current = self.nav_items[0][0]
 
         self.frame = frame(parent, COLORS["sidebar"], width=232)
         self.frame.pack(side=tk.LEFT, fill=tk.Y)
@@ -212,7 +232,7 @@ class SidebarNav:
         nav_wrap = frame(self.frame, COLORS["sidebar"])
         nav_wrap.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
-        for key, display in NAV_ITEMS:
+        for key, display in self.nav_items:
             active = key == self.current
             if ctk:
                 btn = ctk.CTkButton(

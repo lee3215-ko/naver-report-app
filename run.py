@@ -1,7 +1,8 @@
 """네이버 사이트 자동 신고 프로그램 실행 진입점."""
-from paths import init_runtime_paths, get_icon_path, APP_VERSION, UPDATE_VERSION_URL, APP_NAME
+from paths import init_runtime_paths, get_icon_path, APP_VERSION, UPDATE_VERSION_URL, APP_NAME, set_admin_mode
 
 init_runtime_paths()
+set_admin_mode(True)
 
 
 def _preload_frozen_deps():

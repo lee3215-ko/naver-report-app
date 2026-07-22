@@ -10,13 +10,14 @@ from urllib.parse import quote
 
 from naver_reporter import NaverReporter
 from naver_search_url import build_naver_search_url as resolve_naver_search_url
-from paths import data_path, APP_VERSION
+from paths import data_path, APP_VERSION, is_admin_mode
 from ui_theme import (
     COLORS,
     FONTS,
     SidebarNav,
     PageHeader,
     configure_treeview,
+    get_nav_items,
     frame as ui_frame,
     card as ui_card,
     label as ui_label,
@@ -1073,7 +1074,13 @@ class ReportApp:
         self._task_drag_indicator = None
         self._task_drag_ghost = None
 
-        self.sidebar = SidebarNav(self.root, self.on_tab_change, app_version=APP_VERSION)
+        self.sidebar = SidebarNav(
+            self.root,
+            self.on_tab_change,
+            app_version=APP_VERSION,
+            nav_items=get_nav_items(is_admin_mode()),
+        )
+        self.admin_mode = is_admin_mode()
 
         self.content = ui_frame(self.root, COLORS["bg"])
         self.content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1084,16 +1091,17 @@ class ReportApp:
         self.pages_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
 
         self.pages = {}
-        for name in ["웹사이트신고", "카페신고", "블로그신고", "카페수집리스트", "신고 원본", "리라이트 결과", "Settings", "실행 로그"]:
+        for name, _display in get_nav_items(self.admin_mode):
             page = ui_frame(self.pages_container, COLORS["bg"])
             page.pack(fill=tk.BOTH, expand=True)
             self.pages[name] = page
 
         self.load_templates()
         self.build_home_tab(self.pages["웹사이트신고"])
-        self.build_cafe_tab(self.pages["카페신고"])
         self.build_blog_tab(self.pages["블로그신고"])
-        self.build_cafe_collected_tab(self.pages["카페수집리스트"])
+        if self.admin_mode:
+            self.build_cafe_tab(self.pages["카페신고"])
+            self.build_cafe_collected_tab(self.pages["카페수집리스트"])
         self.build_templates_tab(self.pages["신고 원본"])
         self.build_results_tab(self.pages["리라이트 결과"])
         self.build_settings_tab(self.pages["Settings"])
@@ -1118,8 +1126,13 @@ class ReportApp:
         self._report_running = False
         self._cafe_running = False
         self._blog_running = False
-        self._report_stop_requested = False
-        self._active_reporter = None
+        self._preview_running = False
+        self._website_stop_requested = False
+        self._cafe_stop_requested = False
+        self._blog_stop_requested = False
+        self._website_reporter = None
+        self._cafe_reporter = None
+        self._blog_reporter = None
         self.page_header.set("웹사이트신고")
 
     def on_tab_change(self, name):
@@ -1245,7 +1258,7 @@ class ReportApp:
 
         self.preview_btn = ui_button(btn_frame, "리라이트 미리보기", "warning", height=44, command=self.preview_all)
         self.preview_btn.pack(side=tk.RIGHT, padx=(8, 0))
-        self.stop_report_btn = ui_button(btn_frame, "신고 정지", "danger", height=44, command=self.stop_report)
+        self.stop_report_btn = ui_button(btn_frame, "신고 정지", "danger", height=44, command=self.stop_website_report)
         self.stop_report_btn.pack(side=tk.RIGHT, padx=(8, 0))
         self.stop_report_btn.configure(state=tk.DISABLED)
         self.report_btn = ui_button(btn_frame, "신고 시작", "success", height=44, command=self.start_report)
@@ -1354,7 +1367,7 @@ class ReportApp:
         )
         self.cafe_report_btn.pack(side=tk.RIGHT, padx=(8, 0))
         self.cafe_stop_btn = ui_button(
-            cafe_btn_frame, "신고 정지", "danger", height=44, command=self.stop_report,
+            cafe_btn_frame, "신고 정지", "danger", height=44, command=self.stop_cafe_report,
         )
         self.cafe_stop_btn.pack(side=tk.RIGHT, padx=(8, 0))
         self.cafe_stop_btn.configure(state=tk.DISABLED)
@@ -1395,7 +1408,8 @@ class ReportApp:
         url_container.grid_columnconfigure(0, weight=1)
 
         self.blog_url_tree = ttk.Treeview(
-            url_container, columns=("url", "reason"), show="headings", style="Blog.Treeview", height=5,
+            url_container, columns=("url", "reason"), show="headings", style="Blog.Treeview",
+            height=5, selectmode="extended",
         )
         self.blog_url_tree.heading("url", text="블로그 URL")
         self.blog_url_tree.heading("reason", text="신고 사유")
@@ -1405,6 +1419,7 @@ class ReportApp:
         url_sb = ttk.Scrollbar(url_container, orient=tk.VERTICAL, command=self.blog_url_tree.yview)
         url_sb.grid(row=0, column=1, sticky="ns")
         self.blog_url_tree.configure(yscrollcommand=url_sb.set)
+        self.blog_url_tree.bind("<Delete>", lambda e: self.delete_blog_url())
 
         url_btn = self._frame(top_card, COLORS["card"])
         url_btn.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
@@ -1429,6 +1444,7 @@ class ReportApp:
             show="headings",
             style="Blog.Treeview",
             height=8,
+            selectmode="extended",
         )
         for col, title, width in [
             ("account", "계정", 100),
@@ -1465,7 +1481,7 @@ class ReportApp:
         )
         self.blog_report_btn.pack(side=tk.RIGHT, padx=(8, 0))
         self.blog_stop_btn = ui_button(
-            blog_btn_frame, "신고 정지", "danger", height=44, command=self.stop_report,
+            blog_btn_frame, "신고 정지", "danger", height=44, command=self.stop_blog_report,
         )
         self.blog_stop_btn.pack(side=tk.RIGHT, padx=(8, 0))
         self.blog_stop_btn.configure(state=tk.DISABLED)
@@ -1894,6 +1910,67 @@ class ReportApp:
             row=0, column=1, sticky="ew")
 
     # ===================== Log Tab =====================
+    _LOG_CHANNEL_LABELS = {
+        "general": "공통",
+        "website": "웹사이트",
+        "blog": "블로그",
+        "cafe": "카페",
+    }
+
+    def _make_log_textbox(self, parent, *, pack_fill: bool = True):
+        if ctk:
+            box = ctk.CTkTextbox(
+                parent,
+                wrap=tk.WORD,
+                font=FONTS["log"],
+                fg_color=COLORS["log_bg"],
+                text_color=COLORS["log_fg"],
+                border_color=COLORS["log_border"],
+                border_width=2,
+                corner_radius=8,
+                state=tk.DISABLED,
+                activate_scrollbars=True,
+            )
+        else:
+            box = tk.Text(
+                parent,
+                wrap=tk.WORD,
+                font=FONTS["log"],
+                bg=COLORS["log_bg"],
+                fg=COLORS["log_fg"],
+                insertbackground=COLORS["log_fg"],
+                selectbackground=COLORS["table_selected"],
+                relief=tk.SOLID,
+                bd=2,
+                highlightbackground=COLORS["log_border"],
+                highlightthickness=1,
+                padx=10,
+                pady=8,
+                spacing1=2,
+                spacing3=2,
+                state=tk.DISABLED,
+            )
+        if pack_fill:
+            box.pack(fill=tk.BOTH, expand=True)
+        return box
+
+    def _set_log_widget_text(self, widget, text: str):
+        widget.configure(state=tk.NORMAL)
+        if ctk and isinstance(widget, ctk.CTkTextbox):
+            widget.delete("1.0", tk.END)
+            widget.insert("1.0", text)
+        else:
+            widget.delete("1.0", tk.END)
+            widget.insert(tk.END, text)
+        widget.configure(state=tk.DISABLED)
+        widget.see(tk.END)
+
+    def _append_log_widget(self, widget, line: str):
+        widget.configure(state=tk.NORMAL)
+        widget.insert(tk.END, f"{line}\n")
+        widget.see(tk.END)
+        widget.configure(state=tk.DISABLED)
+
     def build_log_tab(self, parent):
         parent.grid_rowconfigure(0, weight=1)
         parent.grid_columnconfigure(0, weight=1)
@@ -1903,22 +1980,158 @@ class ReportApp:
         card.grid_rowconfigure(1, weight=1)
         card.grid_columnconfigure(0, weight=1)
 
-        self._section_label(card, "실행 로그", row=0, pady=(16, 12))
+        header = self._frame(card, COLORS["card"])
+        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 8))
+        ui_label(header, "실행 로그", "subheading", COLORS["text"]).pack(side=tk.LEFT)
+        self.log_layout_hint = ui_label(header, "", "caption", COLORS["text_muted"])
+        self.log_layout_hint.pack(side=tk.LEFT, padx=(12, 0))
 
+        self.log_body = self._frame(card, COLORS["card"])
+        self.log_body.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        self.log_body.grid_rowconfigure(0, weight=1)
+        self.log_body.grid_columnconfigure(0, weight=1)
+
+        self._log_buffers = {c: [] for c in ("general", "website", "blog", "cafe")}
+        self._log_all_lines: list[tuple[str, str]] = []
+        self._log_active_channels: set[str] = set()
+        self._log_widgets: dict[str, object] = {}
+        self._log_split_visible = False
+
+        self.log_single_frame = self._frame(self.log_body, COLORS["card"])
+        self.log_single_frame.grid(row=0, column=0, sticky="nsew")
+        self._log_widgets["single"] = self._make_log_textbox(self.log_single_frame)
+
+        self.log_split_frame = self._frame(self.log_body, COLORS["card"])
+        self.log_split_frame.grid(row=0, column=0, sticky="nsew")
+        self.log_split_frame.grid_rowconfigure(1, weight=1)
+        self.log_split_frame.grid_columnconfigure(0, weight=1)
+
+        general_wrap = self._frame(self.log_split_frame, COLORS["card"])
+        general_wrap.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        general_wrap.grid_columnconfigure(0, weight=1)
+        ui_label(general_wrap, "공통", "log_bold", COLORS["log_muted"]).grid(row=0, column=0, sticky="w")
+        general_box = self._frame(general_wrap, COLORS["card"])
+        general_box.grid(row=1, column=0, sticky="ew")
         if ctk:
-            self.log_text = ctk.CTkTextbox(
-                card, wrap=tk.WORD, font=FONTS["mono"],
-                fg_color=COLORS["preview_bg"], text_color=COLORS["text"],
-                border_color=COLORS["border"], border_width=1,
-                corner_radius=10, state=tk.DISABLED,
+            self._log_widgets["general"] = ctk.CTkTextbox(
+                general_box, wrap=tk.WORD, font=FONTS["log"], height=140,
+                fg_color=COLORS["log_bg"], text_color=COLORS["log_fg"],
+                border_color=COLORS["log_border"], border_width=2, corner_radius=8,
+                state=tk.DISABLED, activate_scrollbars=True,
             )
+            self._log_widgets["general"].pack(fill=tk.X)
         else:
-            self.log_text = tk.Text(
-                card, wrap=tk.WORD, font=FONTS["mono"],
-                bg=COLORS["preview_bg"], fg=COLORS["text"],
-                insertbackground=COLORS["text"], state=tk.DISABLED,
+            self._log_widgets["general"] = tk.Text(
+                general_box, wrap=tk.WORD, font=FONTS["log"], height=6,
+                bg=COLORS["log_bg"], fg=COLORS["log_fg"],
+                relief=tk.SOLID, bd=2, state=tk.DISABLED,
             )
-        self.log_text.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+            self._log_widgets["general"].pack(fill=tk.X)
+
+        self.log_split_channels = self._frame(self.log_split_frame, COLORS["card"])
+        self.log_split_channels.grid(row=1, column=0, sticky="nsew")
+        for col in range(3):
+            self.log_split_channels.grid_columnconfigure(col, weight=1)
+            self.log_split_channels.grid_rowconfigure(0, weight=1)
+
+        self._log_channel_cols: dict[str, tk.Frame] = {}
+        for col, (ch, title) in enumerate([
+            ("website", "웹사이트 신고"),
+            ("blog", "블로그 신고"),
+            ("cafe", "카페 신고"),
+        ]):
+            col_frame = self._frame(self.log_split_channels, COLORS["card"])
+            col_frame.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 6, 0))
+            ui_label(col_frame, title, "log_bold", COLORS["accent"]).pack(anchor="w", pady=(0, 6))
+            self._log_widgets[ch] = self._make_log_textbox(col_frame)
+            self._log_channel_cols[ch] = col_frame
+
+        self.log_split_frame.grid_remove()
+
+    def _register_log_channel(self, channel: str):
+        if channel not in self._log_buffers:
+            return
+        self._log_active_channels.add(channel)
+        self._refresh_log_layout()
+        if len(self._log_active_channels) >= 2 and hasattr(self, "tabs"):
+            self.tabs.select("실행 로그")
+
+    def _unregister_log_channel(self, channel: str):
+        self._log_active_channels.discard(channel)
+        self._refresh_log_layout()
+
+    def _refresh_log_layout(self):
+        if not hasattr(self, "log_single_frame"):
+            return
+        use_split = len(self._log_active_channels) >= 2
+        self._log_split_visible = use_split
+
+        if use_split:
+            self.log_single_frame.grid_remove()
+            self.log_split_frame.grid()
+            active = [c for c in ("website", "blog", "cafe") if c in self._log_active_channels]
+            labels = " · ".join(self._LOG_CHANNEL_LABELS.get(c, c) for c in active)
+            self.log_layout_hint.configure(text=f"분할 표시 — {labels}")
+            col_map = {ch: i for i, ch in enumerate(active)}
+            for ch, col_frame in self._log_channel_cols.items():
+                if ch in col_map:
+                    col_frame.grid(
+                        row=0,
+                        column=col_map[ch],
+                        sticky="nsew",
+                        padx=(0 if col_map[ch] == 0 else 6, 0),
+                    )
+                    self._rebuild_channel_log(ch)
+                else:
+                    col_frame.grid_remove()
+            for col in range(len(active), 3):
+                self.log_split_channels.grid_columnconfigure(col, weight=0)
+            for col in range(len(active)):
+                self.log_split_channels.grid_columnconfigure(col, weight=1)
+            self._rebuild_channel_log("general")
+        else:
+            self.log_split_frame.grid_remove()
+            self.log_single_frame.grid()
+            if self._log_active_channels:
+                only = next(iter(self._log_active_channels))
+                self.log_layout_hint.configure(
+                    text=f"{self._LOG_CHANNEL_LABELS.get(only, only)} 진행 중"
+                )
+            else:
+                self.log_layout_hint.configure(text="")
+            self._rebuild_channel_log("single")
+
+    def _rebuild_channel_log(self, channel: str):
+        widget = self._log_widgets.get(channel)
+        if widget is None:
+            return
+        if channel == "single":
+            lines = []
+            for ch, msg in self._log_all_lines:
+                if ch == "general" or len(self._log_active_channels) <= 1:
+                    lines.append(msg)
+                else:
+                    tag = self._LOG_CHANNEL_LABELS.get(ch, ch)
+                    lines.append(f"[{tag}] {msg}")
+            self._set_log_widget_text(widget, "\n".join(lines))
+            return
+        if channel == "general":
+            self._set_log_widget_text(widget, "\n".join(self._log_buffers["general"]))
+            return
+        self._set_log_widget_text(widget, "\n".join(self._log_buffers.get(channel, [])))
+
+    def _append_log_ui(self, message: str, channel: str):
+        if self._log_split_visible:
+            if channel == "general":
+                self._append_log_widget(self._log_widgets["general"], message)
+            elif channel in self._log_active_channels:
+                self._append_log_widget(self._log_widgets[channel], message)
+            return
+        if channel == "general" or channel in self._log_active_channels or not self._log_active_channels:
+            self._append_log_widget(self._log_widgets["single"], message)
+        else:
+            tag = self._LOG_CHANNEL_LABELS.get(channel, channel)
+            self._append_log_widget(self._log_widgets["single"], f"[{tag}] {message}")
 
     # ===================== Logic =====================
     def text_of(self, widget):
@@ -2278,36 +2491,49 @@ class ReportApp:
         if not selected:
             messagebox.showinfo("선택 필요", "삭제할 URL을 선택해주세요.")
             return
+        urls_to_remove = set()
         for item in selected:
             vals = self.blog_url_tree.item(item, "values")
             if vals:
-                url = vals[0]
-                self.blog_urls = [
-                    e for e in self.blog_urls
-                    if self._normalize_blog_url(self._blog_entry_url(e)) != self._normalize_blog_url(url)
-                ]
+                urls_to_remove.add(self._normalize_blog_url(vals[0]))
+        if not urls_to_remove:
+            return
+        before = len(self.blog_urls)
+        self.blog_urls = [
+            e for e in self.blog_urls
+            if self._normalize_blog_url(self._blog_entry_url(e)) not in urls_to_remove
+        ]
+        removed = before - len(self.blog_urls)
         self.save_blog_urls()
         self.refresh_blog_url_list()
+        if removed == 1:
+            self.log("블로그 URL 삭제 완료")
+        else:
+            self.log(f"블로그 URL {removed}개 삭제 완료")
 
     def delete_selected_blog_result(self):
         selected = self.blog_result_tree.selection()
         if not selected:
             return
-        tags = self.blog_result_tree.item(selected[0])["tags"]
-        if len(tags) < 3:
+        remove_keys: set[tuple[str, str, str]] = set()
+        for item in selected:
+            tags = self.blog_result_tree.item(item)["tags"]
+            if len(tags) >= 3:
+                remove_keys.add((tags[0], tags[1], tags[2]))
+        if not remove_keys:
             return
-        account, url, dt = tags[0], tags[1], tags[2]
+        before = len(self.blog_results)
         self.blog_results = [
             r for r in self.blog_results
-            if not (
-                r.get("account_id") == account
-                and r.get("url") == url
-                and r.get("datetime") == dt
-            )
+            if (r.get("account_id"), r.get("url"), r.get("datetime")) not in remove_keys
         ]
+        removed = before - len(self.blog_results)
         self.save_blog_results()
         self.refresh_blog_results_tree()
-        self.log(f"블로그 신고 결과 삭제: {self._truncate(url, 60)}")
+        if removed == 1:
+            self.log(f"블로그 신고 결과 삭제: {self._truncate(next(iter(remove_keys))[1], 60)}")
+        else:
+            self.log(f"블로그 신고 결과 {removed}개 삭제 완료")
 
     def _find_blog_result_row(self, account_id: str, url: str, dt: str) -> dict | None:
         norm = self._normalize_blog_url(url)
@@ -3032,11 +3258,17 @@ class ReportApp:
             self.api_key_entry.configure(show="*")
             self.show_api_btn.configure(text="표시")
 
-    def log(self, message):
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, f"{message}\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
+    def log(self, message, channel: str = "general"):
+        ch = channel if channel in self._log_buffers else "general"
+        self._log_buffers[ch].append(message)
+        self._log_all_lines.append((ch, message))
+        if hasattr(self, "_log_widgets"):
+            self._append_log_ui(message, ch)
+        elif hasattr(self, "log_text"):
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.insert(tk.END, f"{message}\n")
+            self.log_text.see(tk.END)
+            self.log_text.configure(state=tk.DISABLED)
 
     def parse_sites(self, text):
         sites = []
@@ -3249,80 +3481,63 @@ class ReportApp:
                 return acc.get("password", "")
         return ""
 
-    def _disable_buttons(self, for_report: bool = False, for_cafe: bool = False, for_blog: bool = False):
+    def _sync_report_buttons(self):
+        """각 신고 탭은 독립 실행 — 해당 탭만 시작/정지 버튼 상태 갱신."""
         try:
-            self.preview_btn.configure(state=tk.DISABLED)
+            self.preview_btn.configure(state=tk.DISABLED if self._preview_running else tk.NORMAL)
         except Exception:
             pass
-        try:
-            self.report_btn.configure(state=tk.DISABLED)
-        except Exception:
-            pass
-        try:
-            self.cafe_report_btn.configure(state=tk.DISABLED)
-        except Exception:
-            pass
-        try:
-            self.blog_report_btn.configure(state=tk.DISABLED)
-        except Exception:
-            pass
-        if for_report or for_cafe or for_blog:
-            try:
-                self.stop_report_btn.configure(state=tk.NORMAL)
-            except Exception:
-                pass
-            try:
-                self.cafe_stop_btn.configure(state=tk.NORMAL)
-            except Exception:
-                pass
-            try:
-                self.blog_stop_btn.configure(state=tk.NORMAL)
-            except Exception:
-                pass
+        for start_btn, stop_btn, running in (
+            (getattr(self, "report_btn", None), getattr(self, "stop_report_btn", None), self._report_running),
+            (getattr(self, "cafe_report_btn", None), getattr(self, "cafe_stop_btn", None), self._cafe_running),
+            (getattr(self, "blog_report_btn", None), getattr(self, "blog_stop_btn", None), self._blog_running),
+        ):
+            if start_btn is not None:
+                try:
+                    start_btn.configure(state=tk.DISABLED if running else tk.NORMAL)
+                except Exception:
+                    pass
+            if stop_btn is not None:
+                try:
+                    stop_btn.configure(state=tk.NORMAL if running else tk.DISABLED)
+                except Exception:
+                    pass
 
-    def _enable_buttons(self):
-        try:
-            self.preview_btn.configure(state=tk.NORMAL)
-        except Exception:
-            pass
-        try:
-            self.report_btn.configure(state=tk.NORMAL)
-        except Exception:
-            pass
-        try:
-            self.cafe_report_btn.configure(state=tk.NORMAL)
-        except Exception:
-            pass
-        try:
-            self.blog_report_btn.configure(state=tk.NORMAL)
-        except Exception:
-            pass
-        try:
-            self.stop_report_btn.configure(state=tk.DISABLED)
-        except Exception:
-            pass
-        try:
-            self.cafe_stop_btn.configure(state=tk.DISABLED)
-        except Exception:
-            pass
-        try:
-            self.blog_stop_btn.configure(state=tk.DISABLED)
-        except Exception:
-            pass
-
-    def stop_report(self):
-        if not self._report_running and not self._cafe_running and not self._blog_running:
+    def stop_website_report(self):
+        if not self._report_running:
             return
-        self._report_stop_requested = True
-        self.log("[정지] 브라우저를 즉시 종료합니다...")
+        self._website_stop_requested = True
+        self.log("[웹사이트 신고 정지] 브라우저를 즉시 종료합니다...")
         try:
             self.stop_report_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        if self._website_reporter:
+            self._website_reporter.request_cancel()
+
+    def stop_cafe_report(self):
+        if not self._cafe_running:
+            return
+        self._cafe_stop_requested = True
+        self.log("[카페 신고 정지] 브라우저를 즉시 종료합니다...")
+        try:
             self.cafe_stop_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        if self._cafe_reporter:
+            self._cafe_reporter.request_cancel()
+
+    def stop_blog_report(self):
+        if not self._blog_running:
+            return
+        self._blog_stop_requested = True
+        self.log("[블로그 신고 정지] 브라우저를 즉시 종료합니다...")
+        try:
             self.blog_stop_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
-        if self._active_reporter:
-            self._active_reporter.request_cancel()
+        if self._blog_reporter:
+            self._blog_reporter.request_cancel()
 
     def preview_all(self):
         api_key = self.api_key_var.get().strip()
@@ -3335,24 +3550,31 @@ class ReportApp:
             return
 
         self.log("[미리보기] 리라이트 생성 중...")
-        self._disable_buttons()
+        self._preview_running = True
+        self._sync_report_buttons()
 
         def run():
-            for task in self.tasks:
-                results = self.generate_variants(
-                    task["site"], task["report_type"], [task["template"]],
-                    api_key, self.model_var.get(),
-                )
-                for url, data in results.items():
-                    data["search_url"] = task.get("search_url", url)
-                    data["search_url_custom"] = task.get("search_url_custom", False)
-                    data["search_url_auto"] = task.get("search_url_auto", False)
-                    self._add_result(url, task["report_type"], data)
-            self.root.after(0, self._enable_buttons)
-            self.root.after(0, lambda: self.log("[미리보기] 완료"))
-            self.root.after(0, self.save_results)
-            self.root.after(0, lambda: self.tabs.select("리라이트 결과"))
-            self.root.after(0, self.refresh_results_tree)
+            try:
+                for task in self.tasks:
+                    results = self.generate_variants(
+                        task["site"], task["report_type"], [task["template"]],
+                        api_key, self.model_var.get(),
+                    )
+                    for url, data in results.items():
+                        data["search_url"] = task.get("search_url", url)
+                        data["search_url_custom"] = task.get("search_url_custom", False)
+                        data["search_url_auto"] = task.get("search_url_auto", False)
+                        self._add_result(url, task["report_type"], data)
+            finally:
+                def done():
+                    self._preview_running = False
+                    self._sync_report_buttons()
+                    self.log("[미리보기] 완료")
+                    self.save_results()
+                    self.tabs.select("리라이트 결과")
+                    self.refresh_results_tree()
+
+                self.root.after(0, done)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -3366,15 +3588,17 @@ class ReportApp:
             return
 
         total = len(self.accounts)
-        self.log("=" * 55)
+        self.log("=" * 55, channel="cafe")
         self.log(
             f"카페 신고 시작 | 키워드:{len(self.cafe_keywords)}개, 계정:{total}개 "
-            f"(URL 수집 후 계정별 전체 신고)"
+            f"(URL 수집 후 계정별 전체 신고)",
+            channel="cafe",
         )
         self._cafe_running = True
-        self._report_stop_requested = False
-        self._active_reporter = None
-        self._disable_buttons(for_cafe=True)
+        self._cafe_stop_requested = False
+        self._cafe_reporter = None
+        self._register_log_channel("cafe")
+        self._sync_report_buttons()
         self.cafe_progress["value"] = 0
 
         skip_pairs = {
@@ -3385,7 +3609,7 @@ class ReportApp:
         }
 
         def on_log(message):
-            self.root.after(0, lambda: self.log(message))
+            self.root.after(0, lambda m=message: self.log(m, channel="cafe"))
 
         def on_result(item):
             self.cafe_results.append(item)
@@ -3426,7 +3650,7 @@ class ReportApp:
                 result_callback=on_result,
                 progress_callback=on_progress,
             )
-            self._active_reporter = reporter
+            self._cafe_reporter = reporter
             try:
                 reporter.report_cafe_batch(
                     self.accounts,
@@ -3434,32 +3658,33 @@ class ReportApp:
                     skip_pairs,
                     targets_callback=lambda t: self.root.after(0, lambda targets=t: on_targets_ready(targets)),
                 )
-                if reporter.cancel_requested or self._report_stop_requested:
+                if reporter.cancel_requested or self._cafe_stop_requested:
                     stopped = True
             except Exception as e:
                 on_log(f"[카페] 처리 오류: {e}")
             finally:
-                self._active_reporter = None
+                self._cafe_reporter = None
             self.root.after(0, lambda: self.cafe_report_finished(stopped=stopped))
 
         threading.Thread(target=run, daemon=True).start()
 
     def cafe_report_finished(self, stopped: bool = False):
         self._cafe_running = False
-        self._report_stop_requested = False
-        self._active_reporter = None
-        self._enable_buttons()
+        self._cafe_stop_requested = False
+        self._cafe_reporter = None
+        self._unregister_log_channel("cafe")
+        self._sync_report_buttons()
         if not stopped:
             self.cafe_progress.configure(value=100)
-        self.log("=" * 55)
+        self.log("=" * 55, channel="cafe")
         if stopped:
-            self.log("카페 신고 작업이 중단되었습니다.")
+            self.log("카페 신고 작업이 중단되었습니다.", channel="cafe")
         else:
             ok_count = sum(1 for r in self.cafe_results if r.get("success"))
-            self.log(f"카페 신고 완료 — 성공 {ok_count}건")
+            self.log(f"카페 신고 완료 — 성공 {ok_count}건", channel="cafe")
         self.save_cafe_results()
         self.refresh_cafe_results_tree()
-        self.tabs.select("카페신고")
+        self.tabs.select("카페신고" if self.admin_mode else "웹사이트신고")
 
     def start_blog_report(self):
         if not self.accounts:
@@ -3472,14 +3697,16 @@ class ReportApp:
 
         total_accounts = len(self.accounts)
 
-        self.log("=" * 55)
+        self.log("=" * 55, channel="blog")
         self.log(
-            f"블로그 신고 시작 | URL:{len(self.blog_urls)}개, 계정:{total_accounts}개"
+            f"블로그 신고 시작 | URL:{len(self.blog_urls)}개, 계정:{total_accounts}개",
+            channel="blog",
         )
         self._blog_running = True
-        self._report_stop_requested = False
-        self._active_reporter = None
-        self._disable_buttons(for_blog=True)
+        self._blog_stop_requested = False
+        self._blog_reporter = None
+        self._register_log_channel("blog")
+        self._sync_report_buttons()
         self.blog_progress["value"] = 0
 
         skip_pairs = {
@@ -3495,7 +3722,7 @@ class ReportApp:
         }
 
         def on_log(message):
-            self.root.after(0, lambda: self.log(message))
+            self.root.after(0, lambda m=message: self.log(m, channel="blog"))
 
         def on_result(item):
             aid = item.get("account_id", "")
@@ -3558,7 +3785,7 @@ class ReportApp:
                 result_callback=on_result,
                 progress_callback=on_progress,
             )
-            self._active_reporter = reporter
+            self._blog_reporter = reporter
             try:
                 on_log(
                     f"진행 예정: 계정 {len(self.accounts)}개 × URL {len(self.blog_urls)}개 "
@@ -3570,29 +3797,30 @@ class ReportApp:
                     skip_pairs,
                     known_titles,
                 )
-                if reporter.cancel_requested or self._report_stop_requested:
+                if reporter.cancel_requested or self._blog_stop_requested:
                     stopped = True
             except Exception as e:
                 on_log(f"[블로그] 처리 오류: {e}")
             finally:
-                self._active_reporter = None
+                self._blog_reporter = None
             self.root.after(0, lambda: self.blog_report_finished(stopped=stopped))
 
         threading.Thread(target=run, daemon=True).start()
 
     def blog_report_finished(self, stopped: bool = False):
         self._blog_running = False
-        self._report_stop_requested = False
-        self._active_reporter = None
-        self._enable_buttons()
+        self._blog_stop_requested = False
+        self._blog_reporter = None
+        self._unregister_log_channel("blog")
+        self._sync_report_buttons()
         if not stopped:
             self.blog_progress.configure(value=100)
-        self.log("=" * 55)
+        self.log("=" * 55, channel="blog")
         if stopped:
-            self.log("블로그 신고 작업이 중단되었습니다.")
+            self.log("블로그 신고 작업이 중단되었습니다.", channel="blog")
         else:
             ok_count = sum(1 for r in self.blog_results if r.get("success"))
-            self.log(f"블로그 신고 완료 — 성공 {ok_count}건")
+            self.log(f"블로그 신고 완료 — 성공 {ok_count}건", channel="blog")
         self.save_blog_results()
         self.refresh_blog_results_tree()
         self.tabs.select("블로그신고")
@@ -3616,16 +3844,17 @@ class ReportApp:
             return
 
         total = len(self.accounts) * len(self.tasks)
-        self.log("=" * 55)
-        self.log(f"신고 시작 | 항목:{len(self.tasks)}개, 계정:{len(self.accounts)}개, 총:{total}개")
+        self.log("=" * 55, channel="website")
+        self.log(f"신고 시작 | 항목:{len(self.tasks)}개, 계정:{len(self.accounts)}개, 총:{total}개", channel="website")
         self._report_running = True
-        self._report_stop_requested = False
-        self._active_reporter = None
-        self._disable_buttons(for_report=True)
+        self._website_stop_requested = False
+        self._website_reporter = None
+        self._register_log_channel("website")
+        self._sync_report_buttons()
         self.progress["value"] = 0
 
         def on_log(message):
-            self.root.after(0, lambda: self.log(message))
+            self.root.after(0, lambda m=message: self.log(m, channel="website"))
 
         def on_result(item):
             status = item.get("status", "")
@@ -3655,7 +3884,7 @@ class ReportApp:
         def run():
             stopped = False
             for account in self.accounts:
-                if self._report_stop_requested:
+                if self._website_stop_requested:
                     stopped = True
                     break
                 account_id = account["id"]
@@ -3668,17 +3897,17 @@ class ReportApp:
                     result_callback=on_result,
                     progress_callback=on_progress,
                 )
-                self._active_reporter = reporter
+                self._website_reporter = reporter
                 try:
                     reporter.report(account_id, account["password"], self.tasks)
-                    if reporter.cancel_requested or self._report_stop_requested:
+                    if reporter.cancel_requested or self._website_stop_requested:
                         stopped = True
                 except Exception as e:
                     on_log(f"[{account_id}] 처리 오류: {e}")
                 finally:
-                    self._active_reporter = None
+                    self._website_reporter = None
                 on_log(f"[계정 완료] {account_id}")
-                if self._report_stop_requested:
+                if self._website_stop_requested:
                     stopped = True
                     break
             self.root.after(0, lambda: self.report_finished(stopped=stopped))
@@ -3692,28 +3921,32 @@ class ReportApp:
 
     def report_finished(self, stopped: bool = False):
         self._report_running = False
-        self._report_stop_requested = False
-        self._active_reporter = None
-        self._enable_buttons()
+        self._website_stop_requested = False
+        self._website_reporter = None
+        self._unregister_log_channel("website")
+        self._sync_report_buttons()
         if not stopped:
             self.progress.configure(value=100)
-        self.log("=" * 55)
+        self.log("=" * 55, channel="website")
         if stopped:
-            self.log("신고 작업이 중단되었습니다.")
+            self.log("신고 작업이 중단되었습니다.", channel="website")
         else:
-            self.log("신고 내용 생성 완료")
+            self.log("신고 내용 생성 완료", channel="website")
         stats = self.compute_site_report_stats()
         protected_accounts = set()
         for info in stats.values():
             protected_accounts.update(info["protected_accounts"])
         if protected_accounts:
-            self.log(f"보호조치 제외 계정 (신고 횟수 미포함): {', '.join(sorted(protected_accounts))}")
+            self.log(
+                f"보호조치 제외 계정 (신고 횟수 미포함): {', '.join(sorted(protected_accounts))}",
+                channel="website",
+            )
         for site, info in sorted(stats.items(), key=lambda x: -x[1]["valid"]):
             if info["valid"] or info["protected"]:
                 msg = f"[집계] {self._truncate(site, 60)} — 신고 {info['valid']}회"
                 if info["protected"]:
                     msg += f", 보호조치 {info['protected']}건 제외"
-                self.log(msg)
+                self.log(msg, channel="website")
         self.save_results()
         self.refresh_results_tree()
         self.tabs.select("리라이트 결과")
