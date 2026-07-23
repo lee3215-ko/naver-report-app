@@ -23,7 +23,7 @@ from ui_theme import (
     label as ui_label,
     button as ui_button,
 )
-from ui_layout import apply_main_window, fit_toplevel, make_scrollable, scaled_px, screen_size
+from ui_layout import apply_main_window, fit_toplevel, make_scrollable, scaled_px, screen_size, setup_toplevel
 
 try:
     import customtkinter as ctk
@@ -90,7 +90,8 @@ DEFAULT_TEMPLATES = [
 class DetailWindow:
     def __init__(self, parent, site, report_type, original, rewritten,
                  account_id="", account_password="",
-                 search_url="", search_url_custom=False, search_url_auto=False):
+                 search_url="", search_url_custom=False, search_url_auto=False,
+                 app=None):
         self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
         self.top.title("신고 내용 상세")
         if ctk:
@@ -176,7 +177,11 @@ class DetailWindow:
 
         self.site = site
         self.report_type = report_type
-        fit_toplevel(self.top, 860, 720, 640, 520, parent=parent)
+        if app:
+            app.setup_dialog(self.top, "detail", 860, 720, 640, 520)
+        else:
+            fit_toplevel(self.top, 860, 720, 640, 520, parent=parent)
+            self.top.resizable(True, True)
 
     def _url_textbox(self, parent):
         if ctk:
@@ -315,7 +320,7 @@ class BlogResultDetailWindow:
 
     COPYABLE_FIELDS = {"네이버 계정", "비밀번호", "게시물 URL"}
 
-    def __init__(self, parent, row: dict, report_count: int = 0):
+    def __init__(self, parent, row: dict, report_count: int = 0, app=None):
         self.row = row
         self.report_count = report_count
         self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
@@ -393,7 +398,11 @@ class BlogResultDetailWindow:
         btn_row = ui_frame(outer, COLORS["bg"])
         btn_row.grid(row=1, column=0, sticky="e", pady=(12, 0))
         ui_button(btn_row, "닫기", "ghost", height=38, command=self.top.destroy).pack(side=tk.RIGHT)
-        fit_toplevel(self.top, 660, 580, 520, 420, parent=parent)
+        if app:
+            app.setup_dialog(self.top, "blog_detail", 660, 580, 520, 420)
+        else:
+            fit_toplevel(self.top, 660, 580, 520, 420, parent=parent)
+            self.top.resizable(True, True)
 
     def _add_url_field(self, parent, url: str, report_count: int):
         label_text = f"게시물 URL · 총 신고 {report_count}회"
@@ -678,7 +687,7 @@ class RegisterWindow:
         if self.edit_mode:
             self._load_task(app.tasks[task_index])
         self._update_url_preview()
-        fit_toplevel(self.top, 680, 860, 560, 480, parent=parent)
+        self.app.setup_dialog(self.top, "register", 680, 860, 560, 480)
 
     def _set_textbox(self, widget, text: str):
         if ctk and isinstance(widget, ctk.CTkTextbox):
@@ -1049,8 +1058,21 @@ class RegisterWindow:
 class ReportApp:
     def __init__(self, root):
         self.root = root
+        self.window_geometry = {}
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    _boot = json.load(f)
+                self.window_geometry = _boot.get("window_geometry", {}) or {}
+            except Exception:
+                pass
+
         self.root.title(f"Naver Report · v{APP_VERSION}")
-        apply_main_window(self.root)
+        apply_main_window(
+            self.root,
+            geometry_store=self.window_geometry,
+            save_callback=self.save_window_geometry,
+        )
         if ctk:
             ctk.set_appearance_mode("light")
             ctk.set_default_color_theme("blue")
@@ -1155,19 +1177,55 @@ class ReportApp:
         if name == "카페수집리스트":
             self.refresh_cafe_collected_tree()
 
+    def setup_dialog(self, window, key: str, preferred_w: int, preferred_h: int, min_w: int, min_h: int):
+        setup_toplevel(
+            window,
+            key,
+            preferred_w,
+            preferred_h,
+            min_w,
+            min_h,
+            parent=self.root,
+            geometry_store=self.window_geometry,
+            save_callback=self.save_window_geometry,
+        )
+        window.resizable(True, True)
+
+    def save_window_geometry(self):
+        if not hasattr(self, "api_key_var"):
+            data = {}
+            if os.path.exists(SETTINGS_FILE):
+                try:
+                    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            data["window_geometry"] = self.window_geometry
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            return
+        self.save_settings()
+
     def _frame(self, parent, bg=None):
         return ui_frame(parent, bg or COLORS["bg"])
 
-    def _center_toplevel(self, window, width: int, height: int, min_w: int | None = None, min_h: int | None = None):
-        fit_toplevel(
+    def _center_toplevel(
+        self,
+        window,
+        width: int,
+        height: int,
+        key: str,
+        min_w: int | None = None,
+        min_h: int | None = None,
+    ):
+        self.setup_dialog(
             window,
+            key,
             width,
             height,
             min_w or max(360, width - 120),
             min_h or max(280, height - 120),
-            parent=self.root,
         )
-        window.resizable(True, True)
 
     def _card(self, parent):
         return ui_card(parent)
@@ -2146,6 +2204,9 @@ class ReportApp:
                 self.model_var.set(data.get("model", "gpt-4o"))
                 if hasattr(self, "hagrid_mode_var"):
                     self.hagrid_mode_var.set(data.get("hagrid_mode", False))
+                saved_geom = data.get("window_geometry")
+                if isinstance(saved_geom, dict):
+                    self.window_geometry = saved_geom
             except Exception:
                 pass
 
@@ -2154,6 +2215,7 @@ class ReportApp:
             "api_key": self.api_key_var.get().strip(),
             "model": self.model_var.get(),
             "hagrid_mode": bool(self.hagrid_mode_var.get()) if hasattr(self, "hagrid_mode_var") else False,
+            "window_geometry": getattr(self, "window_geometry", {}),
         }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2488,7 +2550,7 @@ class ReportApp:
         ui_button(btn_row, "취소", "secondary", height=38, command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
         entry.bind("<Return>", lambda e: ok())
         dialog.bind("<Escape>", lambda e: dialog.destroy())
-        fit_toplevel(dialog, 560, 520, 480, 380, parent=self.root)
+        self.setup_dialog(dialog, "blog_url_add", 560, 520, 480, 380)
 
     def delete_blog_url(self):
         selected = self.blog_url_tree.selection()
@@ -2570,7 +2632,7 @@ class ReportApp:
         if not row:
             return
         report_count = self._blog_url_report_count(row.get("url", ""))
-        BlogResultDetailWindow(self.root, row, report_count=report_count)
+        BlogResultDetailWindow(self.root, row, report_count=report_count, app=self)
 
     def _cafe_article_key(self, url: str) -> str:
         m = re.search(r"/([A-Za-z0-9_-]+)/(\d+)", url or "", re.IGNORECASE)
@@ -2765,7 +2827,7 @@ class ReportApp:
 
         entry.bind("<Return>", lambda e: ok())
         dialog.bind("<Escape>", lambda e: dialog.destroy())
-        fit_toplevel(dialog, 440, 200, 380, 180, parent=self.root)
+        self.setup_dialog(dialog, "cafe_keyword_add", 440, 200, 380, 180)
 
     def delete_selected_cafe_result(self):
         selected = self.cafe_result_tree.selection()
@@ -3457,6 +3519,7 @@ class ReportApp:
             search_url=result_meta.get("search_url", ""),
             search_url_custom=result_meta.get("search_url_custom", False),
             search_url_auto=result_meta.get("search_url_auto", False),
+            app=self,
         )
 
     def get_result_meta(self, dt, account_id, site, report_type):
