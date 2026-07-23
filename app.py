@@ -23,6 +23,7 @@ from ui_theme import (
     label as ui_label,
     button as ui_button,
 )
+from ui_layout import apply_main_window, fit_toplevel, make_scrollable, scaled_px, screen_size
 
 try:
     import customtkinter as ctk
@@ -92,13 +93,13 @@ class DetailWindow:
                  search_url="", search_url_custom=False, search_url_auto=False):
         self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
         self.top.title("신고 내용 상세")
-        self.top.geometry("860x720")
         if ctk:
             self.top.configure(fg_color=COLORS["bg"])
         else:
             self.top.configure(bg=COLORS["bg"])
         self.top.transient(parent)
         self.top.grab_set()
+        self.top.resizable(True, True)
 
         outer = ui_frame(self.top, COLORS["bg"])
         outer.pack(fill=tk.BOTH, expand=True, padx=24, pady=24)
@@ -175,6 +176,7 @@ class DetailWindow:
 
         self.site = site
         self.report_type = report_type
+        fit_toplevel(self.top, 860, 720, 640, 520, parent=parent)
 
     def _url_textbox(self, parent):
         if ctk:
@@ -318,13 +320,12 @@ class BlogResultDetailWindow:
         self.report_count = report_count
         self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
         self.top.title("블로그 신고 상세")
-        self.top.geometry("660x580")
-        self.top.minsize(520, 420)
         if ctk:
             self.top.configure(fg_color=COLORS["bg"])
         else:
             self.top.configure(bg=COLORS["bg"])
         self.top.transient(parent)
+        self.top.resizable(True, True)
 
         outer = ui_frame(self.top, COLORS["bg"])
         outer.pack(fill=tk.BOTH, expand=True, padx=24, pady=24)
@@ -392,6 +393,7 @@ class BlogResultDetailWindow:
         btn_row = ui_frame(outer, COLORS["bg"])
         btn_row.grid(row=1, column=0, sticky="e", pady=(12, 0))
         ui_button(btn_row, "닫기", "ghost", height=38, command=self.top.destroy).pack(side=tk.RIGHT)
+        fit_toplevel(self.top, 660, 580, 520, 420, parent=parent)
 
     def _add_url_field(self, parent, url: str, report_count: int):
         label_text = f"게시물 URL · 총 신고 {report_count}회"
@@ -462,12 +464,17 @@ class RegisterWindow:
             self.top.configure(bg=COLORS["bg"])
         self.top.transient(parent)
         self.top.grab_set()
-        self.top.resizable(False, False)
+        self.top.resizable(True, True)
         self.app = app
-        self.center_window(parent)
+
+        _, screen_h = screen_size(parent)
+        site_h = scaled_px(140, screen_h)
+        search_h = scaled_px(100, screen_h)
+        preview_h = scaled_px(110, screen_h)
 
         main = ui_frame(self.top, COLORS["bg"])
-        main.pack(fill=tk.BOTH, expand=True, padx=28, pady=28)
+        main.pack(fill=tk.BOTH, expand=True)
+        main.grid_rowconfigure(1, weight=1)
         main.grid_columnconfigure(0, weight=1)
 
         ui_label(
@@ -475,10 +482,13 @@ class RegisterWindow:
             "신고 항목 수정" if self.edit_mode else "신고 항목 등록",
             "title",
             COLORS["text"],
-        ).grid(row=0, column=0, sticky="w", pady=(0, 20))
+        ).grid(row=0, column=0, sticky="w", padx=28, pady=(20, 12))
 
-        card = ui_card(main)
-        card.grid(row=1, column=0, sticky="ew")
+        scroll_host, scroll_body = make_scrollable(main)
+        scroll_host.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 8))
+
+        card = ui_card(scroll_body)
+        card.pack(fill=tk.X, expand=True)
         card_inner = ui_frame(card, COLORS["card"])
         card_inner.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
         card_inner.grid_columnconfigure(0, weight=1)
@@ -552,7 +562,7 @@ class RegisterWindow:
         if ctk:
             self.site_text = ctk.CTkTextbox(
                 url_box, wrap="char", font=FONTS["mono"],
-                height=140, fg_color=COLORS["input_bg"], text_color=COLORS["text"],
+                height=site_h, fg_color=COLORS["input_bg"], text_color=COLORS["text"],
                 border_color=COLORS["input_border"], border_width=1, corner_radius=10,
                 activate_scrollbars=True,
             )
@@ -609,7 +619,7 @@ class RegisterWindow:
         if ctk:
             self.search_url_text = ctk.CTkTextbox(
                 search_box, wrap="char", font=FONTS["mono"],
-                height=100, fg_color=COLORS["input_bg"], text_color=COLORS["text"],
+                height=search_h, fg_color=COLORS["input_bg"], text_color=COLORS["text"],
                 border_color=COLORS["input_border"], border_width=1, corner_radius=10,
                 activate_scrollbars=True,
             )
@@ -630,7 +640,7 @@ class RegisterWindow:
 
         if ctk:
             self.url_preview = ctk.CTkTextbox(
-                card_inner, wrap="char", font=FONTS["mono"], height=110,
+                card_inner, wrap="char", font=FONTS["mono"], height=preview_h,
                 fg_color=COLORS["accent_light"], text_color=COLORS["text"],
                 border_color=COLORS["card_border"], border_width=1, corner_radius=10,
                 activate_scrollbars=True, state="disabled",
@@ -656,7 +666,7 @@ class RegisterWindow:
         self._build_template_buttons()
 
         btn_frame = ui_frame(main, COLORS["bg"])
-        btn_frame.grid(row=2, column=0, sticky="e", pady=(20, 0))
+        btn_frame.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 20))
         ui_button(btn_frame, "취소", "ghost", width=110, command=self.top.destroy).pack(side=tk.RIGHT, padx=(10, 0))
         save_label = "저장" if self.edit_mode else "등록"
         ui_button(btn_frame, save_label, "primary", width=110, command=self.register).pack(side=tk.RIGHT)
@@ -668,6 +678,7 @@ class RegisterWindow:
         if self.edit_mode:
             self._load_task(app.tasks[task_index])
         self._update_url_preview()
+        fit_toplevel(self.top, 680, 860, 560, 480, parent=parent)
 
     def _set_textbox(self, widget, text: str):
         if ctk and isinstance(widget, ctk.CTkTextbox):
@@ -983,17 +994,6 @@ class RegisterWindow:
                 lines.append(f"       검색: {self._short_url(effective)} (사이트와 동일)")
         self._set_preview_text("\n".join(lines))
 
-    def center_window(self, parent):
-        self.top.update_idletasks()
-        width, height = 640, 1020
-        parent_x = parent.winfo_x()
-        parent_y = parent.winfo_y()
-        parent_w = parent.winfo_width()
-        parent_h = parent.winfo_height()
-        x = parent_x + (parent_w - width) // 2
-        y = parent_y + (parent_h - height) // 2
-        self.top.geometry(f"{width}x{height}+{x}+{y}")
-
     def _site_text_content(self):
         if ctk and isinstance(self.site_text, ctk.CTkTextbox):
             return self.site_text.get("1.0", tk.END).strip()
@@ -1050,8 +1050,7 @@ class ReportApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"Naver Report · v{APP_VERSION}")
-        self.root.geometry("1520x960")
-        self.root.minsize(1280, 800)
+        apply_main_window(self.root)
         if ctk:
             ctk.set_appearance_mode("light")
             ctk.set_default_color_theme("blue")
@@ -1159,15 +1158,16 @@ class ReportApp:
     def _frame(self, parent, bg=None):
         return ui_frame(parent, bg or COLORS["bg"])
 
-    def _center_toplevel(self, window, width: int, height: int):
-        window.update_idletasks()
-        rx = self.root.winfo_rootx()
-        ry = self.root.winfo_rooty()
-        rw = max(self.root.winfo_width(), 1)
-        rh = max(self.root.winfo_height(), 1)
-        x = rx + (rw - width) // 2
-        y = ry + (rh - height) // 2
-        window.geometry(f"{width}x{height}+{x}+{y}")
+    def _center_toplevel(self, window, width: int, height: int, min_w: int | None = None, min_h: int | None = None):
+        fit_toplevel(
+            window,
+            width,
+            height,
+            min_w or max(360, width - 120),
+            min_h or max(280, height - 120),
+            parent=self.root,
+        )
+        window.resizable(True, True)
 
     def _card(self, parent):
         return ui_card(parent)
@@ -2393,32 +2393,35 @@ class ReportApp:
         dialog.title("블로그 URL 추가")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.resizable(False, False)
         if ctk:
             dialog.configure(fg_color=COLORS["bg"])
         else:
             dialog.configure(bg=COLORS["bg"])
 
-        width, height = 560, 520
-        self._center_toplevel(dialog, width, height)
-
         container = self._frame(dialog, COLORS["bg"])
-        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        container.pack(fill=tk.BOTH, expand=True)
+        container.grid_rowconfigure(1, weight=1)
+        container.grid_columnconfigure(0, weight=1)
 
-        ui_label(container, "블로그 게시물 URL", "body_bold", COLORS["text"]).pack(anchor="w")
+        header = self._frame(container, COLORS["bg"])
+        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 0))
+        ui_label(header, "블로그 게시물 URL", "body_bold", COLORS["text"]).pack(anchor="w")
         url_var = tk.StringVar()
         if ctk:
             entry = ctk.CTkEntry(
-                container, textvariable=url_var, height=38,
+                header, textvariable=url_var, height=38,
                 fg_color=COLORS["input_bg"], text_color=COLORS["text"],
                 border_color=COLORS["input_border"],
             )
         else:
-            entry = tk.Entry(container, textvariable=url_var, font=FONTS["body"])
-        entry.pack(fill=tk.X, pady=(8, 16))
+            entry = tk.Entry(header, textvariable=url_var, font=FONTS["body"])
+        entry.pack(fill=tk.X, pady=(8, 0))
         entry.focus_set()
 
-        ui_label(container, "사유선택", "body_bold", COLORS["text"]).pack(anchor="w", pady=(0, 8))
+        scroll_host, scroll_body = make_scrollable(container)
+        scroll_host.grid(row=1, column=0, sticky="nsew", padx=20, pady=(12, 8))
+
+        ui_label(scroll_body, "사유선택", "body_bold", COLORS["text"]).pack(anchor="w", pady=(0, 8))
 
         if ctk:
             reason_box = ctk.CTkFrame(
@@ -2431,7 +2434,7 @@ class ReportApp:
                 highlightbackground=COLORS["card_border"],
                 highlightthickness=1,
             )
-        reason_box.pack(fill=tk.BOTH, expand=True, pady=(0, 16))
+        reason_box.pack(fill=tk.X, expand=True)
 
         reason_var = tk.StringVar(value="3")
         for rid, label in BLOG_REPORT_REASONS.items():
@@ -2454,7 +2457,7 @@ class ReportApp:
             rb.pack(anchor="w", fill=tk.X)
 
         btn_row = self._frame(container, COLORS["bg"])
-        btn_row.pack(fill=tk.X)
+        btn_row.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 20))
 
         def ok():
             raw = url_var.get().strip()
@@ -2485,6 +2488,7 @@ class ReportApp:
         ui_button(btn_row, "취소", "secondary", height=38, command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
         entry.bind("<Return>", lambda e: ok())
         dialog.bind("<Escape>", lambda e: dialog.destroy())
+        fit_toplevel(dialog, 560, 520, 480, 380, parent=self.root)
 
     def delete_blog_url(self):
         selected = self.blog_url_tree.selection()
@@ -2719,14 +2723,10 @@ class ReportApp:
         dialog.title("검색 키워드 추가")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.resizable(False, False)
         if ctk:
             dialog.configure(fg_color=COLORS["bg"])
         else:
             dialog.configure(bg=COLORS["bg"])
-
-        width, height = 440, 170
-        self._center_toplevel(dialog, width, height)
 
         container = self._frame(dialog, COLORS["bg"])
         container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
@@ -2765,6 +2765,7 @@ class ReportApp:
 
         entry.bind("<Return>", lambda e: ok())
         dialog.bind("<Escape>", lambda e: dialog.destroy())
+        fit_toplevel(dialog, 440, 200, 380, 180, parent=self.root)
 
     def delete_selected_cafe_result(self):
         selected = self.cafe_result_tree.selection()
