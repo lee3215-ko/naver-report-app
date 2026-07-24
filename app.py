@@ -23,7 +23,16 @@ from ui_theme import (
     label as ui_label,
     button as ui_button,
 )
-from ui_layout import apply_main_window, fit_toplevel, make_scrollable, scaled_px, screen_size, setup_toplevel
+from ui_layout import (
+    apply_main_window,
+    bind_modal_dialog,
+    fit_toplevel,
+    make_scrollable,
+    release_modal_grab,
+    scaled_px,
+    screen_size,
+    setup_toplevel,
+)
 
 try:
     import customtkinter as ctk
@@ -99,7 +108,6 @@ class DetailWindow:
         else:
             self.top.configure(bg=COLORS["bg"])
         self.top.transient(parent)
-        self.top.grab_set()
         self.top.resizable(True, True)
 
         outer = ui_frame(self.top, COLORS["bg"])
@@ -178,9 +186,10 @@ class DetailWindow:
         self.site = site
         self.report_type = report_type
         if app:
-            app.setup_dialog(self.top, "detail", 860, 720, 640, 520)
+            app.setup_dialog(self.top, "detail", 860, 720, 640, 520, modal=True)
+            bind_modal_dialog(self.top, parent)
         else:
-            fit_toplevel(self.top, 860, 720, 640, 520, parent=parent)
+            fit_toplevel(self.top, 860, 720, 640, 520, parent=parent, modal=True)
             self.top.resizable(True, True)
 
     def _url_textbox(self, parent):
@@ -472,8 +481,6 @@ class RegisterWindow:
         else:
             self.top.configure(bg=COLORS["bg"])
         self.top.transient(parent)
-        self.top.grab_set()
-        self.top.resizable(True, True)
         self.app = app
 
         _, screen_h = screen_size(parent)
@@ -520,7 +527,6 @@ class RegisterWindow:
         self.type_entry.bind("<Return>", lambda e: self.register())
         self.type_entry.bind("<KeyRelease>", self._schedule_url_preview)
         self.type_entry.bind("<FocusOut>", self._on_type_focus_out)
-        self.type_entry.focus()
 
         reason_row = ui_frame(card_inner, COLORS["card"])
         reason_row.grid(row=2, column=0, sticky="w", pady=(0, 16))
@@ -676,7 +682,7 @@ class RegisterWindow:
 
         btn_frame = ui_frame(main, COLORS["bg"])
         btn_frame.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 20))
-        ui_button(btn_frame, "취소", "ghost", width=110, command=self.top.destroy).pack(side=tk.RIGHT, padx=(10, 0))
+        ui_button(btn_frame, "취소", "ghost", width=110, command=self.close).pack(side=tk.RIGHT, padx=(10, 0))
         save_label = "저장" if self.edit_mode else "등록"
         ui_button(btn_frame, save_label, "primary", width=110, command=self.register).pack(side=tk.RIGHT)
 
@@ -687,7 +693,14 @@ class RegisterWindow:
         if self.edit_mode:
             self._load_task(app.tasks[task_index])
         self._update_url_preview()
-        self.app.setup_dialog(self.top, "register", 680, 860, 560, 480)
+        self.top.resizable(True, True)
+        self.app.setup_dialog(self.top, "register", 680, 860, 560, 480, modal=True)
+        bind_modal_dialog(self.top, parent, on_close=self.close)
+        self.top.after(100, lambda: self.type_entry.focus())
+
+    def close(self):
+        release_modal_grab(self.top, self.app.root)
+        self.top.destroy()
 
     def _set_textbox(self, widget, text: str):
         if ctk and isinstance(widget, ctk.CTkTextbox):
@@ -1052,7 +1065,7 @@ class RegisterWindow:
             self.app.refresh_task_list()
             self.app.log(f"일괄 등록 완료: {len(pairs)}개 URL")
         self.app.root.update_idletasks()
-        self.top.destroy()
+        self.close()
 
 
 class ReportApp:
@@ -1177,7 +1190,17 @@ class ReportApp:
         if name == "카페수집리스트":
             self.refresh_cafe_collected_tree()
 
-    def setup_dialog(self, window, key: str, preferred_w: int, preferred_h: int, min_w: int, min_h: int):
+    def setup_dialog(
+        self,
+        window,
+        key: str,
+        preferred_w: int,
+        preferred_h: int,
+        min_w: int,
+        min_h: int,
+        *,
+        modal: bool = False,
+    ):
         setup_toplevel(
             window,
             key,
@@ -1188,6 +1211,7 @@ class ReportApp:
             parent=self.root,
             geometry_store=self.window_geometry,
             save_callback=self.save_window_geometry,
+            modal=modal,
         )
         window.resizable(True, True)
 
@@ -3310,7 +3334,11 @@ class ReportApp:
         self._account_cell_entry = entry
 
     def open_register_window(self):
-        RegisterWindow(self.root, self)
+        try:
+            RegisterWindow(self.root, self)
+        except Exception as e:
+            release_modal_grab(self.root)
+            messagebox.showerror("오류", f"신고 항목 등록 창을 열 수 없습니다.\n{e}")
 
     def toggle_api_visibility(self):
         current = self.api_key_entry.cget("show")

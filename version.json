@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.21",
-    "url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/486952808",
-    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.21/NaverReport.zip",
-    "notes":  "팝업 창 프로그램 중앙 표시, 창 크기·위치 기억 기능",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/486952808",
-    "asset_id":  486952808,
+    "version":  "1.0.22",
+    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.22/NaverReport.zip",
+    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.22/NaverReport.zip",
+    "notes":  "신고 항목 등록 창 미표시·UI 잠김 수정 (CTk 모달 창 표시 순서)",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/486952808",
-                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.21/NaverReport.zip",
+                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.22/NaverReport.zip",
                           "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip"
                       ]
 }
