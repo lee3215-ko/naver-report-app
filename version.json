@@ -1,9 +1,12 @@
 {
     "version":  "1.0.22",
-    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.22/NaverReport.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/487914008",
     "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.22/NaverReport.zip",
     "notes":  "신고 항목 등록 창 미표시·UI 잠김 수정 (CTk 모달 창 표시 순서)",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/487914008",
+    "asset_id":  487914008,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/487914008",
                           "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.22/NaverReport.zip",
                           "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip"
                       ]
