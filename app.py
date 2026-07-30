@@ -3144,12 +3144,17 @@ class ReportApp:
         indicator.place(x=0, y=max(y, 0), relwidth=1, anchor="nw")
         indicator.lift()
 
-    def _show_task_drag_ghost(self, iid: str, event_y: int):
+    def _show_task_drag_ghost(self, drag_iids: list[str], event_y: int):
         tree = self.task_tree
-        values = tree.item(iid, "values")
-        if not values:
+        if not drag_iids:
             return
-        label_text = f"  {values[1]}  {str(values[2])[:48]}"
+        if len(drag_iids) > 1:
+            label_text = f"  {len(drag_iids)}개 항목 이동"
+        else:
+            values = tree.item(drag_iids[0], "values")
+            if not values:
+                return
+            label_text = f"  {values[1]}  {str(values[2])[:48]}"
         if self._task_drag_ghost is None:
             self._task_drag_ghost = tk.Label(
                 tree,
@@ -3188,8 +3193,16 @@ class ReportApp:
         iid = tree.identify_row(event.y)
         if not iid:
             return
+        current_selection = tree.selection()
+        if iid in current_selection:
+            drag_iids = list(current_selection)
+        else:
+            drag_iids = [iid]
+        source_indices = sorted(tree.index(item) for item in drag_iids)
         self._task_drag_state = {
             "iid": iid,
+            "drag_iids": drag_iids,
+            "source_indices": source_indices,
             "source_idx": tree.index(iid),
             "start_x": event.x,
             "start_y": event.y,
@@ -3206,46 +3219,72 @@ class ReportApp:
                 return
             state["active"] = True
             tree = self.task_tree
-            tree.selection_set(state["iid"])
-            tree.item(state["iid"], tags=("drag_source",))
+            drag_iids = state["drag_iids"]
+            tree.selection_set(drag_iids)
+            for drag_iid in drag_iids:
+                tree.item(drag_iid, tags=("drag_source",))
         drop_idx = self._task_drop_index(event.y)
         state["drop_idx"] = drop_idx
         self._show_task_drag_indicator(drop_idx)
-        self._show_task_drag_ghost(state["iid"], event.y)
+        self._show_task_drag_ghost(state["drag_iids"], event.y)
         self._highlight_task_drop_target(
             min(drop_idx, max(len(self.task_tree.get_children()) - 1, 0)),
         )
+
+    def _move_tasks_to_drop(self, source_indices: list[int], drop_idx: int) -> int | None:
+        source_indices = sorted(set(source_indices))
+        if not source_indices or not self.tasks:
+            return None
+
+        insert_idx = drop_idx
+        for i in source_indices:
+            if i < drop_idx:
+                insert_idx -= 1
+
+        if insert_idx == source_indices[0]:
+            return None
+
+        block = [self.tasks[i] for i in source_indices]
+        for i in reversed(source_indices):
+            del self.tasks[i]
+
+        insert_idx = max(0, min(insert_idx, len(self.tasks)))
+        for offset, task in enumerate(block):
+            self.tasks.insert(insert_idx + offset, task)
+        return insert_idx
 
     def _on_task_drag_release(self, event):
         state = self._task_drag_state
         if not state:
             return
-        source_idx = state["source_idx"]
-        drop_idx = state.get("drop_idx", source_idx)
+        source_indices = state["source_indices"]
+        drop_idx = state.get("drop_idx", state["source_idx"])
         was_active = state["active"]
         self._clear_task_drag_ui()
 
         if not was_active:
             return
 
-        if drop_idx > source_idx:
-            insert_idx = drop_idx - 1
-        else:
-            insert_idx = drop_idx
-        if insert_idx == source_idx:
+        insert_idx = self._move_tasks_to_drop(source_indices, drop_idx)
+        if insert_idx is None:
             return
-        if not (0 <= source_idx < len(self.tasks)):
-            return
-        insert_idx = max(0, min(insert_idx, len(self.tasks) - 1))
 
-        task = self.tasks.pop(source_idx)
-        self.tasks.insert(insert_idx, task)
         self.save_tasks()
         self.refresh_task_list()
         children = self.task_tree.get_children()
-        if 0 <= insert_idx < len(children):
-            self._pulse_task_row(children[insert_idx])
-        self.log(f"신고 목록 순서 변경: {source_idx + 1}번 → {insert_idx + 1}번")
+        pulse_start = insert_idx
+        pulse_end = min(insert_idx + len(source_indices), len(children))
+        for idx in range(pulse_start, pulse_end):
+            self._pulse_task_row(children[idx])
+
+        if len(source_indices) == 1:
+            self.log(
+                f"신고 목록 순서 변경: {source_indices[0] + 1}번 → {insert_idx + 1}번"
+            )
+        else:
+            self.log(
+                f"신고 목록 순서 변경: {len(source_indices)}개 항목 → {insert_idx + 1}번 위치"
+            )
 
     def _pulse_task_row(self, iid: str, step: int = 0):
         if step >= 6:
