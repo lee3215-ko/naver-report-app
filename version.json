@@ -1,9 +1,12 @@
 {
     "version":  "1.0.23",
-    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.23/NaverReport.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/495216349",
     "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.23/NaverReport.zip",
     "notes":  "신고 목록 다중 선택 드래그 이동, 신고 항목 등록 창 표시·UI 잠김 수정",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/495216349",
+    "asset_id":  495216349,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/495216349",
                           "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.23/NaverReport.zip",
                           "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip"
                       ]
