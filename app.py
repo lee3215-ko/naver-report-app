@@ -1747,6 +1747,7 @@ class ReportApp:
         tree.bind("<ButtonPress-1>", self._on_task_drag_press, add="+")
         tree.bind("<B1-Motion>", self._on_task_drag_motion, add="+")
         tree.bind("<ButtonRelease-1>", self._on_task_drag_release, add="+")
+        tree.bind("<MouseWheel>", self._on_task_tree_mousewheel, add="+")
         return tree
 
     # ===================== Results Tab =====================
@@ -2478,11 +2479,14 @@ class ReportApp:
         dialog = ctk.CTkToplevel(self.root) if ctk else tk.Toplevel(self.root)
         dialog.title("블로그 URL 추가")
         dialog.transient(self.root)
-        dialog.grab_set()
         if ctk:
             dialog.configure(fg_color=COLORS["bg"])
         else:
             dialog.configure(bg=COLORS["bg"])
+
+        def close():
+            release_modal_grab(dialog, self.root)
+            dialog.destroy()
 
         container = self._frame(dialog, COLORS["bg"])
         container.pack(fill=tk.BOTH, expand=True)
@@ -2502,24 +2506,13 @@ class ReportApp:
         else:
             entry = tk.Entry(header, textvariable=url_var, font=FONTS["body"])
         entry.pack(fill=tk.X, pady=(8, 0))
-        entry.focus_set()
 
         scroll_host, scroll_body = make_scrollable(container)
         scroll_host.grid(row=1, column=0, sticky="nsew", padx=20, pady=(12, 8))
 
         ui_label(scroll_body, "사유선택", "body_bold", COLORS["text"]).pack(anchor="w", pady=(0, 8))
 
-        if ctk:
-            reason_box = ctk.CTkFrame(
-                container, fg_color=COLORS["card"],
-                border_color=COLORS["card_border"], border_width=1,
-            )
-        else:
-            reason_box = tk.Frame(
-                container, bg=COLORS["card"],
-                highlightbackground=COLORS["card_border"],
-                highlightthickness=1,
-            )
+        reason_box = ui_card(scroll_body)
         reason_box.pack(fill=tk.X, expand=True)
 
         reason_var = tk.StringVar(value="3")
@@ -2568,13 +2561,16 @@ class ReportApp:
             })
             self.save_blog_urls()
             self.refresh_blog_url_list()
-            dialog.destroy()
+            close()
 
         ui_button(btn_row, "추가", "primary", height=38, command=ok).pack(side=tk.RIGHT)
-        ui_button(btn_row, "취소", "secondary", height=38, command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+        ui_button(btn_row, "취소", "secondary", height=38, command=close).pack(side=tk.RIGHT, padx=(0, 8))
         entry.bind("<Return>", lambda e: ok())
-        dialog.bind("<Escape>", lambda e: dialog.destroy())
-        self.setup_dialog(dialog, "blog_url_add", 560, 520, 480, 380)
+        dialog.bind("<Escape>", lambda e: close())
+        dialog.resizable(True, True)
+        self.setup_dialog(dialog, "blog_url_add", 560, 520, 480, 380, modal=True)
+        bind_modal_dialog(dialog, self.root, on_close=close)
+        dialog.after(100, lambda: entry.focus_set())
 
     def delete_blog_url(self):
         selected = self.blog_url_tree.selection()
@@ -3112,6 +3108,56 @@ class ReportApp:
             )
         return self._task_drag_indicator
 
+    def _task_tree_pointer_y(self) -> int:
+        tree = self.task_tree
+        return tree.winfo_pointery() - tree.winfo_rooty()
+
+    def _scroll_task_tree(self, event) -> int:
+        tree = self.task_tree
+        if event.delta:
+            delta = -1 * (event.delta // 120) if abs(event.delta) >= 120 else (-1 if event.delta > 0 else 1)
+        else:
+            delta = -1
+        if delta == 0:
+            return 0
+        tree.yview_scroll(delta, "units")
+        return delta
+
+    def _refresh_task_drag_overlays(self, pointer_y: int | None = None):
+        state = self._task_drag_state
+        if not state or not state.get("active"):
+            return
+        y = pointer_y if pointer_y is not None else self._task_tree_pointer_y()
+        drop_idx = self._task_drop_index(y)
+        state["drop_idx"] = drop_idx
+        self._show_task_drag_indicator(drop_idx)
+        self._show_task_drag_ghost(state["drag_iids"], y)
+        self._highlight_task_drop_target(
+            min(drop_idx, max(len(self.task_tree.get_children()) - 1, 0)),
+        )
+
+    def _on_task_tree_mousewheel(self, event):
+        tree = self.task_tree
+        state = self._task_drag_state
+        preserve = None
+        if state:
+            preserve = state.get("drag_iids") or list(tree.selection())
+        elif len(tree.selection()) > 1:
+            preserve = list(tree.selection())
+
+        self._scroll_task_tree(event)
+
+        if preserve:
+            tree.selection_set(preserve)
+            if state and state.get("active"):
+                for drag_iid in state["drag_iids"]:
+                    if tree.exists(drag_iid):
+                        tree.item(drag_iid, tags=("drag_source",))
+
+        if state and state.get("active"):
+            self._refresh_task_drag_overlays()
+        return "break"
+
     def _task_drop_index(self, event_y: int) -> int:
         tree = self.task_tree
         children = tree.get_children()
@@ -3172,6 +3218,7 @@ class ReportApp:
         ghost_y = max(event_y - 18, 2)
         self._task_drag_ghost.place(x=8, y=ghost_y, relwidth=0.96, anchor="nw")
         self._task_drag_ghost.lift()
+        self._task_drag_ghost.bind("<MouseWheel>", self._on_task_tree_mousewheel, add="+")
 
     def _highlight_task_drop_target(self, drop_idx: int):
         tree = self.task_tree
@@ -3223,13 +3270,7 @@ class ReportApp:
             tree.selection_set(drag_iids)
             for drag_iid in drag_iids:
                 tree.item(drag_iid, tags=("drag_source",))
-        drop_idx = self._task_drop_index(event.y)
-        state["drop_idx"] = drop_idx
-        self._show_task_drag_indicator(drop_idx)
-        self._show_task_drag_ghost(state["drag_iids"], event.y)
-        self._highlight_task_drop_target(
-            min(drop_idx, max(len(self.task_tree.get_children()) - 1, 0)),
-        )
+        self._refresh_task_drag_overlays(event.y)
 
     def _move_tasks_to_drop(self, source_indices: list[int], drop_idx: int) -> int | None:
         source_indices = sorted(set(source_indices))
