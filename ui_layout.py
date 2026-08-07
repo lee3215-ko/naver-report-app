@@ -175,13 +175,116 @@ def bind_geometry_persistence(
 
 
 def release_modal_grab(window: tk.Misc, parent: tk.Misc | None = None) -> None:
-    for widget in (window, parent):
+    """Release modal grabs held by a dialog, its parent, or any active grab widget."""
+    seen: set[int] = set()
+    candidates: list[tk.Misc] = []
+
+    def add(widget: tk.Misc | None) -> None:
         if widget is None:
-            continue
+            return
+        try:
+            key = widget.winfo_id()
+        except tk.TclError:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(widget)
+
+    add(window)
+    add(parent)
+    if window is not None:
+        add(_widget_toplevel(window))
+    if parent is not None:
+        add(_widget_toplevel(parent))
+
+    for widget in candidates:
         try:
             widget.grab_release()
         except tk.TclError:
             pass
+
+    anchor = parent or window
+    for _ in range(6):
+        current = None
+        if anchor is not None:
+            try:
+                current = anchor.grab_current()
+            except tk.TclError:
+                current = None
+        if not current:
+            break
+        try:
+            current.grab_release()
+        except tk.TclError:
+            break
+
+    if anchor is not None:
+        for args in (("grab", "release", anchor), ("grab", "release", "-global", anchor)):
+            try:
+                anchor.tk.call(*args)
+            except tk.TclError:
+                pass
+
+
+def _widget_toplevel(widget: tk.Misc) -> tk.Misc | None:
+    try:
+        return widget.winfo_toplevel()
+    except tk.TclError:
+        return None
+
+
+def restore_main_window_input(parent: tk.Misc | None) -> None:
+    """Return keyboard/mouse focus to the main window after a modal closes."""
+    if parent is None:
+        return
+    release_modal_grab(parent, parent)
+
+    def _focus() -> None:
+        try:
+            if not parent.winfo_exists():
+                return
+            try:
+                parent.deiconify()
+            except tk.TclError:
+                pass
+            try:
+                parent.state("normal")
+            except tk.TclError:
+                pass
+            parent.lift()
+            parent.focus_force()
+        except tk.TclError:
+            pass
+
+    try:
+        parent.after_idle(_focus)
+    except tk.TclError:
+        pass
+
+
+def cancel_modal_presentation(window: tk.Misc | None) -> None:
+    """Stop deferred modal grab/focus callbacks for a closing dialog."""
+    if window is None:
+        return
+    setattr(window, "_modal_closed", True)
+    after_ids = getattr(window, "_modal_after_ids", None)
+    if not after_ids:
+        return
+    for after_id in after_ids:
+        try:
+            window.after_cancel(after_id)
+        except tk.TclError:
+            pass
+    window._modal_after_ids = []
+
+
+def _track_modal_after(window: tk.Misc, after_id: str) -> None:
+    ids = getattr(window, "_modal_after_ids", None)
+    if ids is None:
+        ids = []
+        window._modal_after_ids = ids
+    ids.append(after_id)
 
 
 def _set_window_normal(window: tk.Misc) -> None:
@@ -204,6 +307,8 @@ def _safe_topmost_off(window: tk.Misc) -> None:
 
 def present_modal_dialog(window: tk.Misc, parent: tk.Misc | None = None, *, _attempt: int = 0) -> None:
     """Show a CTk/tk dialog and only then grab input (avoids invisible modal freeze)."""
+    if getattr(window, "_modal_closed", False):
+        return
     if _attempt > 20:
         release_modal_grab(window, parent)
         return
@@ -216,19 +321,25 @@ def present_modal_dialog(window: tk.Misc, parent: tk.Misc | None = None, *, _att
         window.lift()
         try:
             window.attributes("-topmost", True)
-            window.after(80, lambda: _safe_topmost_off(window))
+            _track_modal_after(window, window.after(80, lambda: _safe_topmost_off(window)))
         except tk.TclError:
             pass
         window.update_idletasks()
 
         if not window.winfo_viewable():
-            window.after(20, lambda: present_modal_dialog(window, parent, _attempt=_attempt + 1))
+            _track_modal_after(
+                window,
+                window.after(20, lambda: present_modal_dialog(window, parent, _attempt=_attempt + 1)),
+            )
             return
 
         try:
             window.wait_visibility()
         except tk.TclError:
             pass
+
+        if getattr(window, "_modal_closed", False) or not window.winfo_exists():
+            return
 
         window.focus_force()
         try:
@@ -248,18 +359,24 @@ def bind_modal_dialog(window: tk.Misc, parent: tk.Misc | None, on_close=None) ->
     """Ensure modal grab is released when the dialog closes."""
 
     def close():
-        release_modal_grab(window, parent)
+        cancel_modal_presentation(window)
         if on_close:
             on_close()
-        else:
+            return
+        release_modal_grab(window, parent)
+        try:
             window.destroy()
+        except tk.TclError:
+            pass
+        restore_main_window_input(parent)
 
     window.protocol("WM_DELETE_WINDOW", close)
 
     def on_destroy(event=None):
         if event is not None and event.widget is not window:
             return
-        release_modal_grab(window, parent)
+        cancel_modal_presentation(window)
+        restore_main_window_input(parent)
 
     window.bind("<Destroy>", on_destroy, add="+")
 

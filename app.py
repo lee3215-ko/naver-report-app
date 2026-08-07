@@ -26,9 +26,11 @@ from ui_theme import (
 from ui_layout import (
     apply_main_window,
     bind_modal_dialog,
+    cancel_modal_presentation,
     fit_toplevel,
     make_scrollable,
     release_modal_grab,
+    restore_main_window_input,
     scaled_px,
     screen_size,
     setup_toplevel,
@@ -474,12 +476,12 @@ class RegisterWindow:
     def __init__(self, parent, app, task_index=None):
         self.task_index = task_index
         self.edit_mode = task_index is not None
-        self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
+        # tk.Toplevel avoids CTkToplevel titlebar withdraw/deiconify bugs on Windows
+        # that leave the main window unresponsive after close + save.
+        self.top = tk.Toplevel(parent)
+        self.top.withdraw()
         self.top.title("신고 항목 수정" if self.edit_mode else "신고 항목 등록")
-        if ctk:
-            self.top.configure(fg_color=COLORS["bg"])
-        else:
-            self.top.configure(bg=COLORS["bg"])
+        self.top.configure(bg=COLORS["bg"])
         self.top.transient(parent)
         self.app = app
 
@@ -694,13 +696,61 @@ class RegisterWindow:
             self._load_task(app.tasks[task_index])
         self._update_url_preview()
         self.top.resizable(True, True)
-        self.app.setup_dialog(self.top, "register", 680, 860, 560, 480, modal=True)
-        bind_modal_dialog(self.top, parent, on_close=self.close)
-        self.top.after(100, lambda: self.type_entry.focus())
+        self.app.setup_dialog(self.top, "register", 680, 860, 560, 480, modal=False)
+        self._closed = False
+        self._focus_after_id = None
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        self.top.update_idletasks()
+        self.top.deiconify()
+        self.top.lift()
+        self.top.focus_force()
+        self.top.after(50, self._focus_type_entry)
+
+    def _focus_type_entry(self):
+        if self._closed:
+            return
+        try:
+            self.type_entry.focus_set()
+        except tk.TclError:
+            pass
+
+    def _cancel_pending_after(self):
+        for after_id in (self._preview_after_id, self._focus_after_id):
+            if after_id is None:
+                continue
+            try:
+                self.top.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._preview_after_id = None
+        self._focus_after_id = None
+
+    def _finish_dialog(self, callback=None):
+        if self._closed:
+            return
+        self._closed = True
+        self._cancel_pending_after()
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+
+        def run_callback():
+            if callback:
+                callback()
+            self.app._clear_task_drag_ui()
+            try:
+                self.app.root.lift()
+                self.app.root.focus_force()
+                if hasattr(self.app, "task_tree"):
+                    self.app.task_tree.focus_set()
+            except tk.TclError:
+                pass
+
+        self.app.root.after_idle(run_callback)
 
     def close(self):
-        release_modal_grab(self.top, self.app.root)
-        self.top.destroy()
+        self._finish_dialog()
 
     def _set_textbox(self, widget, text: str):
         if ctk and isinstance(widget, ctk.CTkTextbox):
@@ -730,14 +780,30 @@ class RegisterWindow:
 
     def _deferred_url_preview(self):
         self._preview_after_id = None
+        if self._closed:
+            return
         self._update_url_preview()
 
     def _on_type_focus_out(self, event=None):
         if self._preview_after_id is not None:
-            self.top.after_cancel(self._preview_after_id)
+            try:
+                self.top.after_cancel(self._preview_after_id)
+            except tk.TclError:
+                pass
             self._preview_after_id = None
+        if self._focus_after_id is not None:
+            try:
+                self.top.after_cancel(self._focus_after_id)
+            except tk.TclError:
+                pass
         # IME 조합 완료 후 반영되도록 짧게 지연
-        self.top.after(80, self._update_url_preview)
+        self._focus_after_id = self.top.after(80, self._deferred_focus_out_preview)
+
+    def _deferred_focus_out_preview(self):
+        self._focus_after_id = None
+        if self._closed:
+            return
+        self._update_url_preview()
 
     def _toggle_search_auto(self):
         self.search_url_auto = not self.search_url_auto
@@ -1027,34 +1093,47 @@ class RegisterWindow:
         return self.search_url_text.get("1.0", tk.END).strip()
 
     def register(self):
+        if self._closed:
+            return
+
         report_type = self._get_type_text().strip()
         template_choice = self.template_var.get()
 
         if not report_type:
-            messagebox.showwarning("입력 필요", "유형을 입력해주세요.")
+            messagebox.showwarning("입력 필요", "유형을 입력해주세요.", parent=self.top)
             return
 
         pairs = self._resolve_paired_sites()
         if not pairs:
-            messagebox.showwarning("입력 필요", "사이트 주소를 입력해주세요.")
+            messagebox.showwarning("입력 필요", "사이트 주소를 입력해주세요.", parent=self.top)
             return
 
         template = self.app.get_template_text(template_choice)
         if not template:
-            messagebox.showwarning("원본 없음", "해당 원본 신고 내용이 비어 있습니다.")
+            messagebox.showwarning("원본 없음", "해당 원본 신고 내용이 비어 있습니다.", parent=self.top)
             return
 
         if self.edit_mode:
             site, effective, custom, auto = pairs[0]
-            self.app.update_task(
-                self.task_index, site, report_type, template, template_choice,
-                search_url=effective, search_url_custom=custom, search_url_auto=auto,
-                inquiry_category=self._get_inquiry_category(),
-            )
-            self.app.log(f"신고 항목 수정: [{report_type}] {site}")
-        else:
+            idx = self.task_index
             category = self._get_inquiry_category()
-            for site, effective, custom, auto in pairs:
+
+            def apply_edit():
+                self.app.update_task(
+                    idx, site, report_type, template, template_choice,
+                    search_url=effective, search_url_custom=custom, search_url_auto=auto,
+                    inquiry_category=category,
+                )
+                self.app.log(f"신고 항목 수정: [{report_type}] {site}")
+
+            self._finish_dialog(apply_edit)
+            return
+
+        category = self._get_inquiry_category()
+        batch = list(pairs)
+
+        def apply_register():
+            for site, effective, custom, auto in batch:
                 self.app.add_task(
                     site, report_type, template, template_choice,
                     search_url=effective, search_url_custom=custom, search_url_auto=auto,
@@ -1063,9 +1142,9 @@ class RegisterWindow:
                 )
             self.app.save_tasks()
             self.app.refresh_task_list()
-            self.app.log(f"일괄 등록 완료: {len(pairs)}개 URL")
-        self.app.root.update_idletasks()
-        self.close()
+            self.app.log(f"일괄 등록 완료: {len(batch)}개 URL")
+
+        self._finish_dialog(apply_register)
 
 
 class ReportApp:
@@ -3070,6 +3149,8 @@ class ReportApp:
         self.refresh_task_list()
 
     def open_edit_task(self):
+        self._clear_task_drag_ui()
+        release_modal_grab(self.root)
         selected = self.task_tree.selection()
         if not selected:
             return
@@ -3415,6 +3496,7 @@ class ReportApp:
 
     def open_register_window(self):
         try:
+            release_modal_grab(self.root)
             RegisterWindow(self.root, self)
         except Exception as e:
             release_modal_grab(self.root)
