@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.24",
-    "url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/504793346",
-    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.24/NaverReport.zip",
-    "notes":  "신고 항목 수정 저장 먹통·창 깜빡임·블로그 URL 추가 창 버그 수정",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/504793346",
-    "asset_id":  504793346,
+    "version":  "1.0.25",
+    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.25/NaverReport.zip",
+    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.25/NaverReport.zip",
+    "notes":  "신고 항목 등록 창 가로 레이아웃 - 신고 원고 왼쪽 노출",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/504793346",
-                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.24/NaverReport.zip",
+                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.25/NaverReport.zip",
                           "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip"
                       ]
 }

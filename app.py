@@ -502,8 +502,28 @@ class RegisterWindow:
             COLORS["text"],
         ).grid(row=0, column=0, sticky="w", padx=28, pady=(20, 12))
 
-        scroll_host, scroll_body = make_scrollable(main)
-        scroll_host.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 8))
+        content = ui_frame(main, COLORS["bg"])
+        content.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 8))
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_columnconfigure(0, weight=0, minsize=280)
+        content.grid_columnconfigure(1, weight=1)
+
+        left_card = ui_card(content)
+        left_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left_inner = ui_frame(left_card, COLORS["card"])
+        left_inner.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        ui_label(left_inner, "신고 원고", "body_bold", COLORS["text_muted"]).pack(
+            anchor="w", pady=(0, 12),
+        )
+        self.template_var = tk.StringVar()
+        self.tpl_buttons = {}
+        self.tpl_frame = ui_frame(left_inner, COLORS["card"])
+        self.tpl_frame.pack(fill=tk.X)
+        self.tpl_frame.grid_columnconfigure(0, weight=1)
+        self._build_template_buttons()
+
+        scroll_host, scroll_body = make_scrollable(content)
+        scroll_host.grid(row=0, column=1, sticky="nsew")
 
         card = ui_card(scroll_body)
         card.pack(fill=tk.X, expand=True)
@@ -669,18 +689,7 @@ class RegisterWindow:
                 highlightbackground=COLORS["card_border"], highlightthickness=1,
                 padx=12, pady=10, relief=tk.FLAT, state=tk.DISABLED,
             )
-        self.url_preview.grid(row=10, column=0, sticky="ew", pady=(0, 16), padx=16)
-
-        ui_label(card_inner, "신고 원고", "body_bold", COLORS["text_muted"]).grid(row=11, column=0, sticky="w", pady=(0, 10))
-        tpl_frame = ui_frame(card_inner, COLORS["card"])
-        tpl_frame.grid(row=12, column=0, sticky="ew", pady=(0, 8))
-        tpl_frame.grid_columnconfigure(0, weight=1)
-        tpl_frame.grid_columnconfigure(1, weight=1)
-
-        self.template_var = tk.StringVar()
-        self.tpl_buttons = {}
-        self.tpl_frame = tpl_frame
-        self._build_template_buttons()
+        self.url_preview.grid(row=10, column=0, sticky="ew", pady=(0, 8), padx=16)
 
         btn_frame = ui_frame(main, COLORS["bg"])
         btn_frame.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 20))
@@ -696,7 +705,7 @@ class RegisterWindow:
             self._load_task(app.tasks[task_index])
         self._update_url_preview()
         self.top.resizable(True, True)
-        self.app.setup_dialog(self.top, "register", 680, 860, 560, 480, modal=False)
+        self.app.setup_dialog(self.top, "register", 1180, 780, 920, 520, modal=False)
         self._closed = False
         self._focus_after_id = None
         self.top.protocol("WM_DELETE_WINDOW", self.close)
@@ -954,9 +963,10 @@ class RegisterWindow:
         if not self.template_var.get() or self.template_var.get() not in ids:
             self.template_var.set(ids[0])
 
-        cols = 2
+        cols = 1
         for idx, (tid, title) in enumerate(options):
-            row, col = divmod(idx, cols)
+            row = idx
+            col = 0
             active = tid == self.template_var.get()
             if ctk:
                 btn = ctk.CTkButton(
@@ -966,6 +976,7 @@ class RegisterWindow:
                     hover_color=COLORS["accent_hover"] if active else COLORS["border"],
                     text_color="#ffffff" if active else COLORS["text"],
                     corner_radius=10,
+                    anchor="w",
                     command=lambda n=tid: self._pick_template(n),
                 )
             else:
@@ -974,12 +985,10 @@ class RegisterWindow:
                     font=FONTS["body_bold"] if active else FONTS["body"],
                     bg=COLORS["accent"] if active else COLORS["input_bg"],
                     fg="#ffffff" if active else COLORS["text"],
-                    relief=tk.FLAT,
+                    relief=tk.FLAT, anchor="w", justify=tk.LEFT,
                     command=lambda n=tid: self._pick_template(n),
                 )
-            pad_left = 0 if col == 0 else 6
-            pad_right = 6 if col == 0 else 0
-            btn.grid(row=row, column=col, sticky="ew", padx=(pad_left, pad_right), pady=4)
+            btn.grid(row=row, column=col, sticky="ew", pady=4)
             self.tpl_buttons[tid] = btn
 
     def _pick_template(self, name):
