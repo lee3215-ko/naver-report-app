@@ -2407,9 +2407,9 @@ class NaverReporter:
                 self._human_delay(0.3, 0.8)
 
             textarea = wait.until(EC.presence_of_element_located((By.ID, "moText2CA")))
-            self._type_into_element(textarea, content, label="상세 내용")
-            self.log(f"상세 내용 입력 ({len(content)}자)")
-            self._human_delay(0.5, 1.2)
+            self._paste_into_element(textarea, content, label="상세 내용")
+            self.log(f"상세 내용 붙여넣기 ({len(content)}자)")
+            self._human_delay(0.3, 0.6)
 
             try:
                 if not self._select_inquiry_category(wait, category):

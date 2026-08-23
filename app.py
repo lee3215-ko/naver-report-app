@@ -25,8 +25,10 @@ from ui_theme import (
 )
 from ui_layout import (
     apply_main_window,
+    apply_window_geometry,
     bind_modal_dialog,
     cancel_modal_presentation,
+    capture_window_geometry,
     fit_toplevel,
     make_scrollable,
     release_modal_grab,
@@ -531,7 +533,42 @@ class RegisterWindow:
         card_inner.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
         card_inner.grid_columnconfigure(0, weight=1)
 
-        ui_label(card_inner, "유형", "body_bold", COLORS["text_muted"]).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.dual_kind_report = False
+        self.kind_report_row = ui_frame(card_inner, COLORS["card"])
+        self.kind_report_row.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        if ctk:
+            self.kind_report_btn = ctk.CTkButton(
+                self.kind_report_row, text="종류신고", width=110, height=34,
+                font=FONTS["body_bold"],
+                fg_color=COLORS["input_bg"],
+                hover_color=COLORS["border"],
+                text_color=COLORS["text_muted"],
+                border_color=COLORS["accent"],
+                border_width=2,
+                corner_radius=10,
+                command=self._toggle_dual_kind_report,
+            )
+        else:
+            self.kind_report_btn = tk.Button(
+                self.kind_report_row, text="종류신고", width=12,
+                font=FONTS["body_bold"],
+                bg=COLORS["input_bg"], fg=COLORS["text_muted"],
+                activebackground=COLORS["border"],
+                relief=tk.GROOVE, bd=2,
+                command=self._toggle_dual_kind_report,
+            )
+        self.kind_report_btn.pack(side=tk.LEFT)
+        self.kind_report_hint = ui_label(
+            self.kind_report_row,
+            "OFF · 단일 등록  /  ON · 사이트마다 검색URL 자동+수동 2건",
+            "caption",
+            COLORS["text_light"],
+        )
+        self.kind_report_hint.pack(side=tk.LEFT, padx=(10, 0))
+        if self.edit_mode:
+            self.kind_report_row.grid_remove()
+
+        ui_label(card_inner, "유형", "body_bold", COLORS["text_muted"]).grid(row=1, column=0, sticky="w", pady=(0, 6))
         self._preview_after_id = None
         if ctk:
             self.type_entry = ctk.CTkEntry(
@@ -545,13 +582,13 @@ class RegisterWindow:
                 bg=COLORS["input_bg"], fg=COLORS["text"],
                 highlightbackground=COLORS["input_border"], highlightthickness=1,
             )
-        self.type_entry.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.type_entry.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         self.type_entry.bind("<Return>", lambda e: self.register())
         self.type_entry.bind("<KeyRelease>", self._schedule_url_preview)
         self.type_entry.bind("<FocusOut>", self._on_type_focus_out)
 
         reason_row = ui_frame(card_inner, COLORS["card"])
-        reason_row.grid(row=2, column=0, sticky="w", pady=(0, 16))
+        reason_row.grid(row=3, column=0, sticky="w", pady=(0, 16))
         self.use_spam_category = False
         if ctk:
             self.spam_category_btn = ctk.CTkButton(
@@ -584,16 +621,16 @@ class RegisterWindow:
         self.spam_category_hint.pack(side=tk.LEFT, padx=(10, 0))
 
         ui_label(card_inner, "사이트 주소", "body_bold", COLORS["text_muted"]).grid(
-            row=3, column=0, sticky="w", pady=(0, 4))
+            row=4, column=0, sticky="w", pady=(0, 4))
         ui_label(
             card_inner,
             "한 줄에 URL 하나 · Enter 줄바꿈 · Ctrl+Enter 등록",
             "caption",
             COLORS["text_light"],
-        ).grid(row=4, column=0, sticky="w", pady=(0, 8))
+        ).grid(row=5, column=0, sticky="w", pady=(0, 8))
 
         url_box = ui_frame(card_inner, COLORS["card"])
-        url_box.grid(row=5, column=0, sticky="ew", pady=(0, 8), padx=16)
+        url_box.grid(row=6, column=0, sticky="ew", pady=(0, 8), padx=16)
         url_box.grid_columnconfigure(0, weight=1)
 
         if ctk:
@@ -613,7 +650,7 @@ class RegisterWindow:
         self.site_text.grid(row=0, column=0, sticky="nsew")
 
         search_header = ui_frame(card_inner, COLORS["card"])
-        search_header.grid(row=6, column=0, sticky="ew", pady=(8, 4))
+        search_header.grid(row=7, column=0, sticky="ew", pady=(8, 4))
         search_header.grid_columnconfigure(0, weight=1)
         ui_label(search_header, "검색결과 URL", "body_bold", COLORS["text_muted"]).grid(
             row=0, column=0, sticky="w")
@@ -647,10 +684,10 @@ class RegisterWindow:
             "caption",
             COLORS["text_light"],
         )
-        self.search_url_hint.grid(row=7, column=0, sticky="w", pady=(0, 8))
+        self.search_url_hint.grid(row=8, column=0, sticky="w", pady=(0, 8))
 
         search_box = ui_frame(card_inner, COLORS["card"])
-        search_box.grid(row=8, column=0, sticky="ew", pady=(0, 8), padx=16)
+        search_box.grid(row=9, column=0, sticky="ew", pady=(0, 8), padx=16)
         search_box.grid_columnconfigure(0, weight=1)
 
         if ctk:
@@ -670,7 +707,7 @@ class RegisterWindow:
         self.search_url_text.grid(row=0, column=0, sticky="nsew")
 
         preview_header = ui_frame(card_inner, COLORS["card"])
-        preview_header.grid(row=9, column=0, sticky="ew", pady=(4, 6))
+        preview_header.grid(row=10, column=0, sticky="ew", pady=(4, 6))
         ui_label(preview_header, "등록 예정 URL", "body_bold", COLORS["text_muted"]).pack(side=tk.LEFT)
         self.url_count_label = ui_label(preview_header, "0개", "badge", COLORS["accent"])
         self.url_count_label.pack(side=tk.RIGHT)
@@ -689,7 +726,7 @@ class RegisterWindow:
                 highlightbackground=COLORS["card_border"], highlightthickness=1,
                 padx=12, pady=10, relief=tk.FLAT, state=tk.DISABLED,
             )
-        self.url_preview.grid(row=10, column=0, sticky="ew", pady=(0, 8), padx=16)
+        self.url_preview.grid(row=11, column=0, sticky="ew", pady=(0, 8), padx=16)
 
         btn_frame = ui_frame(main, COLORS["bg"])
         btn_frame.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 20))
@@ -711,6 +748,9 @@ class RegisterWindow:
         self.top.protocol("WM_DELETE_WINDOW", self.close)
         self.top.update_idletasks()
         self.top.deiconify()
+        saved_geom = self.app.window_geometry.get("register")
+        if saved_geom:
+            apply_window_geometry(self.top, saved_geom)
         self.top.lift()
         self.top.focus_force()
         self.top.after(50, self._focus_type_entry)
@@ -734,19 +774,33 @@ class RegisterWindow:
         self._preview_after_id = None
         self._focus_after_id = None
 
+    def _save_window_geometry(self):
+        geom = capture_window_geometry(self.top)
+        if geom:
+            self.app.window_geometry["register"] = geom
+            self.app.save_window_geometry()
+
     def _finish_dialog(self, callback=None):
         if self._closed:
             return
         self._closed = True
         self._cancel_pending_after()
+        self._save_window_geometry()
         try:
             self.top.destroy()
         except tk.TclError:
             pass
 
         def run_callback():
-            if callback:
-                callback()
+            try:
+                if callback:
+                    callback()
+            except Exception as exc:
+                self.app.log(f"등록 처리 오류: {exc}")
+                try:
+                    messagebox.showerror("등록 오류", f"항목 등록 중 오류가 발생했습니다.\n{exc}", parent=self.app.root)
+                except tk.TclError:
+                    pass
             self.app._clear_task_drag_ui()
             try:
                 self.app.root.lift()
@@ -815,9 +869,66 @@ class RegisterWindow:
         self._update_url_preview()
 
     def _toggle_search_auto(self):
+        if self.dual_kind_report:
+            return
         self.search_url_auto = not self.search_url_auto
         self._apply_search_auto_ui()
         self._update_url_preview()
+
+    def _toggle_dual_kind_report(self):
+        self.dual_kind_report = not self.dual_kind_report
+        if self.dual_kind_report and self.search_url_auto:
+            self.search_url_auto = False
+            self._apply_search_auto_ui()
+        self._apply_dual_kind_report_ui()
+        self._update_url_preview()
+
+    def _apply_dual_kind_report_ui(self):
+        active = self.dual_kind_report
+        if ctk and isinstance(self.kind_report_btn, ctk.CTkButton):
+            self.kind_report_btn.configure(
+                fg_color=COLORS["accent"] if active else COLORS["input_bg"],
+                hover_color=COLORS["accent_hover"] if active else COLORS["border"],
+                text_color="#ffffff" if active else COLORS["text_muted"],
+                border_color=COLORS["accent_hover"] if active else COLORS["accent"],
+                text="종류신고 ON" if active else "종류신고",
+            )
+        else:
+            self.kind_report_btn.configure(
+                bg=COLORS["accent"] if active else COLORS["input_bg"],
+                fg="#ffffff" if active else COLORS["text_muted"],
+                text="종류신고 ON" if active else "종류신고",
+            )
+        self.kind_report_hint.configure(
+            text=(
+                "ON · 유형·사이트 동일, 검색URL 자동+수동 각 1건씩 등록"
+                if active
+                else "OFF · 단일 등록  /  ON · 사이트마다 검색URL 자동+수동 2건"
+            ),
+        )
+        if active:
+            if self.search_url_auto:
+                self.search_url_auto = False
+                self._apply_search_auto_ui()
+            self._set_auto_search_btn_enabled(False)
+            self.search_url_hint.configure(
+                text="종류신고: 아래 줄은 [수동] 검색URL · [자동]은 신고 시 유형으로 실시간 생성",
+            )
+            if ctk and isinstance(self.search_url_text, ctk.CTkTextbox):
+                content = self._search_url_text_content()
+                if content == SEARCH_URL_AUTO_PLACEHOLDER:
+                    self._set_textbox(self.search_url_text, "")
+            self._set_search_url_disabled(False)
+        else:
+            self._set_auto_search_btn_enabled(True)
+            self._apply_search_auto_ui()
+
+    def _set_auto_search_btn_enabled(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        if ctk and isinstance(self.auto_search_btn, ctk.CTkButton):
+            self.auto_search_btn.configure(state=state)
+        else:
+            self.auto_search_btn.configure(state=state)
 
     def _toggle_spam_category(self):
         self.use_spam_category = not self.use_spam_category
@@ -995,8 +1106,8 @@ class RegisterWindow:
         self.template_var.set(name)
         self._on_tpl_select(name)
 
-    def _parse_search_url_lines(self):
-        if self.search_url_auto:
+    def _parse_search_url_lines(self, *, ignore_auto: bool = False):
+        if self.search_url_auto and not ignore_auto and not self.dual_kind_report:
             return []
         raw = self._search_url_text_content()
         if raw == SEARCH_URL_AUTO_PLACEHOLDER:
@@ -1015,6 +1126,21 @@ class RegisterWindow:
     def _resolve_paired_sites(self):
         """(site, effective_search_url, search_url_custom, search_url_auto)."""
         sites = self._parse_site_lines()
+        if not sites:
+            return []
+
+        if self.dual_kind_report and not self.edit_mode:
+            kw = self._get_type_text().strip()
+            preview_url = resolve_naver_search_url(kw, live=False) if kw else ""
+            manual_pairs = self._parse_paired_sites(ignore_auto=True)
+            resolved = []
+            for site, search in manual_pairs:
+                custom = bool(search)
+                effective_manual = search if custom else site
+                resolved.append((site, preview_url or site, True, True))
+                resolved.append((site, effective_manual, custom, False))
+            return resolved
+
         if self.search_url_auto:
             kw = self._get_type_text().strip()
             preview_url = resolve_naver_search_url(kw, live=False) if kw else ""
@@ -1028,9 +1154,9 @@ class RegisterWindow:
             resolved.append((site, effective, custom, False))
         return resolved
 
-    def _parse_paired_sites(self):
+    def _parse_paired_sites(self, *, ignore_auto: bool = False):
         sites = self._parse_site_lines()
-        search_lines = self._parse_search_url_lines()
+        search_lines = self._parse_search_url_lines(ignore_auto=ignore_auto)
         pairs = []
         for i, site in enumerate(sites):
             search = search_lines[i] if i < len(search_lines) else ""
@@ -1082,7 +1208,8 @@ class RegisterWindow:
 
         lines = []
         for idx, (site, effective, custom, auto) in enumerate(pairs, 1):
-            lines.append(f"  {idx:02d}  사이트: {self._short_url(site)}")
+            mode = "자동" if auto else "수동"
+            lines.append(f"  {idx:02d}  [{mode}] 사이트: {self._short_url(site)}")
             if auto:
                 lines.append("       검색: 신고 시 유형으로 실시간 생성 (tqi·ackey 매번 신규)")
             elif custom:
@@ -1140,6 +1267,8 @@ class RegisterWindow:
 
         category = self._get_inquiry_category()
         batch = list(pairs)
+        site_count = len(self._parse_site_lines())
+        dual_kind = self.dual_kind_report
 
         def apply_register():
             for site, effective, custom, auto in batch:
@@ -1151,7 +1280,12 @@ class RegisterWindow:
                 )
             self.app.save_tasks()
             self.app.refresh_task_list()
-            self.app.log(f"일괄 등록 완료: {len(batch)}개 URL")
+            if dual_kind:
+                self.app.log(
+                    f"종류신고 등록: 사이트 {site_count}개 → 항목 {len(batch)}개 (자동+수동)"
+                )
+            else:
+                self.app.log(f"일괄 등록 완료: {len(batch)}개 URL")
 
         self._finish_dialog(apply_register)
 
@@ -1822,7 +1956,7 @@ class ReportApp:
         tree.column("no", width=50, anchor="center")
         tree.column("report_type", width=100, anchor="center")
         tree.column("site", width=500, anchor="w")
-        tree.column("template_name", width=120, anchor="center")
+        tree.column("template_name", width=200, anchor="center")
         tree.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
@@ -3108,6 +3242,11 @@ class ReportApp:
             return "자동"
         return "별도입력" if search_url_custom else "사이트동일"
 
+    @staticmethod
+    def task_template_display(template_title: str, search_url_auto: bool = False) -> str:
+        tag = "자동URL" if search_url_auto else "수동URL"
+        return f"{template_title} [{tag}]"
+
     def add_task(
         self, site, report_type, template, template_name=None,
         search_url="", search_url_custom=False, search_url_auto=False,
@@ -3170,11 +3309,16 @@ class ReportApp:
         for item in self.task_tree.get_children():
             self.task_tree.delete(item)
         for idx, task in enumerate(self.tasks, 1):
+            template_title = self.get_template_title(task.get("template_name", ""))
+            template_cell = self.task_template_display(
+                template_title,
+                bool(task.get("search_url_auto", False)),
+            )
             self.task_tree.insert("", tk.END, values=(
                 idx,
                 task.get("report_type", ""),
                 task.get("site", ""),
-                self.get_template_title(task.get("template_name", "")),
+                template_cell,
             ))
         self.task_count_label.configure(text=f"{len(self.tasks)}개")
 

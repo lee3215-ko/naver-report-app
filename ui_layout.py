@@ -1,4 +1,5 @@
 """Responsive window geometry, centering, and persistence helpers."""
+import re
 import tkinter as tk
 from tkinter import ttk
 
@@ -8,6 +9,51 @@ except ImportError:
     ctk = None
 
 from ui_theme import COLORS, FONTS, frame as ui_frame
+
+
+def parse_tk_geometry(geo: str) -> dict | None:
+    """Parse Tk geometry string ``WxH+X+Y`` (supports negative offsets)."""
+    if not geo:
+        return None
+    m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", geo)
+    if not m:
+        return None
+    return {
+        "w": int(m.group(1)),
+        "h": int(m.group(2)),
+        "x": int(m.group(3)),
+        "y": int(m.group(4)),
+    }
+
+
+def capture_window_geometry(window: tk.Misc) -> dict | None:
+    """Return stable window geometry using the geometry string, not winfo root coords."""
+    try:
+        window.update_idletasks()
+        parsed = parse_tk_geometry(window.geometry())
+        if parsed and parsed["w"] >= 80 and parsed["h"] >= 80:
+            return parsed
+        w = window.winfo_width()
+        h = window.winfo_height()
+        if w < 80 or h < 80:
+            return None
+        return {
+            "w": w,
+            "h": h,
+            "x": window.winfo_rootx(),
+            "y": window.winfo_rooty(),
+        }
+    except tk.TclError:
+        return None
+
+
+def apply_window_geometry(window: tk.Misc, geom: dict) -> None:
+    """Apply a saved geometry dict without re-centering."""
+    try:
+        window.geometry(f"{int(geom['w'])}x{int(geom['h'])}+{int(geom['x'])}+{int(geom['y'])}")
+        window.update_idletasks()
+    except (tk.TclError, KeyError, TypeError, ValueError):
+        pass
 
 
 def screen_size(window: tk.Misc) -> tuple[int, int]:
@@ -120,22 +166,14 @@ def bind_geometry_persistence(
         if destroyed[0]:
             return last_good
         try:
-            window.update_idletasks()
-            w = window.winfo_width()
-            h = window.winfo_height()
-            if w < 80 or h < 80:
+            if not window.winfo_viewable():
                 return None
-            return {
-                "w": w,
-                "h": h,
-                "x": window.winfo_rootx(),
-                "y": window.winfo_rooty(),
-            }
         except tk.TclError:
             return None
+        return capture_window_geometry(window)
 
     def persist(_event=None):
-        if destroyed[0] or not geometry_key:
+        if not geometry_key:
             return
         geom = capture() or last_good
         if not geom:
@@ -148,6 +186,11 @@ def bind_geometry_persistence(
 
     def on_configure(event=None):
         if destroyed[0] or event is not None and event.widget is not window:
+            return
+        try:
+            if not window.winfo_viewable():
+                return
+        except tk.TclError:
             return
         nonlocal last_good
         snap = capture()
@@ -168,7 +211,11 @@ def bind_geometry_persistence(
                 window.after_cancel(after_id[0])
             except tk.TclError:
                 pass
-        persist()
+        geom = capture_window_geometry(window) or last_good
+        if geom and geometry_key:
+            geometry_store[geometry_key] = geom
+            if save_callback:
+                save_callback()
 
     window.bind("<Configure>", on_configure, add="+")
     window.bind("<Destroy>", on_destroy, add="+")
