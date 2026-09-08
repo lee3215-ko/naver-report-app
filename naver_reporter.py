@@ -7,9 +7,6 @@ import base64
 from datetime import datetime
 from urllib.parse import quote, urlparse, urlunparse
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -23,9 +20,7 @@ from selenium.common.exceptions import (
     WebDriverException,
     UnexpectedAlertPresentException,
 )
-from webdriver_manager.chrome import ChromeDriverManager
-
-
+from chrome_browser import create_webdriver, normalize_browser_mode
 from naver_search_url import fetch_naver_search_url_live
 
 
@@ -40,12 +35,14 @@ class NaverReporter:
                  api_key: str,
                  model: str,
                  headless: bool = False,
+                 browser_mode: str = "chrome",
                  log_callback=None,
                  result_callback=None,
                  progress_callback=None):
         self.api_key = api_key
         self.model = model
         self.headless = headless
+        self.browser_mode = normalize_browser_mode(browser_mode)
         self.log_callback = log_callback or print
         self.result_callback = result_callback
         self.progress_callback = progress_callback
@@ -734,22 +731,19 @@ class NaverReporter:
         return "\n".join(cleaned).strip()
 
     def start_driver(self):
-        self.log("Chrome 드라이버 준비 중...")
-        options = Options()
-        if self.headless:
-            options.add_argument("--headless=new")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--window-size=1280,900")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
-
-        service = Service(ChromeDriverManager().install())
-        self.driver = webdriver.Chrome(service=service, options=options)
-        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        self.log("Chrome 드라이버 시작 완료")
+        self.log("브라우저 준비 중...")
+        self.driver, info = create_webdriver(self.browser_mode, headless=self.headless)
+        version = info.get("version") or ""
+        label = info.get("label") or "브라우저"
+        if version:
+            self.log(f"{label} 사용: {version}")
+        else:
+            self.log(f"{label} 사용")
+        ua = info.get("user_agent") or ""
+        if ua:
+            self.log(f"브라우저 시작 완료 ({ua})")
+        else:
+            self.log("브라우저 시작 완료")
 
     def quit_driver(self):
         if self.driver:
@@ -758,7 +752,7 @@ class NaverReporter:
             except Exception:
                 pass
             self.driver = None
-            self.log("Chrome 드라이버 종료")
+            self.log("브라우저 종료")
 
     def _wait(self, seconds: int = 10):
         return WebDriverWait(self.driver, seconds)
@@ -1921,13 +1915,104 @@ class NaverReporter:
         img = self._find_char_captcha_image()
         return img is not None
 
-    def _solve_receipt_answer(self, question: str, img_el) -> str:
+    def _classify_receipt_question(self, question: str) -> str:
+        """영수증 보안 질문 유형 분류 (키워드 우선순위 중요)."""
+        if not question:
+            return "generic"
+        if re.search(r"(\d+)번째.*숫자", question) or "전화번호" in question:
+            return "phone_digit"
+        if "빈 칸" in question or "[?]" in question:
+            return "blank"
+        # 이름/무엇 — '가격이 싼 물건의 이름'처럼 가격 키워드가 있어도 이름 우선
+        if any(k in question for k in ("이름", "무엇입니까", "무엇 입니까", "제품명", "품목명")):
+            return "name"
+        if "무엇" in question and "물건" in question:
+            return "name"
+        if any(k in question for k in ("종류", "몇 종", "몇종")):
+            return "kind_count"
+        if any(k in question for k in ("몇 개", "총 몇", "몇개", "개 입니까", "개입니까")):
+            return "item_count"
+        if any(k in question for k in ("가격", "얼마", "합계", "한 개 당", "한개당", "kcal", "열량", " kg", "kg ")):
+            return "price"
+        return "generic"
+
+    def _is_refusal_answer(self, answer: str) -> bool:
+        compact = (answer or "").replace(" ", "").lower()
+        return any(k in compact for k in ("죄송", "제공할수", "sorry", "cannot", "unable", "can't"))
+
+    def _validate_receipt_answer(self, question: str, answer: str, qtype: str) -> bool:
+        if not answer or self._is_refusal_answer(answer):
+            return False
+        if qtype in ("kind_count", "item_count", "price", "phone_digit"):
+            if not re.fullmatch(r"\d+", answer):
+                return False
+            if len(answer) > 8:
+                return False
+        if qtype == "name":
+            if re.fullmatch(r"\d+", answer):
+                return False
+            if len(answer) > 40:
+                return False
+        if qtype == "blank":
+            if len(answer) > 20 or len(answer) < 1:
+                return False
+        if qtype == "generic" and len(answer) > 50:
+            return False
+        return True
+
+    def _normalize_receipt_answer(self, answer: str, qtype: str) -> str:
+        line = (answer or "").split("\n")[0].strip()
+        if qtype in ("kind_count", "item_count", "price", "phone_digit"):
+            return re.sub(r"\D", "", line)
+        if qtype in ("name", "blank"):
+            return re.sub(r"[^\w가-힣]", "", line)
+        if qtype == "generic":
+            if re.fullmatch(r"[\d,]+", line.replace(",", "")):
+                return re.sub(r"\D", "", line)
+            return re.sub(r"[^\w가-힣0-9]", "", line)
+        return line
+
+    def _receipt_prompt_for_type(self, question: str, qtype: str) -> str:
+        base = "네이버 영수증 보안 질문입니다. 영수증 이미지를 자세히 읽고 질문에 맞는 정답만 출력하세요.\n"
+        base += "설명·이유·단위(원/kg/kcal) 없이 정답만. 확실하지 않으면 영수증 표에서 해당 값을 다시 확인하세요.\n"
+        base += f"질문: {question}\n\n"
+        extras = {
+            "phone_digit": (
+                "가게 전화번호(☎ 옆)를 찾아 숫자만 나열하세요. "
+                "질문의 N번째 숫자 하나만 최종 출력하세요."
+            ),
+            "blank": "주소·지명 등 [?] 빈 칸에 들어갈 단어 하나만 출력하세요.",
+            "name": (
+                "질문이 묻는 상품/품목 이름만 출력하세요. 가격 숫자는 출력하지 마세요.\n"
+                "- '가장 가격이 싼/적은' → 단가가 가장 낮은 품목명\n"
+                "- '가장 가격이 비싼/많은' → 단가가 가장 높은 품목명\n"
+                "- '적게 구매한' → 수량이 가장 적은 품목명\n"
+                "영수증 품목란에 적힌 이름 그대로."
+            ),
+            "kind_count": (
+                "영수증 표에서 서로 다른 상품(품목) 종류 수를 세세요. "
+                "합계·할인 행은 제외. 숫자 하나만 (예: 3)."
+            ),
+            "item_count": (
+                "영수증에서 구매한 모든 상품의 수량(개수) 합계를 세세요. "
+                "각 품목 옆 수량을 모두 더한 값. 숫자 하나만."
+            ),
+            "price": (
+                "질문에 해당하는 금액·가격·수치 하나만 숫자로 출력하세요. "
+                "'한 개 당'이면 단가, '합계'면 해당 합계 금액."
+            ),
+            "generic": "질문 형식(숫자/단어)에 맞는 정답만 출력하세요.",
+        }
+        return base + extras.get(qtype, extras["generic"])
+
+    def _solve_receipt_answer(self, question: str, img_el, retry: bool = True) -> str:
         """영수증 이미지 + 질문으로 정답 추출."""
         if not img_el:
             return ""
         b64 = self._captcha_element_to_b64(img_el)
+        qtype = self._classify_receipt_question(question)
 
-        if question and re.search(r"(\d+)번째.*숫자", question):
+        if qtype == "phone_digit":
             phone_raw = self._vision_answer(
                 "영수증 이미지에서 가게 전화번호(☎ 표시 옆)를 찾아 숫자만 출력하세요. "
                 "기호 없이 숫자만. 예: 0242664",
@@ -1935,60 +2020,40 @@ class NaverReporter:
                 detail="high",
             )
             digits = re.sub(r"\D", "", phone_raw.split("\n")[0])
-            pos_match = re.search(r"(\d+)번째", question)
+            pos_match = re.search(r"(\d+)번째", question or "")
             if pos_match and digits:
                 pos = int(pos_match.group(1)) - 1
                 if 0 <= pos < len(digits):
                     return digits[pos]
 
-        if question and any(k in question for k in ("가격", "얼마", "합계", "개수", "한 개")):
-            prompt = (
-                "네이버 로그인 영수증 보안 질문입니다.\n"
-                f"질문: {question}\n"
-                "영수증 표의 가격·개수·합계를 읽고 질문에 맞는 숫자 하나만 출력하세요."
-            )
-            answer = re.sub(r"\D", "", self._vision_answer(prompt, b64, detail="high").split("\n")[0])
-            if answer:
-                return answer
+        prompt = self._receipt_prompt_for_type(question or "", qtype)
+        raw = self._vision_answer(prompt, b64, detail="high")
+        answer = self._normalize_receipt_answer(raw, qtype)
 
-        if question and "빈 칸" in question:
-            prompt = (
-                "네이버 로그인 영수증 보안 질문입니다.\n"
-                f"질문: {question}\n"
-                "영수증의 주소·지명 등에서 빈 칸에 들어갈 단어만 출력하세요."
-            )
-            answer = re.sub(r"[^\w가-힣]", "", self._vision_answer(prompt, b64, detail="high").split("\n")[0])
-            if answer:
-                return answer
-
-        if question and any(k in question for k in ("무엇", "이름", "제품", "물건")):
-            prompt = (
-                "네이버 로그인 영수증 보안 질문입니다.\n"
-                f"질문: {question}\n"
-                "영수증 내용을 읽고 질문에 맞는 단어(제품명 등)만 출력하세요."
-            )
-            answer = re.sub(r"[^\w가-힣]", "", self._vision_answer(prompt, b64, detail="high").split("\n")[0])
-            if answer:
-                return answer
-
-        prompt = (
-            "네이버 로그인 영수증 보안 질문입니다. 이미지의 영수증 내용을 읽고 질문에 답하세요.\n"
-            f"질문: {question or '이미지 내용을 바탕으로 요구된 정답을 찾으세요.'}\n"
-            "설명 없이 정답만 출력하세요. 숫자면 숫자만, 문자면 해당 문자만."
-        )
-        answer = self._vision_answer(prompt, b64, detail="high").split("\n")[0].strip()
-        if question and re.search(r"(\d+)번째.*숫자", question):
-            digits = re.sub(r"\D", "", answer)
+        if qtype == "phone_digit" and question:
             pos_match = re.search(r"(\d+)번째", question)
+            digits = re.sub(r"\D", "", answer)
             if pos_match and digits:
                 pos = int(pos_match.group(1)) - 1
                 if 0 <= pos < len(digits):
-                    return digits[pos]
-        if question and any(k in question for k in ("가격", "얼마", "합계", "개수")):
-            digits = re.sub(r"\D", "", answer)
-            if digits:
-                return digits
-        return re.sub(r"[^\w가-힣0-9]", "", answer)
+                    answer = digits[pos]
+
+        if self._validate_receipt_answer(question or "", answer, qtype):
+            return answer
+
+        if retry:
+            self.log(f"영수증 답변 검증 실패({qtype}: '{answer[:30]}') — 재인식")
+            retry_prompt = (
+                f"{prompt}\n\n"
+                "이전 답이 형식에 맞지 않았습니다. 영수증 표를 행 단위로 다시 읽고 "
+                "질문에 정확히 해당하는 값만 출력하세요."
+            )
+            raw2 = self._vision_answer(retry_prompt, b64, detail="high")
+            answer2 = self._normalize_receipt_answer(raw2, qtype)
+            if self._validate_receipt_answer(question or "", answer2, qtype):
+                return answer2
+
+        return answer if answer and not self._is_refusal_answer(answer) else ""
 
     def solve_receipt_captcha(self, naver_pw: str) -> bool:
         """영수증/질문형 보안 화면: 비밀번호 → 정답란 → 확인."""
@@ -2221,35 +2286,52 @@ class NaverReporter:
             return False, "failed"
 
     def _find_inquiry_question(self) -> str:
-        for xpath in [
-            "//*[contains(text(),'빈 칸')]",
+        xpaths = [
+            "//*[contains(text(),'무엇입니까')]",
             "//*[contains(text(),'입니까')]",
+            "//*[contains(text(),'얼마')]",
+            "//*[contains(text(),'빈 칸')]",
+            "//*[contains(text(),'전화번호')]",
+            "//*[contains(text(),'번째 숫자')]",
             "//*[contains(text(),'정답을 입력')]",
-            "//*[contains(text(),'질문에 정답')]",
-        ]:
+        ]
+        for xpath in xpaths:
             try:
                 for el in self.driver.find_elements(By.XPATH, xpath):
-                    text = el.text.strip()
-                    if text and 5 < len(text) < 300:
+                    if not el.is_displayed():
+                        continue
+                    text = (el.text or "").strip()
+                    if 8 < len(text) < 300 and self._is_receipt_captcha_question(text):
                         return text
             except Exception:
                 continue
         return ""
 
     def _find_inquiry_captcha_image(self):
-        for sel in [
+        best = None
+        best_area = 0
+        selectors = [
             "div.InquiryInput img",
             "form img[src]",
             ".captcha img",
             "img[alt*='영수증']",
-        ]:
+            "div.captcha img",
+            ".captcha_box img",
+        ]
+        for sel in selectors:
             try:
                 for img in self.driver.find_elements(By.CSS_SELECTOR, sel):
-                    if img.is_displayed() and img.size.get("width", 0) > 40:
-                        return img
+                    if not img.is_displayed():
+                        continue
+                    w = img.size.get("width", 0) or 0
+                    h = img.size.get("height", 0) or 0
+                    area = w * h
+                    if area > best_area and w >= 80 and h >= 50:
+                        best = img
+                        best_area = area
             except Exception:
                 continue
-        return None
+        return best
 
     def _find_inquiry_answer_input(self):
         skip_ids = {"requiredurl1", "requiredurl2"}
@@ -2283,24 +2365,25 @@ class NaverReporter:
             self.log("추가 질문 있음 — OpenAI 클라이언트 없음")
             return False
 
-        if question:
-            self.log(f"문의 폼 추가 질문: {question}")
-        b64 = self._element_to_b64(img_el) if img_el else None
-        prompt = (
-            "네이버 문의 폼 보안 질문입니다. 이미지(영수증/표)를 참고하여 질문에 답하세요.\n"
-            f"질문: {question or '이미지 내용을 바탕으로 빈 칸에 들어갈 정답을 찾으세요.'}\n"
-            "설명 없이 정답만 출력하세요."
-        )
-        answer = self._vision_answer(prompt, b64).split("\n")[0].strip()
-        if question and any(k in question for k in ("가격", "얼마", "합계", "개수", "몇", "숫자", "번째")):
-            digits = re.sub(r"\D", "", answer)
-            if digits:
-                answer = digits
-        else:
-            answer = re.sub(r"[^\w가-힣]", "", answer)
+        if not img_el:
+            self.log("문의 폼 영수증 이미지 없음")
+            return False
 
+        if question:
+            qtype = self._classify_receipt_question(question)
+            self.log(f"문의 폼 추가 질문({qtype}): {question}")
+        else:
+            qtype = "generic"
+            self.log("문의 폼 추가 질문 — 질문 텍스트 없음, 이미지만 분석")
+
+        answer = self._solve_receipt_answer(question, img_el)
+        if self._is_refusal_answer(answer):
+            self.log("추가 질문 답변 생성 실패 (거절 응답)")
+            self._click_captcha_refresh()
+            return False
         if not answer:
             self.log("추가 질문 답변 생성 실패")
+            self._click_captcha_refresh()
             return False
 
         if not answer_input:

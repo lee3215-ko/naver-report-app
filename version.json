@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.26",
-    "url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/526083103",
-    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.26/NaverReport.zip",
-    "notes":  "신고 항목 등록 오류 수정, 원고 옆 자동URL/수동URL 표시, 등록 창 위치 고정, 상세 내용 붙여넣기 입력",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/526083103",
-    "asset_id":  526083103,
+    "version":  "1.0.27",
+    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.27/NaverReport.zip",
+    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.27/NaverReport.zip",
+    "notes":  "브라우저 선택(기존 Chrome / 실제 Chrome / Edge), 문의 폼 영수증 보안 질문 인식 개선",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/526083103",
-                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.26/NaverReport.zip",
+                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.27/NaverReport.zip",
                           "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip"
                       ]
 }

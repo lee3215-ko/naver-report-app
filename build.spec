@@ -23,6 +23,10 @@ hiddenimports = [
     "selenium.webdriver.chrome.webdriver",
     "selenium.webdriver.chrome.service",
     "selenium.webdriver.chrome.options",
+    "selenium.webdriver.edge",
+    "selenium.webdriver.edge.webdriver",
+    "selenium.webdriver.edge.service",
+    "selenium.webdriver.edge.options",
     "selenium.webdriver.remote.webdriver",
     "selenium.webdriver.remote.webelement",
     "selenium.webdriver.remote.remote_connection",
@@ -34,9 +38,11 @@ hiddenimports = [
     "selenium.common.exceptions",
     "webdriver_manager",
     "webdriver_manager.chrome",
+    "webdriver_manager.microsoft",
     "webdriver_manager.core",
     "webdriver_manager.drivers",
     "webdriver_manager.drivers.chrome",
+    "webdriver_manager.drivers.edge",
 ]
 
 for pkg in ("customtkinter", "selenium", "webdriver_manager"):

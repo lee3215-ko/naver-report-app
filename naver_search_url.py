@@ -2,12 +2,10 @@
 import time
 from urllib.parse import parse_qs, quote, urlparse
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from webdriver_manager.chrome import ChromeDriverManager
+
+from chrome_browser import DEFAULT_BROWSER_MODE, create_webdriver
 
 
 def build_naver_search_url_simple(keyword: str) -> str:
@@ -15,16 +13,6 @@ def build_naver_search_url_simple(keyword: str) -> str:
     if not kw:
         return ""
     return f"https://search.naver.com/search.naver?query={quote(kw)}"
-
-
-def _chrome_options(headless: bool = True) -> Options:
-    opts = Options()
-    if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    return opts
 
 
 def _log_fresh_search_url(log, keyword: str, url: str):
@@ -39,7 +27,7 @@ def _log_fresh_search_url(log, keyword: str, url: str):
         log(f"실시간 검색 [{keyword}] → URL 확보 (tqi·ackey 미포함)")
 
 
-def fetch_naver_search_url_live(keyword: str, driver=None, log=None) -> str:
+def fetch_naver_search_url_live(keyword: str, driver=None, log=None, browser_mode: str = DEFAULT_BROWSER_MODE) -> str:
     """매 호출마다 네이버 검색을 수행해 새 tqi·ackey가 붙은 URL을 반환합니다."""
     kw = (keyword or "").strip()
     if not kw:
@@ -50,10 +38,7 @@ def fetch_naver_search_url_live(keyword: str, driver=None, log=None) -> str:
         log(f"네이버 실시간 검색 중 [{kw}]...")
 
     if owns_driver:
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
-            options=_chrome_options(headless=True),
-        )
+        driver, _info = create_webdriver(browser_mode, headless=True)
 
     try:
         driver.get(f"https://search.naver.com/search.naver?query={quote(kw)}")
@@ -79,7 +64,7 @@ def fetch_naver_search_url_live(keyword: str, driver=None, log=None) -> str:
             driver.quit()
 
 
-def build_naver_search_url(keyword: str, *, driver=None, log=None, live: bool = True) -> str:
+def build_naver_search_url(keyword: str, *, driver=None, log=None, live: bool = True, browser_mode: str = DEFAULT_BROWSER_MODE) -> str:
     if not live:
         return build_naver_search_url_simple(keyword)
-    return fetch_naver_search_url_live(keyword, driver=driver, log=log)
+    return fetch_naver_search_url_live(keyword, driver=driver, log=log, browser_mode=browser_mode)

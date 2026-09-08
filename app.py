@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from urllib.parse import quote
 
+from chrome_browser import BROWSER_MODE_LABELS, DEFAULT_BROWSER_MODE, browser_mode_label, normalize_browser_mode
 from naver_reporter import NaverReporter
 from naver_search_url import build_naver_search_url as resolve_naver_search_url
 from paths import data_path, APP_VERSION, is_admin_mode
@@ -1541,24 +1542,7 @@ class ReportApp:
         ui_button(btn_frame, "+ 신고 항목 등록", "primary", height=44, command=self.open_register_window).pack(side=tk.LEFT, padx=(0, 8))
         ui_button(btn_frame, "선택 삭제", "danger", height=44, command=self.delete_selected_task).pack(side=tk.LEFT, padx=(0, 8))
 
-        hagrid_frame = self._frame(btn_frame, COLORS["card"])
-        hagrid_frame.pack(side=tk.LEFT, padx=(12, 0))
-        self.hagrid_mode_var = tk.BooleanVar(value=False)
-        if ctk:
-            self.hagrid_toggle = ctk.CTkCheckBox(
-                hagrid_frame, text="해그리드 모드 (브라우저 숨김)",
-                variable=self.hagrid_mode_var, font=FONTS["body"],
-                text_color=COLORS["text"], command=self._on_hagrid_toggle,
-            )
-        else:
-            self.hagrid_toggle = tk.Checkbutton(
-                hagrid_frame, text="해그리드 모드 (브라우저 숨김)",
-                variable=self.hagrid_mode_var, font=FONTS["body"],
-                bg=COLORS["card"], fg=COLORS["text"],
-                activebackground=COLORS["card"], activeforeground=COLORS["text"],
-                command=self._on_hagrid_toggle,
-            )
-        self.hagrid_toggle.pack(side=tk.LEFT)
+        self._pack_browser_controls(btn_frame)
 
         self.preview_btn = ui_button(btn_frame, "리라이트 미리보기", "warning", height=44, command=self.preview_all)
         self.preview_btn.pack(side=tk.RIGHT, padx=(8, 0))
@@ -1654,18 +1638,7 @@ class ReportApp:
 
         cafe_btn_frame = self._frame(bottom_card, COLORS["card"])
         cafe_btn_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
-        if ctk:
-            ctk.CTkCheckBox(
-                cafe_btn_frame, text="해그리드 모드 (브라우저 숨김)",
-                variable=self.hagrid_mode_var, font=FONTS["body"],
-                text_color=COLORS["text"],
-            ).pack(side=tk.LEFT, padx=(0, 12))
-        else:
-            tk.Checkbutton(
-                cafe_btn_frame, text="해그리드 모드 (브라우저 숨김)",
-                variable=self.hagrid_mode_var, font=FONTS["body"],
-                bg=COLORS["card"], fg=COLORS["text"],
-            ).pack(side=tk.LEFT, padx=(0, 12))
+        self._pack_browser_controls(cafe_btn_frame, padx=(0, 12))
         self.cafe_report_btn = ui_button(
             cafe_btn_frame, "카페 신고 시작", "success", height=44, command=self.start_cafe_report,
         )
@@ -1768,18 +1741,7 @@ class ReportApp:
 
         blog_btn_frame = self._frame(bottom_card, COLORS["card"])
         blog_btn_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
-        if ctk:
-            ctk.CTkCheckBox(
-                blog_btn_frame, text="해그리드 모드 (브라우저 숨김)",
-                variable=self.hagrid_mode_var, font=FONTS["body"],
-                text_color=COLORS["text"],
-            ).pack(side=tk.LEFT, padx=(0, 12))
-        else:
-            tk.Checkbutton(
-                blog_btn_frame, text="해그리드 모드 (브라우저 숨김)",
-                variable=self.hagrid_mode_var, font=FONTS["body"],
-                bg=COLORS["card"], fg=COLORS["text"],
-            ).pack(side=tk.LEFT, padx=(0, 12))
+        self._pack_browser_controls(blog_btn_frame, padx=(0, 12))
         self.blog_report_btn = ui_button(
             blog_btn_frame, "블로그 신고 시작", "success", height=44, command=self.start_blog_report,
         )
@@ -2154,6 +2116,34 @@ class ReportApp:
                                             state="readonly")
             self.model_combo.grid(row=3, column=0, sticky="ew", pady=(0, 15))
 
+        self._ensure_browser_vars()
+        browser_values = list(BROWSER_MODE_LABELS.values())
+        if ctk:
+            ctk.CTkLabel(api_frame, text="신고 브라우저", font=("맑은 고딕", 10, "bold"),
+                         text_color=COLORS["text_muted"]).grid(row=4, column=0, sticky="w", pady=(0, 5))
+            self.settings_browser_combo = ctk.CTkComboBox(
+                api_frame, values=browser_values, variable=self.browser_mode_var,
+                height=36, state="readonly",
+                command=lambda _v: self._on_browser_mode_change(),
+                border_color=COLORS["input_border"],
+                fg_color=COLORS["input_bg"],
+                text_color=COLORS["text"],
+                button_color=COLORS["accent"],
+                button_hover_color=COLORS["accent_hover"],
+                dropdown_fg_color=COLORS["card"],
+                dropdown_text_color=COLORS["text"],
+            )
+            self.settings_browser_combo.grid(row=5, column=0, sticky="ew", pady=(0, 15))
+        else:
+            tk.Label(api_frame, text="신고 브라우저", font=("맑은 고딕", 10, "bold"),
+                     bg=COLORS["card"], fg=COLORS["text_muted"]).grid(row=4, column=0, sticky="w", pady=(0, 5))
+            self.settings_browser_combo = ttk.Combobox(
+                api_frame, textvariable=self.browser_mode_var,
+                values=browser_values, state="readonly",
+            )
+            self.settings_browser_combo.grid(row=5, column=0, sticky="ew", pady=(0, 15))
+            self.settings_browser_combo.bind("<<ComboboxSelected>>", lambda e: self._on_browser_mode_change())
+
         account_card = self._card(parent)
         account_card.grid(row=1, column=0, sticky="nsew")
         account_card.grid_rowconfigure(1, weight=1)
@@ -2451,6 +2441,10 @@ class ReportApp:
                 self.model_var.set(data.get("model", "gpt-4o"))
                 if hasattr(self, "hagrid_mode_var"):
                     self.hagrid_mode_var.set(data.get("hagrid_mode", False))
+                if hasattr(self, "browser_mode_var"):
+                    self.browser_mode_var.set(
+                        browser_mode_label(data.get("browser_mode", DEFAULT_BROWSER_MODE))
+                    )
                 saved_geom = data.get("window_geometry")
                 if isinstance(saved_geom, dict):
                     self.window_geometry = saved_geom
@@ -2462,10 +2456,66 @@ class ReportApp:
             "api_key": self.api_key_var.get().strip(),
             "model": self.model_var.get(),
             "hagrid_mode": bool(self.hagrid_mode_var.get()) if hasattr(self, "hagrid_mode_var") else False,
+            "browser_mode": self._selected_browser_mode(),
             "window_geometry": getattr(self, "window_geometry", {}),
         }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _ensure_browser_vars(self):
+        if not hasattr(self, "hagrid_mode_var"):
+            self.hagrid_mode_var = tk.BooleanVar(value=False)
+        if not hasattr(self, "browser_mode_var"):
+            self.browser_mode_var = tk.StringVar(value=browser_mode_label(DEFAULT_BROWSER_MODE))
+
+    def _selected_browser_mode(self) -> str:
+        if not hasattr(self, "browser_mode_var"):
+            return DEFAULT_BROWSER_MODE
+        return normalize_browser_mode(self.browser_mode_var.get())
+
+    def _pack_browser_controls(self, parent, padx=(12, 0)):
+        self._ensure_browser_vars()
+        wrap = self._frame(parent, COLORS["card"])
+        wrap.pack(side=tk.LEFT, padx=padx)
+        values = list(BROWSER_MODE_LABELS.values())
+        if ctk:
+            combo = ctk.CTkComboBox(
+                wrap, values=values, variable=self.browser_mode_var,
+                width=148, height=32, state="readonly",
+                command=lambda _v: self._on_browser_mode_change(),
+                font=FONTS["body"],
+                border_color=COLORS["input_border"],
+                fg_color=COLORS["input_bg"],
+                text_color=COLORS["text"],
+                button_color=COLORS["accent"],
+                button_hover_color=COLORS["accent_hover"],
+                dropdown_fg_color=COLORS["card"],
+                dropdown_text_color=COLORS["text"],
+            )
+            combo.pack(side=tk.LEFT, padx=(0, 10))
+            ctk.CTkCheckBox(
+                wrap, text="해그리드 모드 (브라우저 숨김)",
+                variable=self.hagrid_mode_var, font=FONTS["body"],
+                text_color=COLORS["text"], command=self._on_hagrid_toggle,
+            ).pack(side=tk.LEFT)
+        else:
+            combo = ttk.Combobox(
+                wrap, textvariable=self.browser_mode_var,
+                values=values, state="readonly", width=16,
+            )
+            combo.pack(side=tk.LEFT, padx=(0, 10))
+            combo.bind("<<ComboboxSelected>>", lambda e: self._on_browser_mode_change())
+            tk.Checkbutton(
+                wrap, text="해그리드 모드 (브라우저 숨김)",
+                variable=self.hagrid_mode_var, font=FONTS["body"],
+                bg=COLORS["card"], fg=COLORS["text"],
+                activebackground=COLORS["card"], activeforeground=COLORS["text"],
+                command=self._on_hagrid_toggle,
+            ).pack(side=tk.LEFT)
+
+    def _on_browser_mode_change(self):
+        self.save_settings()
+        self.log(f"브라우저: {browser_mode_label(self._selected_browser_mode())}")
 
     def _on_hagrid_toggle(self):
         self.save_settings()
@@ -4053,6 +4103,7 @@ class ReportApp:
                 api_key=api_key or "cafe-only",
                 model=self.model_var.get(),
                 headless=bool(self.hagrid_mode_var.get()),
+                browser_mode=self._selected_browser_mode(),
                 log_callback=on_log,
                 result_callback=on_result,
                 progress_callback=on_progress,
@@ -4188,6 +4239,7 @@ class ReportApp:
                 api_key=api_key or "blog-only",
                 model=self.model_var.get(),
                 headless=bool(self.hagrid_mode_var.get()),
+                browser_mode=self._selected_browser_mode(),
                 log_callback=on_log,
                 result_callback=on_result,
                 progress_callback=on_progress,
@@ -4300,6 +4352,7 @@ class ReportApp:
                     api_key=api_key,
                     model=self.model_var.get(),
                     headless=bool(self.hagrid_mode_var.get()),
+                    browser_mode=self._selected_browser_mode(),
                     log_callback=on_log,
                     result_callback=on_result,
                     progress_callback=on_progress,
