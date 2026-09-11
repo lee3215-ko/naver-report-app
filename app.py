@@ -3,6 +3,8 @@ from tkinter import ttk, messagebox
 import json
 import os
 import re
+import random
+import string
 import threading
 import time
 from datetime import datetime
@@ -1439,6 +1441,7 @@ class ReportApp:
         self.load_blog_urls()
         self.load_blog_results()
         self._report_running = False
+        self._booster_running = False
         self._cafe_running = False
         self._blog_running = False
         self._preview_running = False
@@ -1614,6 +1617,11 @@ class ReportApp:
         self.stop_report_btn.configure(state=tk.DISABLED)
         self.report_btn = ui_button(right_btns, "신고 시작", "success", height=44, command=self.start_report)
         self.report_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.booster_report_btn = ui_button(
+            right_btns, "부스터 신고 시작", "warning", width=168, height=44,
+            command=self.start_booster_report,
+        )
+        self.booster_report_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         prog_frame = self._frame(bottom_card, COLORS["card"])
         prog_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
@@ -2271,6 +2279,15 @@ class ReportApp:
             row=0, column=2, sticky="ew", padx=(0, 8))
         ui_button(add_frame, "선택 삭제", "danger", height=38, command=self.delete_selected_account).grid(
             row=0, column=3, sticky="ew")
+        ui_button(
+            add_frame, "랜덤 생성 (10개)", "warning", height=38, command=self.generate_random_accounts,
+        ).grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ui_label(
+            add_frame,
+            "아이디·비밀번호 10쌍을 무작위로 만들어 계정 목록에 추가합니다. (부스터 이메일용)",
+            "caption",
+            COLORS["text_light"],
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
     # ===================== Log Tab =====================
     _LOG_CHANNEL_LABELS = {
@@ -2279,6 +2296,11 @@ class ReportApp:
         "blog": "블로그",
         "cafe": "카페",
     }
+
+    def _log_channel_title(self, channel: str) -> str:
+        if channel == "website" and getattr(self, "_booster_running", False):
+            return "부스터"
+        return self._LOG_CHANNEL_LABELS.get(channel, channel)
 
     def _make_log_textbox(self, parent, *, pack_fill: bool = True):
         if ctk:
@@ -2479,7 +2501,7 @@ class ReportApp:
             self._job_ui[ch] = {"count": count, "account": account, "bar": bar, "skip": skip}
         self._refresh_job_status_ui()
 
-    def _begin_job(self, channel: str, total: int):
+    def _begin_job(self, channel: str, total: int, booster: bool = False):
         st = self._job_status.get(channel)
         if not st:
             return
@@ -2491,6 +2513,7 @@ class ReportApp:
             "stopped": False,
             "skipped": [],
             "skipping": "",
+            "booster": bool(booster),
         })
         self._refresh_job_status_ui()
 
@@ -2578,14 +2601,16 @@ class ReportApp:
             stopped = bool(st.get("stopped"))
             skipped = list(st.get("skipped") or [])
             skipping = st.get("skipping") or ""
+            booster = bool(st.get("booster"))
             if running:
-                count_text = f"{done} / {total} 진행 중" if total else f"{done}건 진행 중"
+                kind = "부스터 신고" if booster else "진행"
+                count_text = f"{done} / {total} {kind} 중" if total else f"{done}건 {kind} 중"
                 if skipped:
                     count_text += f" · 건너뜀 {len(skipped)}"
                 if skipping and skipping == account:
                     account_text = f"아이디  {account}  ·  보호조치 건너뜀"
                 elif account:
-                    account_text = f"아이디  {account}"
+                    account_text = f"아이디  {account}" + ("  ·  이메일 신고" if booster else "")
                 else:
                     account_text = "아이디  —"
             elif stopped and total:
@@ -2601,6 +2626,8 @@ class ReportApp:
             else:
                 count_text = "대기 중"
                 account_text = ""
+            if booster and not running and total and done >= total and not stopped:
+                count_text = f"{total} / {total} 부스터 완료"
             widgets["count"].configure(text=count_text)
             widgets["account"].configure(text=account_text)
             skip_widget = widgets.get("skip")
@@ -2643,7 +2670,7 @@ class ReportApp:
             self.log_single_frame.grid_remove()
             self.log_split_frame.grid()
             active = [c for c in ("website", "blog", "cafe") if c in self._log_active_channels]
-            labels = " · ".join(self._LOG_CHANNEL_LABELS.get(c, c) for c in active)
+            labels = " · ".join(self._log_channel_title(c) for c in active)
             self.log_layout_hint.configure(text=f"분할 표시 — {labels}")
             col_map = {ch: i for i, ch in enumerate(active)}
             for ch, col_frame in self._log_channel_cols.items():
@@ -2668,7 +2695,7 @@ class ReportApp:
             if self._log_active_channels:
                 only = next(iter(self._log_active_channels))
                 self.log_layout_hint.configure(
-                    text=f"{self._LOG_CHANNEL_LABELS.get(only, only)} 진행 중"
+                    text=f"{self._log_channel_title(only)} 진행 중"
                 )
             else:
                 self.log_layout_hint.configure(text="")
@@ -2703,7 +2730,7 @@ class ReportApp:
         if channel == "general" or channel in self._log_active_channels or not self._log_active_channels:
             self._append_log_widget(self._log_widgets["single"], message)
         else:
-            tag = self._LOG_CHANNEL_LABELS.get(channel, channel)
+            tag = self._log_channel_title(channel)
             self._append_log_widget(self._log_widgets["single"], f"[{tag}] {message}")
 
     def _toggle_log_scroll_lock(self):
@@ -4405,6 +4432,30 @@ class ReportApp:
         self.log(f"계정 일괄 등록: {added}개 추가, {skipped}개 중복 스킵")
         messagebox.showinfo("완료", f"{added}개 계정이 등록되었습니다.")
 
+    def generate_random_accounts(self, count: int = 10):
+        letters = string.ascii_lowercase
+        alnum = string.ascii_lowercase + string.digits
+        pw_chars = string.ascii_letters + string.digits
+        existing = {acc.get("id", "") for acc in self.accounts}
+        added = []
+        guard = 0
+        while len(added) < count and guard < 80:
+            guard += 1
+            uid = random.choice(letters) + "".join(random.choices(alnum, k=random.randint(7, 10)))
+            if uid in existing:
+                continue
+            password = "".join(random.choices(pw_chars, k=random.randint(10, 14)))
+            self.accounts.append({"id": uid, "password": password})
+            existing.add(uid)
+            added.append(uid)
+        if not added:
+            messagebox.showwarning("등록 없음", "랜덤 계정을 만들지 못했습니다.")
+            return
+        self.save_accounts()
+        self.refresh_account_list()
+        self.log(f"랜덤 계정 {len(added)}개 추가: {', '.join(added)}")
+        messagebox.showinfo("완료", f"랜덤 계정 {len(added)}개를 추가했습니다.")
+
     def delete_selected_account(self):
         selected = self.account_tree.selection()
         if not selected:
@@ -4574,12 +4625,18 @@ class ReportApp:
                     stop_btn.configure(state=tk.NORMAL if running else tk.DISABLED)
                 except Exception:
                     pass
+        booster_btn = getattr(self, "booster_report_btn", None)
+        if booster_btn is not None:
+            try:
+                booster_btn.configure(state=tk.DISABLED if self._report_running else tk.NORMAL)
+            except Exception:
+                pass
 
     def stop_website_report(self):
         if not self._report_running:
             return
         self._website_stop_requested = True
-        self.log("[웹사이트 신고 정지] 브라우저를 즉시 종료합니다...")
+        self.log("[웹사이트 신고 정지] 브라우저를 즉시 종료합니다..." if not self._booster_running else "[부스터 신고 정지] 브라우저를 즉시 종료합니다...")
         try:
             self.stop_report_btn.configure(state=tk.DISABLED)
         except Exception:
@@ -4909,7 +4966,10 @@ class ReportApp:
     def generate_variants(self, site_url, report_type, templates, api_key, model):
         return self.generate_variants_with_account(site_url, report_type, templates, api_key, model, "default")
 
-    def start_report(self):
+    def start_booster_report(self):
+        self.start_report(booster=True)
+
+    def start_report(self, booster: bool = False):
         self.save_settings()
         api_key = self.api_key_var.get().strip()
         if not api_key:
@@ -4926,14 +4986,23 @@ class ReportApp:
 
         total = len(self.accounts) * len(self.tasks)
         self.log("=" * 55, channel="website")
-        self.log(f"신고 시작 | 항목:{len(self.tasks)}개, 계정:{len(self.accounts)}개, 총:{total}개", channel="website")
+        if booster:
+            self.log(
+                f"부스터 신고 시작 | 로그인 생략 · 이메일만 입력 | "
+                f"항목:{len(self.tasks)}개, 계정:{len(self.accounts)}개, 총:{total}개",
+                channel="website",
+            )
+            self.log("부스터 — 신고 페이지에서 @gmail.com 이메일만 사용합니다", channel="website")
+        else:
+            self.log(f"신고 시작 | 항목:{len(self.tasks)}개, 계정:{len(self.accounts)}개, 총:{total}개", channel="website")
         self._report_running = True
+        self._booster_running = bool(booster)
         self._website_stop_requested = False
         self._website_reporter = None
         self._register_log_channel("website")
         self._sync_report_buttons()
         self.progress["value"] = 0
-        self._begin_job("website", total)
+        self._begin_job("website", total, booster=booster)
 
         def on_log(message):
             self.root.after(0, lambda m=message: self.log(m, channel="website"))
@@ -4978,13 +5047,9 @@ class ReportApp:
 
         def run():
             stopped = False
-            for account in self.accounts:
-                if self._website_stop_requested:
-                    stopped = True
-                    break
-                account_id = account["id"]
-                on_log(f"[계정 시작] {account_id}")
-                reporter = NaverReporter(
+            shared = None
+            if booster:
+                shared = NaverReporter(
                     api_key=api_key,
                     model=self.model_var.get(),
                     headless=bool(self.hagrid_mode_var.get()),
@@ -4992,20 +5057,50 @@ class ReportApp:
                     log_callback=on_log,
                     result_callback=on_result,
                     progress_callback=on_progress,
+                    booster_mode=True,
                 )
-                self._website_reporter = reporter
-                try:
-                    reporter.report(account_id, account["password"], self.tasks)
-                    if reporter.cancel_requested or self._website_stop_requested:
+                self._website_reporter = shared
+            try:
+                for account in self.accounts:
+                    if self._website_stop_requested:
                         stopped = True
-                except Exception as e:
-                    on_log(f"[{account_id}] 처리 오류: {e}")
-                finally:
+                        break
+                    account_id = account["id"]
+                    on_log(f"[계정 시작] {account_id}" + (" (부스터)" if booster else ""))
+                    reporter = shared or NaverReporter(
+                        api_key=api_key,
+                        model=self.model_var.get(),
+                        headless=bool(self.hagrid_mode_var.get()),
+                        browser_mode=self._selected_browser_mode(),
+                        log_callback=on_log,
+                        result_callback=on_result,
+                        progress_callback=on_progress,
+                    )
+                    if not booster:
+                        self._website_reporter = reporter
+                    try:
+                        reporter.report(
+                            account_id, account["password"], self.tasks,
+                            keep_driver=bool(booster),
+                        )
+                        if reporter.cancel_requested or self._website_stop_requested:
+                            stopped = True
+                    except Exception as e:
+                        on_log(f"[{account_id}] 처리 오류: {e}")
+                    finally:
+                        if not booster:
+                            self._website_reporter = None
+                    on_log(f"[계정 완료] {account_id}" + (" (부스터)" if booster else ""))
+                    if self._website_stop_requested:
+                        stopped = True
+                        break
+            finally:
+                if shared is not None:
+                    try:
+                        shared.quit_driver()
+                    except Exception:
+                        pass
                     self._website_reporter = None
-                on_log(f"[계정 완료] {account_id}")
-                if self._website_stop_requested:
-                    stopped = True
-                    break
             self.root.after(0, lambda: self.report_finished(stopped=stopped))
 
         threading.Thread(target=run, daemon=True).start()
@@ -5016,7 +5111,9 @@ class ReportApp:
             self.log(f"   {line}")
 
     def report_finished(self, stopped: bool = False):
+        was_booster = bool(getattr(self, "_booster_running", False))
         self._report_running = False
+        self._booster_running = False
         self._website_stop_requested = False
         self._website_reporter = None
         self._unregister_log_channel("website")
@@ -5026,9 +5123,9 @@ class ReportApp:
             self.progress.configure(value=100)
         self.log("=" * 55, channel="website")
         if stopped:
-            self.log("신고 작업이 중단되었습니다.", channel="website")
+            self.log("부스터 신고가 중단되었습니다." if was_booster else "신고 작업이 중단되었습니다.", channel="website")
         else:
-            self.log("신고 내용 생성 완료", channel="website")
+            self.log("부스터 신고 완료" if was_booster else "신고 내용 생성 완료", channel="website")
         stats = self.compute_site_report_stats()
         protected_accounts = set()
         for info in stats.values():

@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.28",
-    "url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/556209566",
-    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.28/NaverReport.zip",
-    "notes":  "진행 현황 게이지·보호조치 건너뜀 표시, 실행 로그 스크롤 잠금·전체 복사, 리라이트 결과 UI 정리, 종류신고/유형 기억, 네이버 홈 다른 계정 로그아웃 후 진행",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/556209566",
-    "asset_id":  556209566,
+    "version":  "1.0.29",
+    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.29/NaverReport.zip",
+    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.29/NaverReport.zip",
+    "notes":  "부스터 신고: @gmail.com만 사용, 검색 Chrome 생략으로 자동 URL 즉시 생성, 입력·대기 가속. 일반 신고 대기 단축, 로그인 확인 깜빡임 완화, 랜덤 계정 생성",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/556209566",
-                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.28/NaverReport.zip",
+                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.29/NaverReport.zip",
                           "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip"
                       ]
 }

@@ -40,7 +40,9 @@ class NaverReporter:
                  browser_mode: str = "chrome",
                  log_callback=None,
                  result_callback=None,
-                 progress_callback=None):
+                 progress_callback=None,
+                 booster_mode: bool = False,
+                 delay_scale: float | None = None):
         self.api_key = api_key
         self.model = model
         self.headless = headless
@@ -48,6 +50,11 @@ class NaverReporter:
         self.log_callback = log_callback or print
         self.result_callback = result_callback
         self.progress_callback = progress_callback
+        self.booster_mode = bool(booster_mode)
+        if delay_scale is None:
+            self.delay_scale = 0.10 if self.booster_mode else 0.62
+        else:
+            self.delay_scale = max(0.05, float(delay_scale))
         self.driver = None
         self.cancel_requested = False
         self._last_popup_message = ""
@@ -59,9 +66,11 @@ class NaverReporter:
         self._inquiry_window = ""
         self._search_window = ""
         self._search_driver = None
+        self._booster_url_cache = {}
         self._current_naver_id = ""
         self._guest_email_used = False
         self._guest_email_address = ""
+        self._booster_email = ""
 
     def request_cancel(self):
         self.cancel_requested = True
@@ -96,10 +105,19 @@ class NaverReporter:
 
     def log(self, message):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_callback(f"[{ts}] {message}")
+        prefix = "[부스터] " if self.booster_mode else ""
+        self.log_callback(f"[{ts}] {prefix}{message}")
 
     def _human_delay(self, min_sec: float = 0.8, max_sec: float = 2.5):
-        self._interruptible_sleep(random.uniform(min_sec, max_sec))
+        if getattr(self, "booster_mode", False):
+            lo = max(0.02, min_sec * self.delay_scale)
+            hi = max(lo, max_sec * self.delay_scale)
+            self._interruptible_sleep(random.uniform(lo, min(hi, 0.18)))
+            return
+        scale = getattr(self, "delay_scale", 1.0)
+        lo = max(0.04, min_sec * scale)
+        hi = max(lo, max_sec * scale)
+        self._interruptible_sleep(random.uniform(lo, hi))
 
     def _cafe_fast_delay(self, min_sec: float = 0.08, max_sec: float = 0.22):
         """카페 신고 팝업 — 짧은 대기."""
@@ -242,18 +260,36 @@ class NaverReporter:
             return raw
         return f"{raw}@naver.com"
 
+    def _random_booster_email(self, naver_id: str) -> str:
+        local = (naver_id or "").strip()
+        if "@" in local:
+            local = local.split("@", 1)[0]
+        if not local:
+            return ""
+        return f"{local}@gmail.com"
+
+    def _guest_report_email(self, naver_id: str) -> str:
+        if self.booster_mode:
+            if not self._booster_email:
+                self._booster_email = self._random_booster_email(naver_id)
+            return self._booster_email
+        return self._naver_inquiry_email(naver_id)
+
     def _fill_guest_inquiry_email(self, naver_id: str) -> bool:
-        """로그인 풀린 신고 폼이면 아이디@naver.com 을 넣고 계속 진행합니다."""
+        """로그인 풀린 신고 폼이면 이메일을 넣고 계속 진행합니다."""
         email_el = self._inquiry_guest_email_field()
         if not email_el:
             return True
-        email = self._naver_inquiry_email(naver_id)
+        email = self._guest_report_email(naver_id)
         if not email:
             self.log("비로그인 신고 — 이메일을 만들 아이디가 없습니다")
             return False
         current = self._read_element_value(email_el)
         if not self._guest_email_used:
-            self.log(f"로그인 풀림 — 이메일로 신고 진행 ({email})")
+            if self.booster_mode:
+                self.log(f"부스터 — 이메일만 입력하고 신고 진행 ({email})")
+            else:
+                self.log(f"로그인 풀림 — 이메일로 신고 진행 ({email})")
         self._guest_email_used = True
         self._guest_email_address = email
         if current.lower() == email.lower():
@@ -274,6 +310,13 @@ class NaverReporter:
     def _go_to_inquiry_page(self):
         self._switch_to_handle(self._inquiry_window)
         if self._is_on_inquiry_form():
+            return
+        if self.booster_mode:
+            self.log("부스터 — 신고 작성 페이지로 바로 이동")
+            self._open_url_with_referrer(self.INQUIRY_FORM_URL)
+            self._human_delay(0.6, 1.1)
+            wait = self._wait(18)
+            wait.until(EC.visibility_of_element_located((By.ID, "requiredUrl1")))
             return
         if self._inquiry_session_lost():
             self._open_inquiry_as_guest()
@@ -455,6 +498,18 @@ class NaverReporter:
             return ""
         from naver_search_url import build_naver_search_url_simple, _log_fresh_search_url
 
+        if self.booster_mode:
+            cache = getattr(self, "_booster_url_cache", None)
+            if cache is None:
+                cache = {}
+                self._booster_url_cache = cache
+            if kw in cache:
+                return cache[kw]
+            url = build_naver_search_url_simple(kw)
+            cache[kw] = url
+            self.log(f"부스터 — 자동 URL 즉시 생성 (검색 브라우저 생략) {url[:90]}")
+            return url
+
         inquiry_handle = self._current_window_handle()
         self._remember_inquiry_tab()
         url = ""
@@ -478,6 +533,8 @@ class NaverReporter:
         return url
 
     def _ensure_search_driver(self):
+        if self.booster_mode:
+            return None
         if self._search_driver:
             return self._search_driver
         try:
@@ -1023,11 +1080,15 @@ class NaverReporter:
             or self._find_inquiry_answer_input()
         )
 
-    def _wait_submit_success(self, timeout: int = 30) -> bool:
+    def _wait_submit_success(self, timeout: int | None = None) -> bool:
+        if timeout is None:
+            timeout = 10 if self.booster_mode else 30
         self.log("신고 접수 완료 확인 대기...")
         end = time.time() + timeout
+        poll = 0.12 if self.booster_mode else 0.5
+        alert_wait = 0.12 if self.booster_mode else 0.8
         while time.time() < end:
-            alert_text = self._accept_alert(timeout=0.8)
+            alert_text = self._accept_alert(timeout=alert_wait)
             if alert_text and self._is_wrong_captcha_alert(alert_text):
                 self.log("접수 대기 중 오답 팝업 감지")
                 return False
@@ -1050,7 +1111,7 @@ class NaverReporter:
                 self.log("신고 접수 완료 확인")
                 return True
 
-            time.sleep(0.5)
+            time.sleep(poll)
 
         self.log("신고 접수 완료 확인 실패")
         return False
@@ -1070,6 +1131,17 @@ class NaverReporter:
         self._clear_like_human(element)
 
     def _click_element(self, element):
+        if self.booster_mode:
+            try:
+                element.click()
+                return
+            except Exception:
+                pass
+            try:
+                self.driver.execute_script("arguments[0].click();", element)
+            except Exception:
+                pass
+            return
         try:
             ActionChains(self.driver).move_to_element(element).pause(
                 random.uniform(0.12, 0.35)
@@ -1573,46 +1645,21 @@ class NaverReporter:
             pass
 
     def _logout_naver(self) -> bool:
-        clicked = False
-        selectors = [
-            (By.CSS_SELECTOR, "a.MyView-module__btn_logout___bsTOJ"),
-            (By.CSS_SELECTOR, "[class*='btn_logout']"),
-            (By.CSS_SELECTOR, "#gnb_logout_button"),
-            (By.CSS_SELECTOR, "a[href*='nidlogin.logout']"),
-            (By.XPATH, "//a[contains(.,'로그아웃')]"),
-            (By.XPATH, "//button[contains(.,'로그아웃')]"),
-        ]
-        self._expand_naver_home_account_panel()
-        for by, sel in selectors:
-            try:
-                for el in self.driver.find_elements(by, sel):
-                    if not el.is_displayed():
-                        continue
-                    self._click_element(el)
-                    clicked = True
-                    self.log("네이버 홈 → 로그아웃 클릭")
-                    self._human_delay(1.2, 2.2)
-                    break
-            except Exception:
-                continue
-            if clicked:
-                break
-        if not clicked:
-            logout_url = (
-                "https://nid.naver.com/nidlogin.logout"
-                f"?returl={quote(self.NAVER_HOME_URL, safe='')}"
-            )
-            self.log("로그아웃 URL로 세션 종료")
-            self.driver.get(logout_url)
-            self._human_delay(1.4, 2.4)
-        current = (self.driver.current_url or "")
-        if "www.naver.com" not in current:
-            self.driver.get(self.NAVER_HOME_URL)
-            self._human_delay(1.0, 1.8)
+        logout_url = (
+            "https://nid.naver.com/nidlogin.logout"
+            f"?returl={quote(self.NAVER_HOME_URL, safe='')}"
+        )
+        self.log("로그아웃 URL로 세션 종료")
+        self.driver.get(logout_url)
+        self._wait_until(
+            lambda: "www.naver.com" in (self.driver.current_url or "") and not self._is_logged_in(),
+            timeout=8,
+            interval=0.25,
+        )
         if self._is_logged_in():
             self._clear_naver_session_cookies()
             self.driver.get(self.NAVER_HOME_URL)
-            self._human_delay(1.0, 1.8)
+            self._human_delay(0.3, 0.6)
         return not self._is_logged_in()
 
     def _align_naver_home_account(self, naver_id: str) -> str:
@@ -1622,30 +1669,28 @@ class NaverReporter:
         wanted = self._normalize_naver_id(naver_id)
         self.log("네이버 홈에서 로그인 계정 확인")
         self.driver.get(self.NAVER_HOME_URL)
-        self._human_delay(1.6, 2.8)
+        self._wait_until(
+            lambda: "www.naver.com" in (self.driver.current_url or ""),
+            timeout=10,
+            interval=0.2,
+        )
+        self._human_delay(0.35, 0.7)
         if not self._is_logged_in():
             self.log("네이버 홈 — 로그인되어 있지 않음")
             return "guest"
         current = self._detect_naver_home_id()
-        if not current:
-            current = self._detect_naver_id_from_myinfo()
-            try:
-                self.driver.get(self.NAVER_HOME_URL)
-                self._human_delay(1.0, 1.8)
-            except Exception:
-                pass
         if current and current == wanted:
             self.log(f"네이버 홈 — 이미 설정 계정으로 로그인됨 ({naver_id})")
             return "same"
         if current:
             self.log(f"네이버 홈 — 다른 계정 로그인 ({current} ≠ {naver_id}) → 로그아웃")
         else:
-            self.log(f"네이버 홈 — 로그인되어 있으나 아이디가 설정과 다름 → 로그아웃 후 {naver_id}로 진행")
+            self.log(f"네이버 홈 — 로그인되어 있으나 아이디 확인 불가로 로그아웃 후 {naver_id}로 진행")
         if not self._logout_naver():
             self.log("로그아웃 확인 실패 — 세션 쿠키 정리 후 진행")
             self._clear_naver_session_cookies()
             self.driver.get(self.NAVER_HOME_URL)
-            self._human_delay(1.0, 1.8)
+            self._human_delay(0.4, 0.8)
         return "logged_out"
 
     def _is_logged_in(self) -> bool:
@@ -2219,6 +2264,9 @@ class NaverReporter:
                 self._human_delay(0.3, 0.6)
 
     def _type_into_element(self, element, text: str, label: str = "입력"):
+        if self.booster_mode:
+            self._paste_into_element(element, text, label=label)
+            return
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
         time.sleep(0.15)
         try:
@@ -3326,7 +3374,8 @@ class NaverReporter:
         try:
             self._go_to_inquiry_page()
             wait = self._wait(15)
-            self._human_delay(0.8, 1.5)
+            if not self.booster_mode:
+                self._human_delay(0.8, 1.5)
 
             if self._inquiry_guest_email_field() or self._inquiry_login_buttons():
                 if not self._fill_guest_inquiry_email(account_id):
@@ -3418,11 +3467,14 @@ class NaverReporter:
             if self.progress_callback:
                 self.progress_callback(1)
 
-    def report(self, naver_id: str, naver_pw: str, tasks: list) -> list:
+    def report(self, naver_id: str, naver_pw: str, tasks: list, keep_driver: bool = False) -> list:
         """한 계정으로 모든 task를 처리합니다."""
         results = []
         try:
-            self.start_driver()
+            if self.booster_mode:
+                return self._report_booster(naver_id, naver_pw, tasks)
+            if not self.driver:
+                self.start_driver()
             ok, reason = self.login(naver_id, naver_pw, from_inquiry=True)
             if not ok:
                 if reason == "protected":
@@ -3502,7 +3554,71 @@ class NaverReporter:
                     self.progress_callback(1)
                 self._human_delay(2.0, 4.5)
         finally:
-            self.quit_driver()
+            if not keep_driver:
+                self.quit_driver()
+        return results
+
+    def _report_booster(self, naver_id: str, naver_pw: str, tasks: list) -> list:
+        results = []
+        if not self.driver:
+            self.start_driver()
+        self._current_naver_id = naver_id
+        self._guest_email_used = False
+        self._guest_email_address = ""
+        self._booster_email = self._random_booster_email(naver_id)
+        self.log(f"부스터 신고 진행 — 로그인 생략, 신고 페이지에서 이메일만 입력 ({self._booster_email})")
+        self._open_url_with_referrer(self.INQUIRY_FORM_URL)
+        self._human_delay(0.5, 0.9)
+        try:
+            self._wait(18).until(lambda d: self._is_on_inquiry_form() or bool(self._inquiry_guest_email_field()))
+        except TimeoutException:
+            self.log("부스터 — 신고 페이지 로드 실패")
+            return results
+        self._remember_inquiry_tab()
+        # 부스터는 검색용 Chrome을 띄우지 않고 자동 URL을 즉시 생성합니다.
+
+        for idx, task in enumerate(tasks):
+            if self._should_stop():
+                self.log("사용자 요청으로 부스터 신고 중단")
+                break
+            site = task.get("site", "")
+            report_type = task.get("report_type", "")
+            template = task.get("template", "")
+            search_url = task.get("search_url", "") or site
+            search_url_custom = task.get("search_url_custom", False)
+            search_url_auto = task.get("search_url_auto", False)
+            inquiry_category = task.get("inquiry_category", "illegal")
+            if search_url_auto and report_type:
+                search_url = self._collect_auto_search_url(report_type) or search_url
+            rewritten = self._rewrite(template, naver_id, site, report_type)
+            self.log(f"[{naver_id}] {idx + 1}/{len(tasks)} 리라이트 완료 ({len(rewritten)}자)")
+            success = self.fill_form(
+                site, report_type, rewritten,
+                search_url=search_url,
+                inquiry_category=inquiry_category,
+                naver_id=naver_id,
+            )
+            dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            results.append({
+                "account_id": naver_id,
+                "account_password": naver_pw,
+                "site": site,
+                "report_type": report_type,
+                "original": template,
+                "rewritten": rewritten,
+                "datetime": dt,
+                "success": success,
+                "search_url": search_url,
+                "search_url_custom": search_url_custom,
+                "search_url_auto": search_url_auto,
+                "login_mode": "email",
+                "guest_email": self._guest_email_address or self._booster_email,
+            })
+            if self.result_callback:
+                self.result_callback(results[-1])
+            if self.progress_callback:
+                self.progress_callback(1)
+            self._human_delay(0.4, 0.9)
         return results
 
     CAFE_SEARCH_URL = "https://search.naver.com/search.naver?ssc=tab.ur.all&query="
