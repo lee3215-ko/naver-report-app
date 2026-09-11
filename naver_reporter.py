@@ -9,6 +9,7 @@ from urllib.parse import quote, urlparse, urlunparse
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
@@ -20,7 +21,7 @@ from selenium.common.exceptions import (
     WebDriverException,
     UnexpectedAlertPresentException,
 )
-from chrome_browser import create_webdriver, normalize_browser_mode
+from chrome_browser import create_webdriver, normalize_browser_mode, quit_webdriver
 from naver_search_url import fetch_naver_search_url_live
 
 
@@ -30,6 +31,7 @@ class NaverReporter:
     INQUIRY_FORM_URL = (
         "https://help.naver.com/inquiry/input.help?categoryNo=5749&serviceNo=5626&lang=ko"
     )
+    HELP_HOME_URL = "https://help.naver.com/"
 
     def __init__(self,
                  api_key: str,
@@ -52,16 +54,23 @@ class NaverReporter:
         self._last_login_restriction_reason = ""
         self._last_login_restriction_date = ""
         self.client = self._openai_client()
+        self._warmup_search_url = ""
+        self._warmup_search_type = ""
+        self._inquiry_window = ""
+        self._search_window = ""
+        self._search_driver = None
+        self._current_naver_id = ""
+        self._guest_email_used = False
+        self._guest_email_address = ""
 
     def request_cancel(self):
         self.cancel_requested = True
-        if self.driver:
+        if self.driver or self._search_driver:
             self.log("작업 중단 — 브라우저 종료")
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
+            quit_webdriver(self.driver)
             self.driver = None
+            quit_webdriver(self._search_driver)
+            self._search_driver = None
 
     def _should_stop(self) -> bool:
         return self.cancel_requested
@@ -124,14 +133,431 @@ class NaverReporter:
         except Exception:
             return False
 
+    def _inquiry_login_buttons(self):
+        found = []
+        selectors = [
+            (By.CSS_SELECTOR, "button.InquiryInput_login_link__hGz_Z"),
+            (By.CSS_SELECTOR, "button[class*='InquiryInput_login_link']"),
+            (By.CSS_SELECTOR, "a[class*='InquiryInput_login_link']"),
+            (By.XPATH, "//button[normalize-space()='로그인하기']"),
+            (By.XPATH, "//a[normalize-space()='로그인하기']"),
+        ]
+        seen = set()
+        for by, sel in selectors:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    try:
+                        key = el.id
+                    except Exception:
+                        key = id(el)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if el.is_displayed() and el.is_enabled():
+                        found.append(el)
+            except Exception:
+                continue
+        return found
+
+    def _click_inquiry_login_button(self) -> bool:
+        for el in self._inquiry_login_buttons():
+            try:
+                self._click_element(el)
+                self.log("신고 페이지 → 로그인하기 클릭")
+                self._human_delay(1.5, 2.8)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _open_login_from_inquiry_page(self, skip_home: bool = False) -> bool:
+        """신고 작성 페이지에 먼저 들어간 뒤 '로그인하기'로 nid 로그인."""
+        if not skip_home:
+            self.log("네이버 홈 접속 후 신고 작성 페이지로 이동")
+            self.driver.get(self.NAVER_HOME_URL)
+            self._human_delay(1.6, 2.8)
+        self.log(f"신고 작성 페이지 접속: {self.INQUIRY_FORM_URL}")
+        self.driver.get(self.INQUIRY_FORM_URL)
+        self._human_delay(1.8, 3.2)
+        try:
+            self._wait(20).until(
+                lambda d: self._is_on_inquiry_form() or bool(self._inquiry_login_buttons())
+            )
+        except TimeoutException:
+            self.log("신고 페이지 로드 실패")
+            return False
+        if not self._inquiry_login_buttons():
+            if self._is_on_inquiry_form() and self._has_naver_session_cookie():
+                self.log("신고 페이지 — 이미 로그인된 상태")
+                return True
+            self.log("로그인하기 버튼을 찾지 못함")
+            return False
+        if not self._click_inquiry_login_button():
+            return False
+        if self._wait_until(
+            lambda: self._is_on_login_page() or self._has_login_form(),
+            timeout=15,
+        ):
+            return True
+        self.log("로그인하기 클릭 후 로그인 페이지가 열리지 않음")
+        return False
+
+    def _ensure_naver_web_context(self):
+        """help.naver.com 진입 전에 *.naver.com 페이지에 머무르게 합니다."""
+        current = (self.driver.current_url or "")
+        if "naver.com" in current and "nid.naver.com" not in current:
+            return
+        self.driver.get(self.NAVER_HOME_URL)
+        self.log("세션 유지 — 네이버 홈으로 복귀")
+        self._human_delay(1.5, 2.8)
+
+    def _open_url_with_referrer(self, url: str):
+        """일반 주소 이동. 숨은 링크 삽입·CDP 강제 이동은 자동화 탐지에 잘 잡힙니다."""
+        self.driver.get(url)
+
+    def _inquiry_session_lost(self) -> bool:
+        return self._is_on_login_page() or self._has_login_form()
+
+    def _inquiry_guest_email_field(self):
+        try:
+            el = self.driver.find_element(By.ID, "mocustomerEmail")
+            if el.is_displayed() and el.is_enabled():
+                return el
+        except Exception:
+            pass
+        return None
+
+    def _is_guest_inquiry_form(self) -> bool:
+        if not self._is_on_inquiry_form():
+            return False
+        if self._inquiry_guest_email_field():
+            return True
+        return bool(self._inquiry_login_buttons())
+
+    def _naver_inquiry_email(self, naver_id: str) -> str:
+        raw = (naver_id or "").strip()
+        if not raw:
+            return ""
+        if "@" in raw:
+            return raw
+        return f"{raw}@naver.com"
+
+    def _fill_guest_inquiry_email(self, naver_id: str) -> bool:
+        """로그인 풀린 신고 폼이면 아이디@naver.com 을 넣고 계속 진행합니다."""
+        email_el = self._inquiry_guest_email_field()
+        if not email_el:
+            return True
+        email = self._naver_inquiry_email(naver_id)
+        if not email:
+            self.log("비로그인 신고 — 이메일을 만들 아이디가 없습니다")
+            return False
+        current = self._read_element_value(email_el)
+        if not self._guest_email_used:
+            self.log(f"로그인 풀림 — 이메일로 신고 진행 ({email})")
+        self._guest_email_used = True
+        self._guest_email_address = email
+        if current.lower() == email.lower():
+            return True
+        self._paste_into_element(email_el, email, label="이메일")
+        self._human_delay(0.3, 0.6)
+        actual = self._read_element_value(email_el)
+        if actual.lower() != email.lower():
+            self.log(f"이메일 입력 실패 (실제: {actual or '비어 있음'})")
+            return False
+        return True
+
+    def _open_inquiry_as_guest(self):
+        self.log("로그인 세션 없음 — 비로그인 신고 폼으로 진행")
+        self._open_url_with_referrer(self.INQUIRY_FORM_URL)
+        self._human_delay(1.8, 3.0)
+
     def _go_to_inquiry_page(self):
+        self._switch_to_handle(self._inquiry_window)
         if self._is_on_inquiry_form():
             return
-        self.driver.get(self.INQUIRY_FORM_URL)
+        if self._inquiry_session_lost():
+            self._open_inquiry_as_guest()
+            if self._is_on_inquiry_form():
+                return
+        self._ensure_naver_web_context()
+        self._human_delay(0.8, 1.6)
+
+        current = (self.driver.current_url or "")
+        if "help.naver.com" not in current:
+            self.log("고객센터 홈으로 이동")
+            self._open_url_with_referrer(self.HELP_HOME_URL)
+            self._human_delay(2.0, 3.5)
+            if self._inquiry_session_lost():
+                self._open_inquiry_as_guest()
+
+        if self._is_on_inquiry_form():
+            return
+
         self.log("신고 작성 페이지로 이동")
+        self._open_url_with_referrer(self.INQUIRY_FORM_URL)
         self._human_delay(2.0, 4.0)
+        if self._inquiry_session_lost():
+            self._open_inquiry_as_guest()
         wait = self._wait(25)
         wait.until(EC.visibility_of_element_located((By.ID, "requiredUrl1")))
+
+    def _open_login_from_naver_home(self) -> bool:
+        """네이버 홈의 로그인 버튼을 눌러 nid 로그인으로 진입."""
+        selectors = [
+            (By.CSS_SELECTOR, "a.MyView-module__link_login___HpHMW"),
+            (By.CSS_SELECTOR, "#account .link_login"),
+            (By.CSS_SELECTOR, "a.link_login"),
+            (By.CSS_SELECTOR, "#gnb_login_button"),
+            (By.CSS_SELECTOR, "a[href*='nidlogin.login']"),
+            (By.XPATH, "//a[contains(@href,'nidlogin.login') and not(contains(@href,'logout'))]"),
+            (By.XPATH, "//a[normalize-space()='로그인']"),
+        ]
+        for by, sel in selectors:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    if not el.is_displayed():
+                        continue
+                    href = (el.get_attribute("href") or "").lower()
+                    text = (el.text or "").strip()
+                    if "logout" in href or text == "로그아웃":
+                        continue
+                    if "nidlogin" not in href and "로그인" not in text:
+                        continue
+                    self._click_element(el)
+                    self._human_delay(1.2, 2.2)
+                    if self._is_on_login_page() or self._has_login_form():
+                        self.log("네이버 홈 → 로그인 버튼 클릭")
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _find_naver_search_box(self):
+        selectors = [
+            (By.ID, "query"),
+            (By.CSS_SELECTOR, "input[name='query']"),
+            (By.CSS_SELECTOR, "input.search_input"),
+            (By.CSS_SELECTOR, "#search-input"),
+        ]
+        for by, sel in selectors:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+            except Exception:
+                continue
+        return None
+
+    def _search_from_naver_ui(self, keyword: str) -> bool:
+        """주소창 직접 이동 없이 검색창에 입력 후 검색."""
+        if self._should_stop() or not self.driver:
+            return False
+        box = self._find_naver_search_box()
+        if not box:
+            current = (self.driver.current_url or "")
+            if "www.naver.com" not in current:
+                self.driver.get(self.NAVER_HOME_URL)
+                self._human_delay(1.2, 2.0)
+                box = self._find_naver_search_box()
+        if not box:
+            self.log("네이버 검색창을 찾지 못했습니다")
+            return False
+        try:
+            self._click_element(box)
+            try:
+                box.clear()
+            except Exception:
+                pass
+            self._clear_like_human(box)
+            for char in keyword:
+                box.send_keys(char)
+                time.sleep(random.uniform(0.05, 0.14))
+            self._human_delay(0.3, 0.7)
+            box.send_keys(Keys.ENTER)
+        except Exception as e:
+            self.log(f"검색 입력 오류: {e}")
+            return False
+        ok = self._wait_until(
+            lambda: "search.naver.com" in (self.driver.current_url or "") and "query=" in (self.driver.current_url or ""),
+            timeout=12,
+        )
+        if ok:
+            self._human_delay(1.5, 3.0)
+        return ok
+
+    def _current_window_handle(self) -> str:
+        try:
+            return self.driver.current_window_handle
+        except Exception:
+            return ""
+
+    def _switch_to_handle(self, handle: str) -> bool:
+        if not handle or not self.driver:
+            return False
+        try:
+            if handle in self.driver.window_handles:
+                self.driver.switch_to.window(handle)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _remember_inquiry_tab(self):
+        handle = self._current_window_handle()
+        if handle and handle != self._search_window:
+            self._inquiry_window = handle
+
+    def _ensure_search_tab(self) -> bool:
+        """자동 URL용 검색 탭을 만들고, 이미 있으면 그 탭으로 전환합니다."""
+        if self._search_window and self._switch_to_handle(self._search_window):
+            return True
+        self._remember_inquiry_tab()
+        if self._should_stop() or not self.driver:
+            return False
+        before = list(self.driver.window_handles)
+        opened = False
+        try:
+            ActionChains(self.driver).key_down(Keys.CONTROL).send_keys("t").key_up(Keys.CONTROL).perform()
+            opened = self._wait_until(
+                lambda: len(self.driver.window_handles) > len(before),
+                timeout=4,
+            )
+        except Exception:
+            opened = False
+        if not opened:
+            try:
+                self.driver.execute_cdp_cmd(
+                    "Target.createTarget",
+                    {"url": "https://www.naver.com"},
+                )
+            except Exception as e:
+                self.log(f"검색 탭 열기 실패: {e}")
+                return False
+        if not self._wait_until(lambda: len(self.driver.window_handles) > len(before), timeout=10):
+            self.log("검색 탭이 열리지 않았습니다")
+            return False
+        after = self.driver.window_handles
+        new_handles = [h for h in after if h not in before]
+        self._search_window = new_handles[-1] if new_handles else after[-1]
+        if not self._switch_to_handle(self._search_window):
+            return False
+        current = (self.driver.current_url or "")
+        if "naver.com" not in current:
+            self.driver.get(self.NAVER_HOME_URL)
+        self.log("검색 전용 탭 생성 (이후 자동 URL은 이 탭에서 검색)")
+        self._human_delay(1.2, 2.2)
+        return True
+
+    def _collect_auto_search_url(self, report_type: str) -> str:
+        """로그인된 신고 창은 건드리지 않고, 별도 브라우저에서 유형을 검색합니다."""
+        kw = (report_type or "").strip()
+        if not kw:
+            return ""
+        from naver_search_url import build_naver_search_url_simple, _log_fresh_search_url
+
+        inquiry_handle = self._current_window_handle()
+        self._remember_inquiry_tab()
+        url = ""
+        try:
+            driver = self._ensure_search_driver()
+            if not driver:
+                url = build_naver_search_url_simple(kw)
+                self.log("검색 브라우저를 열 수 없어 기본 검색 URL을 사용합니다")
+            else:
+                self.log(f"분리된 검색 브라우저에서 유형 검색 [{kw}]")
+                url = self._search_keyword_on_driver(driver, kw)
+                if url:
+                    _log_fresh_search_url(self.log, kw, url)
+                else:
+                    url = build_naver_search_url_simple(kw)
+                    self.log("실시간 검색 실패 — 기본 검색 URL 사용")
+        except Exception as e:
+            url = build_naver_search_url_simple(kw)
+            self.log(f"유형 검색 오류 — 기본 URL 사용 ({e})")
+        self._switch_to_handle(self._inquiry_window or inquiry_handle)
+        return url
+
+    def _ensure_search_driver(self):
+        if self._search_driver:
+            return self._search_driver
+        try:
+            driver, _info = create_webdriver(
+                self.browser_mode,
+                headless=True,
+                profile_key=f"{self.browser_mode}-search",
+            )
+            self._search_driver = driver
+            self.log("유형 검색용 브라우저 준비 (로그인 창과 분리)")
+            return driver
+        except Exception as e:
+            self.log(f"검색 브라우저 준비 실패: {e}")
+            return None
+
+    def _search_keyword_on_driver(self, driver, keyword: str) -> str:
+        if not driver or not keyword:
+            return ""
+        try:
+            driver.get(self.NAVER_HOME_URL)
+            time.sleep(random.uniform(1.0, 1.8))
+            box = None
+            for by, sel in (
+                (By.ID, "query"),
+                (By.CSS_SELECTOR, "input[name='query']"),
+                (By.CSS_SELECTOR, "input.search_input"),
+            ):
+                try:
+                    for el in driver.find_elements(by, sel):
+                        if el.is_displayed() and el.is_enabled():
+                            box = el
+                            break
+                except Exception:
+                    continue
+                if box:
+                    break
+            if box:
+                try:
+                    box.click()
+                except Exception:
+                    pass
+                try:
+                    box.clear()
+                except Exception:
+                    pass
+                box.send_keys(keyword)
+                time.sleep(random.uniform(0.2, 0.5))
+                box.send_keys(Keys.ENTER)
+            else:
+                from naver_search_url import build_naver_search_url_simple
+                driver.get(build_naver_search_url_simple(keyword))
+            end = time.time() + 12
+            while time.time() < end:
+                url = driver.current_url or ""
+                if "search.naver.com" in url and "query=" in url:
+                    time.sleep(random.uniform(0.8, 1.4))
+                    return url
+                time.sleep(0.25)
+        except Exception as e:
+            self.log(f"분리 검색 입력 오류: {e}")
+        return ""
+
+    def _run_first_start_warmup(self, report_type: str = ""):
+        """첫 자동 URL 항목: 검색 전용 탭에서 유형 검색."""
+        url = self._collect_auto_search_url(report_type)
+        if url:
+            self._warmup_search_url = url
+            self._warmup_search_type = report_type
+            self.log(f"검색 탭: 자동 URL 확보 ({url[:90]})")
+
+    def _consume_warmup_search_url(self, report_type: str) -> str:
+        if (
+            self._warmup_search_url
+            and report_type
+            and self._warmup_search_type == report_type
+        ):
+            url = self._warmup_search_url
+            self._warmup_search_url = ""
+            return url
+        return ""
 
     def _wait_after_submit(self, timeout: int = 30) -> bool:
         return self._wait_submit_success(timeout)
@@ -629,28 +1055,39 @@ class NaverReporter:
         self.log("신고 접수 완료 확인 실패")
         return False
 
-    def _clear_input(self, element):
+    def _clear_like_human(self, element):
         try:
             element.click()
-            element.clear()
+            element.send_keys(Keys.CONTROL, "a")
+            element.send_keys(Keys.BACKSPACE)
         except Exception:
-            self.driver.execute_script("""
-                var el = arguments[0];
-                el.focus();
-                el.value = '';
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-            """, element)
+            try:
+                element.clear()
+            except Exception:
+                pass
+
+    def _clear_input(self, element):
+        self._clear_like_human(element)
 
     def _click_element(self, element):
-        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-        self._human_delay(0.2, 0.5)
+        try:
+            ActionChains(self.driver).move_to_element(element).pause(
+                random.uniform(0.12, 0.35)
+            ).click().perform()
+            return
+        except Exception:
+            pass
         try:
             element.click()
         except Exception:
             self.driver.execute_script("arguments[0].click();", element)
 
-    INQUIRY_CATEGORY_LABELS: dict[str, str] = {
+    NAVER_HOME_URL = "https://www.naver.com"
+    WARMUP_SEARCH_KEYWORDS = (
+        "오늘 날씨", "뉴스", "지하철 시간", "환율", "프로야구",
+        "미세먼지", "로또 번호", "운세", "주식", "맛집",
+    )
+    INQUIRY_CATEGORY_LABELS = {
         "illegal": "불법성",
         "spam": "스팸성",
     }
@@ -681,20 +1118,22 @@ class NaverReporter:
     @staticmethod
     def _rewrite_rules() -> str:
         return (
-            "- '신고 대상:', '사이트:', '신고 사항:', '유형:', 'URL:', '---' 같은 구조적 요약은 절대 넣지 마세요.\n"
-            "- 한국어 자연스러운 문단 형식으로만 작성하세요.\n"
-            "- 네이버 아이디, 계정명, '저는 ... 계정을 사용' 같은 계정 관련 표현은 절대 넣지 마세요.\n"
-            "- 다른 신고 문구와 겹치지 않도록 표현/어체/문장 흐름을 다양하게 바꿔주세요."
+            "- 결과는 문단 2개만 작성하세요. 문단과 문단 사이에는 빈 줄 하나를 넣으세요.\n"
+            "- 각 문단은 2~4개의 완결된 문장으로, 읽기 쉽게 쓰세요.\n"
+            "- 제목, 글머리표(-), 번호 목록, 마크다운(** # `)은 넣지 마세요.\n"
+            "- '신고 대상:', '사이트:', '유형:', 'URL:' 같은 라벨 나열은 절대 넣지 마세요.\n"
+            "- 네이버 아이디, 계정명, '저는 ... 계정을 사용' 같은 계정 관련 표현은 넣지 마세요.\n"
+            "- 다른 신고 문구와 겹치지 않도록 표현과 어체를 바꿔주세요."
         )
 
     def _rewrite(self, template: str, account_id: str, site: str, report_type: str) -> str:
         """GPT로 원본을 리라이트합니다."""
         if not self.client:
-            return template
+            return self._format_rewritten(template)
         prompt = (
-            "아래 원본 신고 내용을 토대로, 같은 의미와 맥락을 유지하면서 "
-            "단어, 문장구조, 어체(해라체/합쇼체/해요체), 표현 방식을 바꿔서 "
-            "새로운 신고 내용을 250~400자 내외로 작성해주세요.\n\n"
+            "아래 원본 신고 내용을 같은 의미로 다시 쓰세요. "
+            "250~400자, 문단 2개, 문단 사이 빈 줄 하나. "
+            "사람이 읽기 쉬운 자연스러운 한국어 문장만 출력하세요.\n\n"
             f"[원본 신고 내용]\n{template}\n\n"
             "[규칙]\n"
             + self._rewrite_rules()
@@ -703,16 +1142,16 @@ class NaverReporter:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "당신은 불법 금융 사이트 신고 내용을 자연스럽고 다양하게 변형하는 전문 보조원입니다."},
+                    {"role": "system", "content": "당신은 신고 내용을 짧고 읽기 쉬운 문단으로 다시 쓰는 보조원입니다. 목록이나 제목 없이 본문만 씁니다."},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.85,
+                temperature=0.7,
                 max_tokens=700,
             )
-            return self._clean_output(response.choices[0].message.content.strip())
+            return self._format_rewritten(response.choices[0].message.content.strip())
         except Exception as e:
             self.log(f"GPT 리라이트 오류: {self._format_openai_error(e)}")
-            return template
+            return self._format_rewritten(template)
 
     @staticmethod
     def _clean_output(text: str) -> str:
@@ -730,15 +1169,48 @@ class NaverReporter:
             cleaned.append(line)
         return "\n".join(cleaned).strip()
 
+    def _format_rewritten(self, text: str) -> str:
+        cleaned = self._clean_output(text or "")
+        cleaned = re.sub(r"[*_`#>]{1,}", "", cleaned)
+        cleaned = cleaned.replace("\r\n", "\n").strip()
+        parts = [re.sub(r"[ \t]+", " ", p).strip() for p in re.split(r"\n\s*\n", cleaned)]
+        paras = [p.replace("\n", " ").strip() for p in parts if p.strip()]
+        if len(paras) == 1 and len(paras[0]) > 160:
+            sents = re.split(r"(?<=다)\.\s+|(?<=요)\.\s+|(?<=니다)\.\s+", paras[0])
+            sents = [s.strip() for s in sents if s.strip()]
+            if len(sents) >= 3:
+                mid = max(1, len(sents) // 2)
+                first = ". ".join(sents[:mid])
+                second = ". ".join(sents[mid:])
+                if not first.endswith("다") and not first.endswith("요"):
+                    first += "."
+                if not second.endswith("다") and not second.endswith("요"):
+                    second += "."
+                paras = [first.strip(), second.strip()]
+        if not paras:
+            return cleaned
+        return "\n\n".join(paras)
+
     def start_driver(self):
         self.log("브라우저 준비 중...")
+        self._inquiry_window = ""
+        self._search_window = ""
+        self._search_driver = None
+        self._guest_email_used = False
+        self._guest_email_address = ""
         self.driver, info = create_webdriver(self.browser_mode, headless=self.headless)
         version = info.get("version") or ""
         label = info.get("label") or "브라우저"
         if version:
-            self.log(f"{label} 사용: {version}")
+            self.log(f"{label} 사용: {version} (앱 전용 프로필, 일상 브라우저와 분리)")
         else:
-            self.log(f"{label} 사용")
+            self.log(f"{label} 사용 (앱 전용 프로필, 일상 브라우저와 분리)")
+        if info.get("launch") == "attach":
+            self.log("설치된 브라우저를 직접 실행한 뒤 연결했습니다")
+        else:
+            self.log("브라우저 연결 실패 — ChromeDriver 실행으로 대체")
+        if info.get("webdriver_flag"):
+            self.log("자동화 표시(navigator.webdriver)가 남아 있습니다")
         ua = info.get("user_agent") or ""
         if ua:
             self.log(f"브라우저 시작 완료 ({ua})")
@@ -746,12 +1218,14 @@ class NaverReporter:
             self.log("브라우저 시작 완료")
 
     def quit_driver(self):
+        had = bool(self.driver or self._search_driver)
         if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
+            quit_webdriver(self.driver)
             self.driver = None
+        if self._search_driver:
+            quit_webdriver(self._search_driver)
+            self._search_driver = None
+        if had:
             self.log("브라우저 종료")
 
     def _wait(self, seconds: int = 10):
@@ -832,16 +1306,35 @@ class NaverReporter:
     def _is_receipt_captcha_question(self, text: str) -> bool:
         if not text or self._is_char_captcha_instruction(text):
             return False
+        if self._is_inquiry_captcha_notice(text):
+            return False
         return any(
             k in text
             for k in (
                 "입니까", "얼마", "무엇", "몇", "합계", "가격", "개수", "빈 칸",
                 "전화번호", "영수증", "가게", "제품", "번째 숫자", "번째숫자",
+                "종류",
+            )
+        )
+
+    def _is_inquiry_captcha_notice(self, text: str) -> bool:
+        compact = (text or "").replace(" ", "")
+        return any(
+            k in compact
+            for k in (
+                "아래질문에",
+                "가상으로제작",
+                "실제영수증",
+                "음성으로듣기",
+                "캡차이미지",
             )
         )
 
     def _find_receipt_captcha_question(self) -> str:
         """영수증/질문형 보안 화면의 질문 문구."""
+        picked = self._find_inquiry_question()
+        if picked:
+            return picked
         xpaths = [
             "//*[contains(text(),'무엇입니까')]",
             "//*[contains(text(),'입니까')]",
@@ -856,8 +1349,8 @@ class NaverReporter:
                 for el in self.driver.find_elements(By.XPATH, xpath):
                     if not el.is_displayed():
                         continue
-                    text = (el.text or "").strip()
-                    if 8 < len(text) < 180 and self._is_receipt_captcha_question(text):
+                    text = self._pick_receipt_question_text(el.text or "")
+                    if text:
                         return text
             except Exception:
                 continue
@@ -867,7 +1360,11 @@ class NaverReporter:
         """영수증형 캡챠 이미지 (큰 영수증 이미지)."""
         best = None
         best_area = 0
-        for img in self.driver.find_elements(By.CSS_SELECTOR, "div.captcha img, .captcha_box img, .captcha_inner img"):
+        for img in self.driver.find_elements(
+            By.CSS_SELECTOR,
+            "img[alt='캡차이미지'], div[class*='InquiryInput_captcha_img'] img, "
+            "div.captcha_wrap img, div.captcha img, .captcha_box img, .captcha_inner img",
+        ):
             try:
                 if not img.is_displayed():
                     continue
@@ -970,6 +1467,187 @@ class NaverReporter:
                 continue
         return False
 
+    @staticmethod
+    def _normalize_naver_id(value: str) -> str:
+        raw = (value or "").strip().lower()
+        if raw.endswith("@naver.com"):
+            raw = raw[: -len("@naver.com")]
+        return raw.strip()
+
+    def _extract_naver_id_from_text(self, text: str) -> str:
+        blob = text or ""
+        mail = re.search(r"([a-z0-9._-]{2,40})@naver\.com", blob, re.I)
+        if mail:
+            return self._normalize_naver_id(mail.group(1))
+        labeled = re.search(
+            r"(?:네이버\s*)?아이디\s*[:：]\s*([a-z0-9._-]{2,40})",
+            blob,
+            re.I,
+        )
+        if labeled:
+            return self._normalize_naver_id(labeled.group(1))
+        return ""
+
+    def _expand_naver_home_account_panel(self):
+        selectors = [
+            (By.CSS_SELECTOR, "#account"),
+            (By.CSS_SELECTOR, "#account [class*='MyView-module']"),
+            (By.CSS_SELECTOR, "button[class*='MyView-module__btn']"),
+            (By.CSS_SELECTOR, "a[class*='MyView-module__link_my']"),
+            (By.CSS_SELECTOR, ".MyView-module__my_info___GNmHz"),
+        ]
+        for by, sel in selectors:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    if not el.is_displayed():
+                        continue
+                    href = (el.get_attribute("href") or "").lower()
+                    text = (el.text or "").strip()
+                    if "logout" in href or text in ("로그인", "로그아웃"):
+                        continue
+                    self._click_element(el)
+                    self._human_delay(0.4, 0.8)
+                    return
+            except Exception:
+                continue
+
+    def _detect_naver_home_id(self) -> str:
+        try:
+            found = self.driver.execute_script(
+                """
+                const acc = document.querySelector('#account');
+                if (!acc) return '';
+                const html = (acc.innerText || acc.textContent || '');
+                const mail = html.match(/([A-Za-z0-9._-]{2,40})@naver\\.com/i);
+                if (mail) return mail[1];
+                const nodes = acc.querySelectorAll(
+                    '[class*="MyView-module__id"], [class*="MyView-module__email"],'
+                    + ' [class*="mail_address"], em, span, strong, a'
+                );
+                for (const n of nodes) {
+                    const t = (n.innerText || n.textContent || '').trim();
+                    const m = t.match(/([A-Za-z0-9._-]{2,40})@naver\\.com/i);
+                    if (m) return m[1];
+                }
+                return '';
+                """
+            ) or ""
+            nid = self._normalize_naver_id(found)
+            if nid:
+                return nid
+        except Exception:
+            pass
+        self._expand_naver_home_account_panel()
+        try:
+            acc = self.driver.find_element(By.CSS_SELECTOR, "#account")
+            nid = self._extract_naver_id_from_text(acc.text or "")
+            if nid:
+                return nid
+        except Exception:
+            pass
+        return ""
+
+    def _detect_naver_id_from_myinfo(self) -> str:
+        try:
+            self.driver.get("https://nid.naver.com/user2/help/myInfo?lang=ko_KR")
+            self._human_delay(1.2, 2.0)
+            nid = self._extract_naver_id_from_text(self.driver.page_source or "")
+            if not nid:
+                try:
+                    body = self.driver.find_element(By.TAG_NAME, "body")
+                    nid = self._extract_naver_id_from_text(body.text or "")
+                except Exception:
+                    pass
+            return nid
+        except Exception:
+            return ""
+
+    def _clear_naver_session_cookies(self):
+        try:
+            for name in ("NID_AUT", "NID_SES", "NID_JKL"):
+                try:
+                    self.driver.delete_cookie(name)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _logout_naver(self) -> bool:
+        clicked = False
+        selectors = [
+            (By.CSS_SELECTOR, "a.MyView-module__btn_logout___bsTOJ"),
+            (By.CSS_SELECTOR, "[class*='btn_logout']"),
+            (By.CSS_SELECTOR, "#gnb_logout_button"),
+            (By.CSS_SELECTOR, "a[href*='nidlogin.logout']"),
+            (By.XPATH, "//a[contains(.,'로그아웃')]"),
+            (By.XPATH, "//button[contains(.,'로그아웃')]"),
+        ]
+        self._expand_naver_home_account_panel()
+        for by, sel in selectors:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    if not el.is_displayed():
+                        continue
+                    self._click_element(el)
+                    clicked = True
+                    self.log("네이버 홈 → 로그아웃 클릭")
+                    self._human_delay(1.2, 2.2)
+                    break
+            except Exception:
+                continue
+            if clicked:
+                break
+        if not clicked:
+            logout_url = (
+                "https://nid.naver.com/nidlogin.logout"
+                f"?returl={quote(self.NAVER_HOME_URL, safe='')}"
+            )
+            self.log("로그아웃 URL로 세션 종료")
+            self.driver.get(logout_url)
+            self._human_delay(1.4, 2.4)
+        current = (self.driver.current_url or "")
+        if "www.naver.com" not in current:
+            self.driver.get(self.NAVER_HOME_URL)
+            self._human_delay(1.0, 1.8)
+        if self._is_logged_in():
+            self._clear_naver_session_cookies()
+            self.driver.get(self.NAVER_HOME_URL)
+            self._human_delay(1.0, 1.8)
+        return not self._is_logged_in()
+
+    def _align_naver_home_account(self, naver_id: str) -> str:
+        """홈 세션이 설정 아이디와 같으면 same, 비로그인이면 guest, 로그아웃했으면 logged_out."""
+        if self._should_stop() or not self.driver:
+            return "stopped"
+        wanted = self._normalize_naver_id(naver_id)
+        self.log("네이버 홈에서 로그인 계정 확인")
+        self.driver.get(self.NAVER_HOME_URL)
+        self._human_delay(1.6, 2.8)
+        if not self._is_logged_in():
+            self.log("네이버 홈 — 로그인되어 있지 않음")
+            return "guest"
+        current = self._detect_naver_home_id()
+        if not current:
+            current = self._detect_naver_id_from_myinfo()
+            try:
+                self.driver.get(self.NAVER_HOME_URL)
+                self._human_delay(1.0, 1.8)
+            except Exception:
+                pass
+        if current and current == wanted:
+            self.log(f"네이버 홈 — 이미 설정 계정으로 로그인됨 ({naver_id})")
+            return "same"
+        if current:
+            self.log(f"네이버 홈 — 다른 계정 로그인 ({current} ≠ {naver_id}) → 로그아웃")
+        else:
+            self.log(f"네이버 홈 — 로그인되어 있으나 아이디가 설정과 다름 → 로그아웃 후 {naver_id}로 진행")
+        if not self._logout_naver():
+            self.log("로그아웃 확인 실패 — 세션 쿠키 정리 후 진행")
+            self._clear_naver_session_cookies()
+            self.driver.get(self.NAVER_HOME_URL)
+            self._human_delay(1.0, 1.8)
+        return "logged_out"
+
     def _is_logged_in(self) -> bool:
         if self._is_on_login_page():
             return False
@@ -1041,6 +1719,13 @@ class NaverReporter:
         self.log("블로그 로그인 완료")
         return True
 
+    def _is_naver_home_target(self, target: str) -> bool:
+        url = (target or "").rstrip("/")
+        return url == self.NAVER_HOME_URL.rstrip("/") or url.endswith("www.naver.com")
+
+    def _is_inquiry_target(self, target: str) -> bool:
+        return "inquiry/input.help" in (target or "")
+
     def _finalize_login(self, target: str) -> bool:
         if self._is_blog_target(target):
             return self._finalize_blog_login(target)
@@ -1048,9 +1733,40 @@ class NaverReporter:
         current = self.driver.current_url
         self.log(f"로그인 완료 확인 → {current[:100]}")
         if self._is_on_inquiry_form() and self._has_naver_session_cookie():
+            self.log("로그인 완료 — 신고 페이지 유지")
             return True
+
+        if self._is_inquiry_target(target):
+            if self._wait_until(
+                lambda: self._is_on_inquiry_form() or self._inquiry_session_lost(),
+                timeout=18,
+            ):
+                if self._is_on_inquiry_form() and self._has_naver_session_cookie():
+                    self.log("로그인 완료 — 신고 페이지로 복귀")
+                    return True
+                if self._inquiry_session_lost():
+                    self.log("로그인 후 신고 페이지 복귀 실패 — 로그인 화면")
+                    return False
+            if not self._has_naver_session_cookie():
+                self.log("로그인 세션 쿠키 없음 — 로그인 미완료")
+                return False
+            self.log("신고 페이지 복귀 — 링크 이동")
+            self._open_url_with_referrer(self.INQUIRY_FORM_URL)
+            self._human_delay(2.0, 3.5)
+            if self._is_on_inquiry_form():
+                return True
+            if self._inquiry_session_lost():
+                self.log("신고 페이지 접근 시 로그인 세션 없음")
+                return False
+            try:
+                self._wait(15).until(lambda d: self._is_on_inquiry_form())
+                return True
+            except TimeoutException:
+                self.log("신고 작성 폼 로드 실패")
+                return False
+
         if "www.naver.com" not in current:
-            self.driver.get("https://www.naver.com")
+            self.driver.get(self.NAVER_HOME_URL)
             self.log("네이버 메인에서 로그인 UI 확인")
             self._human_delay(1.5, 2.5)
         if not self._has_naver_logged_in_ui():
@@ -1058,6 +1774,10 @@ class NaverReporter:
                 self.log("로그인 세션 쿠키 없음 — 로그인 미완료")
                 return False
             self.log("로그인 UI 미표시 — 세션 쿠키만 확인됨")
+        if self._is_naver_home_target(target):
+            self.log("로그인 세션 확인 — 네이버 홈 유지")
+            self._human_delay(2.0, 4.0)
+            return True
         self.driver.get(target)
         self.log("신고 작성 페이지로 이동 (세션 확인)")
         self._human_delay(2.0, 3.5)
@@ -1231,7 +1951,15 @@ class NaverReporter:
         return msg
 
     def _captcha_element_to_b64(self, img_el) -> str:
-        """캡챠 이미지를 고해상도로 캡처해 Vision 인식률을 높입니다."""
+        """캡챠 이미지. data URL이면 원본을 쓰고, 아니면 화면 캡처합니다."""
+        try:
+            src = img_el.get_attribute("src") or ""
+            if src.startswith("data:image") and "," in src:
+                raw = src.split(",", 1)[1].strip()
+                if len(raw) > 80:
+                    return raw
+        except Exception:
+            pass
         try:
             raw = img_el.screenshot_as_base64
             if raw:
@@ -1241,6 +1969,10 @@ class NaverReporter:
         try:
             return self.driver.execute_script(
                 "var img=arguments[0];"
+                "var src=img.getAttribute('src')||'';"
+                "if(src.indexOf('data:image')===0 && src.indexOf(',')>0){"
+                "  return src.split(',')[1];"
+                "}"
                 "var scale=3;"
                 "var c=document.createElement('canvas');"
                 "var w=img.naturalWidth||img.width||120;"
@@ -1291,6 +2023,8 @@ class NaverReporter:
     def _click_captcha_refresh(self) -> bool:
         """캡챠 새로고침 버튼 클릭 (확인/로그인 버튼 제외)."""
         selectors = [
+            (By.CSS_SELECTOR, "button[class*='InquiryInput_refresh']"),
+            (By.XPATH, "//button[normalize-space()='새로고침']"),
             (By.ID, "captcha_reload"),
             (By.ID, "btnCaptchaReload"),
             (By.CSS_SELECTOR, "button.btn_reload"),
@@ -1348,7 +2082,7 @@ class NaverReporter:
         except Exception:
             pass
 
-    def _vision_answer(self, prompt: str, b64: str | None = None, detail: str = "auto") -> str:
+    def _vision_answer(self, prompt: str, b64: str | None = None, detail: str = "auto", max_tokens: int = 100) -> str:
         if not self.client:
             return ""
         content = [{"type": "text", "text": prompt}]
@@ -1361,7 +2095,7 @@ class NaverReporter:
             response = self.client.chat.completions.create(
                 model=self._vision_model(),
                 messages=[{"role": "user", "content": content}],
-                max_tokens=100,
+                max_tokens=max_tokens,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -1373,9 +2107,7 @@ class NaverReporter:
             pw_input = self._find_login_pw_input()
             if not pw_input.is_displayed():
                 return
-            pw_input.click()
-            pw_input.clear()
-            self.driver.execute_script("arguments[0].value = '';", pw_input)
+            self._clear_like_human(pw_input)
             for char in naver_pw:
                 pw_input.send_keys(char)
                 time.sleep(random.uniform(0.05, 0.1))
@@ -1430,25 +2162,26 @@ class NaverReporter:
     def _paste_into_element(self, element, text: str, label: str = "입력"):
         """URL 등 긴 문자열 붙여넣기 — 폼 검증이 인식하는지 확인 후 재시도."""
         expected = text.strip()
-        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-        self._human_delay(0.2, 0.4)
         try:
-            element.click()
+            ActionChains(self.driver).move_to_element(element).pause(
+                random.uniform(0.08, 0.2)
+            ).click().perform()
         except Exception:
-            pass
-
-        self._dispatch_input_events(element, expected)
+            try:
+                element.click()
+            except Exception:
+                pass
+        self._human_delay(0.15, 0.35)
+        self._clear_like_human(element)
+        try:
+            element.send_keys(expected)
+        except ElementNotInteractableException:
+            self._dispatch_input_events(element, expected)
         actual = self._read_element_value(element)
 
         if actual != expected:
-            self.log(f"{label} JS 입력 미인식 → send_keys 재시도")
-            try:
-                element.click()
-                element.clear()
-                self._human_delay(0.1, 0.2)
-                element.send_keys(expected)
-            except ElementNotInteractableException:
-                self._dispatch_input_events(element, expected)
+            self.log(f"{label} 키 입력 미인식 → 폼 이벤트 재시도")
+            self._dispatch_input_events(element, expected)
             actual = self._read_element_value(element)
 
         if actual != expected:
@@ -1657,18 +2390,12 @@ class NaverReporter:
                 element.clear()
             except Exception:
                 pass
-            if label != "비밀번호":
-                self.driver.execute_script("arguments[0].value = '';", element)
+            self._clear_like_human(element)
             for char in text:
                 element.send_keys(char)
                 time.sleep(random.uniform(0.05, 0.12))
             if label == "비밀번호":
-                self.driver.execute_script(
-                    "var el=arguments[0];"
-                    "el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:'a'}));"
-                    "el.dispatchEvent(new Event('change',{bubbles:true}));",
-                    element,
-                )
+                self._human_delay(0.2, 0.45)
             actual = self._read_element_value(element)
             shown = len(actual) if actual else len(text)
             self.log(f"{label} 입력 ({shown}자)")
@@ -1829,9 +2556,7 @@ class NaverReporter:
             try:
                 btn = self.driver.find_element(By.ID, elem_id)
                 if btn.is_displayed() and btn.is_enabled():
-                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                    self._human_delay(0.15, 0.3)
-                    btn.click()
+                    self._click_element(btn)
                     self.log(f"로그인 버튼 클릭 ({elem_id})")
                     return True
             except NoSuchElementException:
@@ -1861,12 +2586,7 @@ class NaverReporter:
             pw_input = self._find_login_pw_input()
             self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pw_input)
             self._human_delay(0.15, 0.3)
-            pw_input.click()
-            try:
-                pw_input.clear()
-            except Exception:
-                pass
-            self.driver.execute_script("arguments[0].value = '';", pw_input)
+            self._clear_like_human(pw_input)
             for char in naver_pw:
                 pw_input.send_keys(char)
                 time.sleep(random.uniform(0.05, 0.12))
@@ -1919,18 +2639,18 @@ class NaverReporter:
         """영수증 보안 질문 유형 분류 (키워드 우선순위 중요)."""
         if not question:
             return "generic"
+        compact = question.replace(" ", "")
         if re.search(r"(\d+)번째.*숫자", question) or "전화번호" in question:
             return "phone_digit"
         if "빈 칸" in question or "[?]" in question:
             return "blank"
-        # 이름/무엇 — '가격이 싼 물건의 이름'처럼 가격 키워드가 있어도 이름 우선
+        if any(k in compact for k in ("종류", "몇종", "몇가지", "몇품목")):
+            return "kind_count"
         if any(k in question for k in ("이름", "무엇입니까", "무엇 입니까", "제품명", "품목명")):
             return "name"
         if "무엇" in question and "물건" in question:
             return "name"
-        if any(k in question for k in ("종류", "몇 종", "몇종")):
-            return "kind_count"
-        if any(k in question for k in ("몇 개", "총 몇", "몇개", "개 입니까", "개입니까")):
+        if any(k in question for k in ("몇 개", "총 몇", "몇개", "개 입니까", "개입니까", "총수량", "총 수량")):
             return "item_count"
         if any(k in question for k in ("가격", "얼마", "합계", "한 개 당", "한개당", "kcal", "열량", " kg", "kg ")):
             return "price"
@@ -1990,8 +2710,9 @@ class NaverReporter:
                 "영수증 품목란에 적힌 이름 그대로."
             ),
             "kind_count": (
-                "영수증 표에서 서로 다른 상품(품목) 종류 수를 세세요. "
-                "합계·할인 행은 제외. 숫자 하나만 (예: 3)."
+                "서로 다른 상품(품목) 행이 몇 줄인지 세세요. "
+                "'구매한 물건은 총 몇 종류' = 품목 종류 수. "
+                "합계·할인·부가세·거스름돈 행은 제외. 수량 합계가 아닙니다. 숫자 하나만 (예: 4)."
             ),
             "item_count": (
                 "영수증에서 구매한 모든 상품의 수량(개수) 합계를 세세요. "
@@ -2005,30 +2726,68 @@ class NaverReporter:
         }
         return base + extras.get(qtype, extras["generic"])
 
+    def _parse_labeled_answer(self, raw: str) -> str:
+        text = (raw or "").strip()
+        if not text:
+            return ""
+        match = re.search(r"ANSWER\s*[:：]\s*(.+)$", text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            return match.group(1).strip().split("\n")[0].strip()
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        return lines[-1] if lines else ""
+
+    def _transcribe_receipt(self, b64: str) -> str:
+        prompt = (
+            "이것은 가상 영수증 이미지입니다. 글자를 빠짐없이 읽으세요.\n"
+            "1) 가게명, 주소, 전화번호\n"
+            "2) 각 상품 행을 표로: 품목명 | 수량 | 단가 | 금액\n"
+            "3) 합계/할인/부가세 행은 따로 적고 상품이 아님을 표시\n"
+            "추정하지 말고 보이는 숫자·글자만. 설명은 생략."
+        )
+        try:
+            return self._vision_answer(prompt, b64, detail="high", max_tokens=700)
+        except Exception:
+            return ""
+
     def _solve_receipt_answer(self, question: str, img_el, retry: bool = True) -> str:
         """영수증 이미지 + 질문으로 정답 추출."""
         if not img_el:
             return ""
         b64 = self._captcha_element_to_b64(img_el)
         qtype = self._classify_receipt_question(question)
+        transcript = self._transcribe_receipt(b64)
+        if transcript:
+            self.log(f"영수증 내용 인식 ({len(transcript)}자)")
 
         if qtype == "phone_digit":
-            phone_raw = self._vision_answer(
-                "영수증 이미지에서 가게 전화번호(☎ 표시 옆)를 찾아 숫자만 출력하세요. "
-                "기호 없이 숫자만. 예: 0242664",
-                b64,
-                detail="high",
-            )
-            digits = re.sub(r"\D", "", phone_raw.split("\n")[0])
+            phone_src = transcript or ""
+            if not re.search(r"\d{5,}", phone_src):
+                phone_src = self._vision_answer(
+                    "영수증 이미지에서 가게 전화번호(☎ 표시 옆)를 찾아 숫자만 출력하세요. "
+                    "기호 없이 숫자만. 예: 0242664",
+                    b64,
+                    detail="high",
+                    max_tokens=80,
+                )
+            digits = re.sub(r"\D", "", phone_src.split("\n")[0] if phone_src else "")
+            if not digits:
+                digits = re.sub(r"\D", "", phone_src)
             pos_match = re.search(r"(\d+)번째", question or "")
             if pos_match and digits:
                 pos = int(pos_match.group(1)) - 1
                 if 0 <= pos < len(digits):
                     return digits[pos]
 
-        prompt = self._receipt_prompt_for_type(question or "", qtype)
-        raw = self._vision_answer(prompt, b64, detail="high")
-        answer = self._normalize_receipt_answer(raw, qtype)
+        type_hint = self._receipt_prompt_for_type(question or "", qtype)
+        prompt = (
+            f"{type_hint}\n\n"
+            "아래는 같은 영수증을 읽은 초안입니다. 이미지와 대조해 틀린 글자를 고친 뒤 답하세요.\n"
+            f"---\n{transcript[:1800]}\n---\n"
+            "마지막 줄에만 이 형식으로 출력: ANSWER:정답\n"
+            "정답 앞에 설명·단위를 붙이지 마세요."
+        )
+        raw = self._vision_answer(prompt, b64, detail="high", max_tokens=400)
+        answer = self._normalize_receipt_answer(self._parse_labeled_answer(raw) or raw, qtype)
 
         if qtype == "phone_digit" and question:
             pos_match = re.search(r"(\d+)번째", question)
@@ -2044,14 +2803,16 @@ class NaverReporter:
         if retry:
             self.log(f"영수증 답변 검증 실패({qtype}: '{answer[:30]}') — 재인식")
             retry_prompt = (
-                f"{prompt}\n\n"
-                "이전 답이 형식에 맞지 않았습니다. 영수증 표를 행 단위로 다시 읽고 "
-                "질문에 정확히 해당하는 값만 출력하세요."
+                f"{type_hint}\n\n"
+                "이전 답이 형식에 맞지 않았습니다. 상품 행만 다시 세고 "
+                "질문에 해당하는 값만 출력하세요. 마지막 줄: ANSWER:정답"
             )
-            raw2 = self._vision_answer(retry_prompt, b64, detail="high")
-            answer2 = self._normalize_receipt_answer(raw2, qtype)
+            raw2 = self._vision_answer(retry_prompt, b64, detail="high", max_tokens=300)
+            answer2 = self._normalize_receipt_answer(self._parse_labeled_answer(raw2) or raw2, qtype)
             if self._validate_receipt_answer(question or "", answer2, qtype):
                 return answer2
+            if answer2:
+                answer = answer2
 
         return answer if answer and not self._is_refusal_answer(answer) else ""
 
@@ -2187,16 +2948,57 @@ class NaverReporter:
             return self.solve_char_captcha_login(naver_pw)
         return True
 
-    def login(self, naver_id: str, naver_pw: str, redirect_url: str | None = None) -> tuple[bool, str]:
+    def login(
+        self,
+        naver_id: str,
+        naver_pw: str,
+        redirect_url: str | None = None,
+        natural_start: bool = False,
+        from_inquiry: bool = False,
+    ) -> tuple[bool, str]:
         if self._should_stop() or not self.driver:
             return False, "stopped"
-        target = redirect_url or self.INQUIRY_FORM_URL
-        login_url = self._build_login_url(target)
         self._last_login_restriction_reason = ""
         self._last_login_restriction_date = ""
-        self.driver.get(login_url)
-        self.log(f"네이버 로그인 페이지 접속: {naver_id}")
-        self._human_delay(1.0, 2.0)
+        aligned = self._align_naver_home_account(naver_id)
+        if aligned == "stopped" or self._should_stop() or not self.driver:
+            return False, "stopped"
+
+        if from_inquiry:
+            target = self.INQUIRY_FORM_URL
+            if aligned == "same":
+                self.log(f"신고 페이지로 이동 (계정 유지: {naver_id})")
+                self._open_url_with_referrer(self.INQUIRY_FORM_URL)
+                self._human_delay(1.8, 3.2)
+                if self._is_on_inquiry_form() and self._has_naver_session_cookie() and not self._inquiry_login_buttons():
+                    return True, "ok"
+                self.log("계정은 맞지만 신고 페이지 세션 확인 실패 — 로그인 재시도")
+            self.log(f"신고 페이지에서 로그인: {naver_id}")
+            opened = self._open_login_from_inquiry_page(skip_home=True)
+            if self._is_on_inquiry_form() and self._has_naver_session_cookie() and not self._inquiry_login_buttons():
+                return True, "ok"
+            if not opened:
+                self.log("로그인하기 실패 — 신고 URL 리다이렉트 로그인으로 대체")
+                self.driver.get(self._build_login_url(self.INQUIRY_FORM_URL))
+                self._human_delay(1.0, 2.0)
+        elif natural_start:
+            target = self.NAVER_HOME_URL
+            self.log(f"첫 시작 — 네이버 홈에서 로그인: {naver_id}")
+            if aligned == "same":
+                return True, "ok"
+            if not self._open_login_from_naver_home():
+                self.log("홈 로그인 버튼 실패 — 네이버 홈 리다이렉트 로그인으로 대체")
+                self.driver.get(self._build_login_url(self.NAVER_HOME_URL))
+                self._human_delay(1.0, 2.0)
+        else:
+            target = redirect_url or self.INQUIRY_FORM_URL
+            if aligned == "same":
+                if self._finalize_login(target):
+                    return True, "ok"
+                self.log("계정은 맞지만 대상 페이지 이동 실패 — 로그인 재시도")
+            self.driver.get(self._build_login_url(target))
+            self.log(f"네이버 로그인 페이지 접속: {naver_id}")
+            self._human_delay(1.0, 2.0)
         if self._should_stop() or not self.driver:
             return False, "stopped"
 
@@ -2285,32 +3087,69 @@ class NaverReporter:
             self.log(f"로그인 오류: {e}")
             return False, "failed"
 
+    def _pick_receipt_question_text(self, text: str) -> str:
+        if not text:
+            return ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        candidates = []
+        for ln in lines:
+            if self._is_inquiry_captcha_notice(ln):
+                continue
+            if 6 < len(ln) < 90 and self._is_receipt_captcha_question(ln):
+                candidates.append(ln)
+        if candidates:
+            return min(candidates, key=len)
+        compact = " ".join(lines)
+        if 6 < len(compact) < 90 and self._is_receipt_captcha_question(compact):
+            return compact
+        return ""
+
     def _find_inquiry_question(self) -> str:
+        selectors = [
+            (By.CSS_SELECTOR, "p[class*='InquiryInput_captcha_question']"),
+            (By.CSS_SELECTOR, "[class*='InquiryInput_captcha_question']"),
+            (By.CSS_SELECTOR, ".InquiryInput_captcha_input_area__fkFHS p"),
+            (By.CSS_SELECTOR, "div[class*='captcha_input'] p"),
+        ]
+        for by, sel in selectors:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    if not el.is_displayed():
+                        continue
+                    picked = self._pick_receipt_question_text(el.text or "")
+                    if picked:
+                        return picked
+            except Exception:
+                continue
         xpaths = [
-            "//*[contains(text(),'무엇입니까')]",
             "//*[contains(text(),'입니까')]",
             "//*[contains(text(),'얼마')]",
             "//*[contains(text(),'빈 칸')]",
             "//*[contains(text(),'전화번호')]",
             "//*[contains(text(),'번째 숫자')]",
-            "//*[contains(text(),'정답을 입력')]",
+            "//*[contains(text(),'종류')]",
         ]
         for xpath in xpaths:
             try:
                 for el in self.driver.find_elements(By.XPATH, xpath):
                     if not el.is_displayed():
                         continue
-                    text = (el.text or "").strip()
-                    if 8 < len(text) < 300 and self._is_receipt_captcha_question(text):
-                        return text
+                    picked = self._pick_receipt_question_text(el.text or "")
+                    if picked:
+                        return picked
             except Exception:
                 continue
         return ""
 
     def _find_inquiry_captcha_image(self):
-        best = None
-        best_area = 0
         selectors = [
+            "img[alt='캡차이미지']",
+            "img[alt*='캡차']",
+            "div[class*='InquiryInput_captcha_img'] img",
+            "div.captcha_wrap img[src^='data:image']",
+            "div[class*='InquiryInput_captcha'] img[src^='data:image']",
+            "div.InquiryInput img[src^='data:image']",
+            "form img[src^='data:image']",
             "div.InquiryInput img",
             "form img[src]",
             ".captcha img",
@@ -2318,23 +3157,48 @@ class NaverReporter:
             "div.captcha img",
             ".captcha_box img",
         ]
+        best = None
+        best_area = 0
         for sel in selectors:
             try:
                 for img in self.driver.find_elements(By.CSS_SELECTOR, sel):
                     if not img.is_displayed():
                         continue
+                    src = (img.get_attribute("src") or "")
+                    alt = (img.get_attribute("alt") or "")
                     w = img.size.get("width", 0) or 0
                     h = img.size.get("height", 0) or 0
                     area = w * h
-                    if area > best_area and w >= 80 and h >= 50:
+                    if src.startswith("data:image"):
+                        area += 1_000_000
+                    if "캡차" in alt:
+                        area += 500_000
+                    if area > best_area and (w >= 80 or src.startswith("data:image")):
                         best = img
                         best_area = area
             except Exception:
                 continue
+            if best and (best.get_attribute("alt") or "").find("캡차") >= 0:
+                return best
         return best
 
     def _find_inquiry_answer_input(self):
-        skip_ids = {"requiredurl1", "requiredurl2"}
+        skip_ids = {"requiredurl1", "requiredurl2", "mocustomeremail", "id", "pw"}
+        for by, sel in [
+            (By.ID, "captcha"),
+            (By.CSS_SELECTOR, "input#captcha"),
+            (By.CSS_SELECTOR, "div[class*='InquiryInput_captcha_input'] input"),
+            (By.CSS_SELECTOR, "input[placeholder*='정답']"),
+        ]:
+            try:
+                for el in self.driver.find_elements(by, sel):
+                    el_id = (el.get_attribute("id") or "").lower()
+                    if el_id in skip_ids or "motext" in el_id:
+                        continue
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+            except Exception:
+                continue
         for el in self.driver.find_elements(By.CSS_SELECTOR, "input[type='text']"):
             el_id = (el.get_attribute("id") or "").lower()
             if el_id in skip_ids or "motext" in el_id:
@@ -2342,14 +3206,6 @@ class NaverReporter:
             ph = el.get_attribute("placeholder") or ""
             if el.is_displayed() and el.is_enabled() and "정답" in ph:
                 return el
-        for el in self.driver.find_elements(By.CSS_SELECTOR, "input.InquiryInput_input_text__5duMq"):
-            el_id = (el.get_attribute("id") or "").lower()
-            if el_id in skip_ids:
-                continue
-            if el.is_displayed() and el.is_enabled():
-                ph = el.get_attribute("placeholder") or ""
-                if "정답" in ph or not el.get_attribute("value"):
-                    return el
         return None
 
     def _solve_inquiry_followup(self, clear_first: bool = False) -> bool:
@@ -2399,6 +3255,13 @@ class NaverReporter:
 
         self.log(f"추가 질문 답변: {answer}")
         self._type_into_element(answer_input, answer, label="문의폼 정답")
+        filled = self._read_element_value(answer_input)
+        if filled != answer:
+            self._paste_into_element(answer_input, answer, label="문의폼 정답")
+            filled = self._read_element_value(answer_input)
+        if filled != answer:
+            self.log(f"정답 입력 확인 실패 (화면: {filled or '비어 있음'})")
+            return False
         self._human_delay(0.5, 1.2)
         return True
 
@@ -2451,6 +3314,7 @@ class NaverReporter:
         content: str,
         search_url: str = "",
         inquiry_category: str = "illegal",
+        naver_id: str = "",
     ) -> bool:
         """문의 작성 폼을 채웁니다."""
         if self._should_stop():
@@ -2458,10 +3322,16 @@ class NaverReporter:
         category = inquiry_category if inquiry_category in self.INQUIRY_CATEGORY_LABELS else "illegal"
         category_label = self.INQUIRY_CATEGORY_LABELS[category]
         effective_search = (search_url or site).strip()
+        account_id = (naver_id or getattr(self, "_current_naver_id", "") or "").strip()
         try:
             self._go_to_inquiry_page()
             wait = self._wait(15)
             self._human_delay(0.8, 1.5)
+
+            if self._inquiry_guest_email_field() or self._inquiry_login_buttons():
+                if not self._fill_guest_inquiry_email(account_id):
+                    self.log("비로그인 신고 — 이메일 입력 실패")
+                    return False
 
             url_input = wait.until(EC.presence_of_element_located((By.ID, "requiredUrl1")))
             self._paste_into_element(url_input, site, label="게시물 URL")
@@ -2505,6 +3375,11 @@ class NaverReporter:
                 self.log(f"유형 선택 처리 오류: {e}")
                 return False
 
+            if self._inquiry_guest_email_field():
+                if not self._fill_guest_inquiry_email(account_id):
+                    self.log("제출 전 이메일 입력 실패")
+                    return False
+
             if not self._submit_inquiry(wait):
                 self.log("문의 접수 실패")
                 return False
@@ -2521,7 +3396,7 @@ class NaverReporter:
             report_type = task.get("report_type", "")
             search_url = task.get("search_url", "") or site
             if task.get("search_url_auto") and report_type:
-                search_url = fetch_naver_search_url_live(report_type, driver=self.driver, log=self.log)
+                search_url = search_url or site
             item = {
                 "account_id": naver_id,
                 "account_password": naver_pw,
@@ -2548,7 +3423,7 @@ class NaverReporter:
         results = []
         try:
             self.start_driver()
-            ok, reason = self.login(naver_id, naver_pw)
+            ok, reason = self.login(naver_id, naver_pw, from_inquiry=True)
             if not ok:
                 if reason == "protected":
                     detail = self._login_restriction_detail()
@@ -2565,6 +3440,15 @@ class NaverReporter:
                         self.log(f"[{naver_id}] 로그인 실패로 중단")
                 return results
 
+            self._current_naver_id = naver_id
+            first_task = tasks[0] if tasks else {}
+            self._remember_inquiry_tab()
+            if first_task.get("search_url_auto") and (first_task.get("report_type") or "").strip():
+                self.log("첫 항목이 자동 URL — 로그인 창과 분리된 브라우저에서 유형 검색")
+                self._run_first_start_warmup((first_task.get("report_type") or "").strip())
+            else:
+                self.log("첫 항목이 수동 URL — 유형 검색 생략")
+
             for idx, task in enumerate(tasks):
                 if self._should_stop():
                     self.log("사용자 요청으로 신고 중단")
@@ -2578,7 +3462,12 @@ class NaverReporter:
                 search_url_auto = task.get("search_url_auto", False)
                 inquiry_category = task.get("inquiry_category", "illegal")
                 if search_url_auto and report_type:
-                    search_url = fetch_naver_search_url_live(report_type, driver=self.driver, log=self.log)
+                    warmed = self._consume_warmup_search_url(report_type)
+                    if warmed:
+                        search_url = warmed
+                        self.log("자동 URL — 분리 검색으로 확보한 주소 사용")
+                    else:
+                        search_url = self._collect_auto_search_url(report_type) or search_url
 
                 self._human_delay(1.0, 2.5)
                 rewritten = self._rewrite(template, naver_id, site, report_type)
@@ -2589,6 +3478,7 @@ class NaverReporter:
                     site, report_type, rewritten,
                     search_url=search_url,
                     inquiry_category=inquiry_category,
+                    naver_id=naver_id,
                 )
                 dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 results.append({
@@ -2603,6 +3493,8 @@ class NaverReporter:
                     "search_url": search_url,
                     "search_url_custom": search_url_custom,
                     "search_url_auto": search_url_auto,
+                    "login_mode": "email" if self._guest_email_used else "login",
+                    "guest_email": self._guest_email_address,
                 })
                 if self.result_callback:
                     self.result_callback(results[-1])

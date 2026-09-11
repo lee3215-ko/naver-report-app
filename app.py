@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from chrome_browser import BROWSER_MODE_LABELS, DEFAULT_BROWSER_MODE, browser_mode_label, normalize_browser_mode
 from naver_reporter import NaverReporter
@@ -105,6 +105,7 @@ class DetailWindow:
     def __init__(self, parent, site, report_type, original, rewritten,
                  account_id="", account_password="",
                  search_url="", search_url_custom=False, search_url_auto=False,
+                 guest_email="", login_mode="",
                  app=None):
         self.top = ctk.CTkToplevel(parent) if ctk else tk.Toplevel(parent)
         self.top.title("신고 내용 상세")
@@ -161,6 +162,15 @@ class DetailWindow:
         self.account_pw_box.pack(fill=tk.X, pady=(4, 0))
         self._set_text(self.account_pw_box, account_password or "")
 
+        if login_mode == "email" or guest_email:
+            email_txt = guest_email or f"{account_id}@naver.com"
+            ui_label(
+                meta_inner,
+                f"로그인 풀림 — 이메일 신고 ({email_txt})",
+                "small",
+                COLORS["warning"],
+            ).pack(anchor="w", pady=(10, 0))
+
         ui_label(outer, "원본 신고 내용", "subheading", COLORS["text"]).grid(row=1, column=0, sticky="w")
         orig_card = ui_card(outer)
         orig_card.grid(row=2, column=0, sticky="nsew", pady=(6, 14))
@@ -177,8 +187,8 @@ class DetailWindow:
         rew_card = ui_card(outer)
         rew_card.grid(row=4, column=0, sticky="nsew", pady=(6, 14))
         self.rew_box = self._textbox(rew_card)
-        self.rew_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
-        self._set_text(self.rew_box, rewritten)
+        self.rew_box.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        self._set_text(self.rew_box, ReportApp.pretty_rewrite(rewritten))
         self.update_length()
         self.rew_box.bind("<KeyRelease>", lambda e: self.update_length())
 
@@ -257,9 +267,10 @@ class DetailWindow:
         return tb
 
     def _textbox(self, parent, readonly=False):
+        rewrite_font = (FONTS["body"][0], 12)
         if ctk:
             tb = ctk.CTkTextbox(
-                parent, wrap=tk.WORD, font=FONTS["body"],
+                parent, wrap=tk.WORD, font=rewrite_font,
                 fg_color=COLORS["input_bg"], text_color=COLORS["text"],
                 border_color=COLORS["input_border"], border_width=1,
                 corner_radius=10, activate_scrollbars=True,
@@ -268,11 +279,11 @@ class DetailWindow:
                 tb.configure(state="disabled")
             return tb
         return tk.Text(
-            parent, wrap=tk.WORD, font=FONTS["body"],
+            parent, wrap=tk.WORD, font=rewrite_font, spacing3=8,
             bg=COLORS["input_bg"], fg=COLORS["text"],
             insertbackground=COLORS["text"],
             highlightbackground=COLORS["input_border"], highlightthickness=1,
-            padx=10, pady=10, relief=tk.FLAT,
+            padx=12, pady=12, relief=tk.FLAT,
         )
 
     def _set_text(self, widget, text, readonly=False):
@@ -741,9 +752,11 @@ class RegisterWindow:
         self.search_url_text.bind("<Control-Return>", lambda e: self.register())
         if self.edit_mode:
             self._load_task(app.tasks[task_index])
+        else:
+            self._restore_register_prefs()
         self._update_url_preview()
         self.top.resizable(True, True)
-        self.app.setup_dialog(self.top, "register", 1180, 780, 920, 520, modal=False)
+        self.app.setup_dialog(self.top, "register", 1240, 860, 1040, 640, modal=False)
         self._closed = False
         self._focus_after_id = None
         self.top.protocol("WM_DELETE_WINDOW", self.close)
@@ -760,9 +773,23 @@ class RegisterWindow:
         if self._closed:
             return
         try:
-            self.type_entry.focus_set()
+            if not self.edit_mode and self._get_type_text().strip():
+                self.site_text.focus_set()
+            else:
+                self.type_entry.focus_set()
         except tk.TclError:
             pass
+
+    def _restore_register_prefs(self):
+        dual_kind = bool(getattr(self.app, "last_register_dual_kind", False))
+        report_type = (getattr(self.app, "last_register_report_type", "") or "").strip()
+        if report_type:
+            self._set_type_text(report_type)
+        self.dual_kind_report = dual_kind
+        self._apply_dual_kind_report_ui()
+
+    def _persist_register_prefs(self, *, dual_kind=None, report_type=None):
+        self.app.save_register_prefs(dual_kind=dual_kind, report_type=report_type)
 
     def _cancel_pending_after(self):
         for after_id in (self._preview_after_id, self._focus_after_id):
@@ -868,6 +895,11 @@ class RegisterWindow:
         if self._closed:
             return
         self._update_url_preview()
+        if not self.edit_mode:
+            self._persist_register_prefs(
+                dual_kind=self.dual_kind_report,
+                report_type=self._get_type_text(),
+            )
 
     def _toggle_search_auto(self):
         if self.dual_kind_report:
@@ -883,6 +915,10 @@ class RegisterWindow:
             self._apply_search_auto_ui()
         self._apply_dual_kind_report_ui()
         self._update_url_preview()
+        self._persist_register_prefs(
+            dual_kind=self.dual_kind_report,
+            report_type=self._get_type_text(),
+        )
 
     def _apply_dual_kind_report_ui(self):
         active = self.dual_kind_report
@@ -1254,6 +1290,7 @@ class RegisterWindow:
             site, effective, custom, auto = pairs[0]
             idx = self.task_index
             category = self._get_inquiry_category()
+            self._persist_register_prefs(report_type=report_type)
 
             def apply_edit():
                 self.app.update_task(
@@ -1270,6 +1307,7 @@ class RegisterWindow:
         batch = list(pairs)
         site_count = len(self._parse_site_lines())
         dual_kind = self.dual_kind_report
+        self._persist_register_prefs(dual_kind=dual_kind, report_type=report_type)
 
         def apply_register():
             for site, effective, custom, auto in batch:
@@ -1306,6 +1344,10 @@ class ReportApp:
         self.root.title(f"Naver Report · v{APP_VERSION}")
         apply_main_window(
             self.root,
+            preferred_w=1720,
+            preferred_h=980,
+            min_w=1480,
+            min_h=780,
             geometry_store=self.window_geometry,
             save_callback=self.save_window_geometry,
         )
@@ -1322,6 +1364,20 @@ class ReportApp:
         configure_treeview("Template.Treeview")
         configure_treeview("Cafe.Treeview")
         configure_treeview("Blog.Treeview")
+        configure_treeview("Results.Treeview")
+        configure_treeview("Stats.Treeview")
+        style = ttk.Style()
+        style.configure("Results.Treeview", rowheight=44, font=FONTS["body"])
+        style.configure("Job.Horizontal.TProgressbar",
+                        troughcolor=COLORS["accent_light"], background=COLORS["accent"], thickness=16)
+
+        self._job_status = {
+            "website": {"label": "웹사이트", "done": 0, "total": 0, "account": "", "running": False, "stopped": False, "skipped": [], "skipping": ""},
+            "blog": {"label": "블로그", "done": 0, "total": 0, "account": "", "running": False, "stopped": False, "skipped": [], "skipping": ""},
+            "cafe": {"label": "카페", "done": 0, "total": 0, "account": "", "running": False, "stopped": False, "skipped": [], "skipping": ""},
+        }
+        self._job_ui = {}
+        self._log_scroll_locked = False
 
         self.hidden_results = {}
         self.tasks = []
@@ -1330,6 +1386,8 @@ class ReportApp:
         self._task_drag_state = None
         self._task_drag_indicator = None
         self._task_drag_ghost = None
+        self.last_register_dual_kind = False
+        self.last_register_report_type = ""
 
         self.sidebar = SidebarNav(
             self.root,
@@ -1538,19 +1596,24 @@ class ReportApp:
 
         btn_frame = self._frame(bottom_card, COLORS["card"])
         btn_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
 
-        ui_button(btn_frame, "+ 신고 항목 등록", "primary", height=44, command=self.open_register_window).pack(side=tk.LEFT, padx=(0, 8))
-        ui_button(btn_frame, "선택 삭제", "danger", height=44, command=self.delete_selected_task).pack(side=tk.LEFT, padx=(0, 8))
+        left_btns = self._frame(btn_frame, COLORS["card"])
+        left_btns.grid(row=0, column=0, sticky="w")
+        ui_button(left_btns, "+ 신고 항목 등록", "primary", height=44, command=self.open_register_window).pack(side=tk.LEFT, padx=(0, 8))
+        ui_button(left_btns, "선택 삭제", "danger", height=44, command=self.delete_selected_task).pack(side=tk.LEFT, padx=(0, 8))
+        self._pack_browser_controls(left_btns)
 
-        self._pack_browser_controls(btn_frame)
-
-        self.preview_btn = ui_button(btn_frame, "리라이트 미리보기", "warning", height=44, command=self.preview_all)
-        self.preview_btn.pack(side=tk.RIGHT, padx=(8, 0))
-        self.stop_report_btn = ui_button(btn_frame, "신고 정지", "danger", height=44, command=self.stop_website_report)
-        self.stop_report_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        right_btns = self._frame(btn_frame, COLORS["card"])
+        right_btns.grid(row=0, column=1, sticky="e")
+        self.preview_btn = ui_button(right_btns, "리라이트 미리보기", "warning", height=44, command=self.preview_all)
+        self.preview_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.stop_report_btn = ui_button(right_btns, "신고 정지", "danger", height=44, command=self.stop_website_report)
+        self.stop_report_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.stop_report_btn.configure(state=tk.DISABLED)
-        self.report_btn = ui_button(btn_frame, "신고 시작", "success", height=44, command=self.start_report)
-        self.report_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.report_btn = ui_button(right_btns, "신고 시작", "success", height=44, command=self.start_report)
+        self.report_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         prog_frame = self._frame(bottom_card, COLORS["card"])
         prog_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
@@ -1967,28 +2030,34 @@ class ReportApp:
         stats_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         stats_inner = self._frame(stats_card, COLORS["card"])
         stats_inner.pack(fill=tk.X, padx=20, pady=14)
-        ui_label(stats_inner, "사이트별 신고 집계", "body_bold", COLORS["text"]).pack(anchor="w")
-        ui_label(
-            stats_inner,
-            "보호조치 계정은 신고 횟수에서 제외됩니다.",
-            "caption",
-            COLORS["text_light"],
-        ).pack(anchor="w", pady=(2, 8))
-        if ctk:
-            self.site_stats_text = ctk.CTkTextbox(
-                stats_inner, wrap=tk.WORD, font=FONTS["mono"], height=88,
-                fg_color=COLORS["accent_light"], text_color=COLORS["text"],
-                border_color=COLORS["card_border"], border_width=1, corner_radius=10,
-                activate_scrollbars=True, state="disabled",
-            )
-        else:
-            self.site_stats_text = tk.Text(
-                stats_inner, wrap=tk.WORD, font=FONTS["mono"], height=5,
-                bg=COLORS["accent_light"], fg=COLORS["text"],
-                highlightbackground=COLORS["card_border"], highlightthickness=1,
-                padx=10, pady=8, relief=tk.FLAT, state=tk.DISABLED,
-            )
-        self.site_stats_text.pack(fill=tk.X)
+        stats_inner.grid_columnconfigure(0, weight=1)
+
+        head = self._frame(stats_inner, COLORS["card"])
+        head.grid(row=0, column=0, sticky="ew")
+        ui_label(head, "사이트별 신고 집계", "body_bold", COLORS["text"]).pack(side=tk.LEFT)
+        self.results_summary_label = ui_label(head, "", "small", COLORS["text_muted"])
+        self.results_summary_label.pack(side=tk.RIGHT)
+
+        stats_wrap = self._frame(stats_inner, COLORS["card"])
+        stats_wrap.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        stats_wrap.grid_columnconfigure(0, weight=1)
+        self.site_stats_tree = ttk.Treeview(
+            stats_wrap,
+            columns=("site", "count", "note"),
+            show="headings",
+            style="Stats.Treeview",
+            height=4,
+        )
+        self.site_stats_tree.heading("site", text="사이트")
+        self.site_stats_tree.heading("count", text="신고")
+        self.site_stats_tree.heading("note", text="비고")
+        self.site_stats_tree.column("site", width=420, anchor="w")
+        self.site_stats_tree.column("count", width=70, anchor="center")
+        self.site_stats_tree.column("note", width=220, anchor="w")
+        self.site_stats_tree.grid(row=0, column=0, sticky="ew")
+        stats_sb = ttk.Scrollbar(stats_wrap, orient=tk.VERTICAL, command=self.site_stats_tree.yview)
+        stats_sb.grid(row=0, column=1, sticky="ns")
+        self.site_stats_tree.configure(yscrollcommand=stats_sb.set)
 
         card = self._card(parent)
         card.grid(row=2, column=0, sticky="nsew")
@@ -2006,41 +2075,34 @@ class ReportApp:
 
         tree = ttk.Treeview(
             frame,
-            columns=("datetime", "account", "site", "search_mode", "report_type", "site_count", "original", "rewritten"),
-            show="headings", style="Preview.Treeview", selectmode="extended",
+            columns=("datetime", "account", "status", "report_type", "site", "rewritten"),
+            show="headings", style="Results.Treeview", selectmode="extended",
         )
-        tree.heading("datetime", text="생성 시간")
-        tree.heading("account", text="사용 계정")
-        tree.heading("site", text="사이트")
-        tree.heading("search_mode", text="검색URL")
+        tree.heading("datetime", text="시간")
+        tree.heading("account", text="계정")
+        tree.heading("status", text="상태")
         tree.heading("report_type", text="유형")
-        tree.heading("site_count", text="사이트 신고")
-        tree.heading("original", text="원본 신고 내용")
-        tree.heading("rewritten", text="리라이트 된 내용")
-        tree.column("datetime", width=110, anchor="center")
-        tree.column("account", width=90, anchor="center")
-        tree.column("site", width=150, anchor="w")
-        tree.column("search_mode", width=72, anchor="center")
-        tree.column("report_type", width=70, anchor="center")
-        tree.column("site_count", width=80, anchor="center")
-        tree.column("original", width=220, anchor="w")
-        tree.column("rewritten", width=220, anchor="w")
+        tree.heading("site", text="사이트")
+        tree.heading("rewritten", text="리라이트")
+        tree.column("datetime", width=90, anchor="center", stretch=False)
+        tree.column("account", width=110, anchor="center", stretch=False)
+        tree.column("status", width=78, anchor="center", stretch=False)
+        tree.column("report_type", width=72, anchor="center", stretch=False)
+        tree.column("site", width=200, anchor="w", stretch=False)
+        tree.column("rewritten", width=520, anchor="w")
         tree.grid(row=0, column=0, sticky="nsew")
 
         sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
         tree.configure(yscrollcommand=sb.set)
 
-        hsb = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=tree.xview)
-        hsb.grid(row=1, column=0, sticky="ew")
-        tree.configure(xscrollcommand=hsb.set)
-
         del_btn = ui_button(frame, "선택 항목 삭제", "danger", height=38, command=self.delete_selected_result)
-        del_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        del_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
         tree.bind("<Double-1>", lambda e: self.open_preview_detail())
         tree.bind("<Delete>", lambda e: self.delete_selected_result())
-        tree.tag_configure("protected", background="#d1d5db", foreground="#6b7280")
+        tree.tag_configure("protected", background="#e5e7eb", foreground="#6b7280")
+        tree.tag_configure("row_email", background="#fef3c7", foreground="#92400e")
         return tree
 
     # ===================== Settings Tab =====================
@@ -2172,6 +2234,8 @@ class ReportApp:
         self.account_tree.bind("<Delete>", lambda e: self.delete_selected_account())
         self.account_tree.bind("<Double-1>", self._on_account_tree_double_click)
         self.account_tree.bind("<Button-1>", self._on_account_tree_click, add="+")
+        self.account_tree.bind("<Control-c>", self._on_account_tree_copy)
+        self.account_tree.bind("<Control-C>", self._on_account_tree_copy)
         self._account_cell_entry = None
 
         bulk_frame = self._frame(account_card, COLORS["card"])
@@ -2197,12 +2261,16 @@ class ReportApp:
 
         add_frame = self._frame(account_card, COLORS["card"])
         add_frame.grid(row=3, column=0, sticky="ew", padx=15, pady=(0, 12))
-        add_frame.grid_columnconfigure((0, 1), weight=1)
+        add_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         ui_button(add_frame, "일괄 등록", "primary", height=38, command=self.add_accounts_bulk).grid(
             row=0, column=0, sticky="ew", padx=(0, 8))
+        ui_button(add_frame, "아이디 복사", "ghost", height=38, command=self.copy_selected_account_ids).grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        ui_button(add_frame, "비밀번호 변경", "warning", height=38, command=self.change_selected_account_password).grid(
+            row=0, column=2, sticky="ew", padx=(0, 8))
         ui_button(add_frame, "선택 삭제", "danger", height=38, command=self.delete_selected_account).grid(
-            row=0, column=1, sticky="ew")
+            row=0, column=3, sticky="ew")
 
     # ===================== Log Tab =====================
     _LOG_CHANNEL_LABELS = {
@@ -2258,13 +2326,15 @@ class ReportApp:
             widget.delete("1.0", tk.END)
             widget.insert(tk.END, text)
         widget.configure(state=tk.DISABLED)
-        widget.see(tk.END)
+        if not getattr(self, "_log_scroll_locked", False):
+            widget.see(tk.END)
 
     def _append_log_widget(self, widget, line: str):
         widget.configure(state=tk.NORMAL)
         widget.insert(tk.END, f"{line}\n")
-        widget.see(tk.END)
         widget.configure(state=tk.DISABLED)
+        if not getattr(self, "_log_scroll_locked", False):
+            widget.see(tk.END)
 
     def build_log_tab(self, parent):
         parent.grid_rowconfigure(0, weight=1)
@@ -2272,17 +2342,28 @@ class ReportApp:
 
         card = self._card(parent)
         card.pack(fill=tk.BOTH, expand=True)
-        card.grid_rowconfigure(1, weight=1)
+        card.grid_rowconfigure(2, weight=1)
         card.grid_columnconfigure(0, weight=1)
 
+        self._build_job_status_panel(card)
+
         header = self._frame(card, COLORS["card"])
-        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 8))
+        header.grid(row=1, column=0, sticky="ew", padx=20, pady=(8, 8))
         ui_label(header, "실행 로그", "subheading", COLORS["text"]).pack(side=tk.LEFT)
         self.log_layout_hint = ui_label(header, "", "caption", COLORS["text_muted"])
         self.log_layout_hint.pack(side=tk.LEFT, padx=(12, 0))
+        self.log_copy_btn = ui_button(
+            header, "전체 복사", "ghost", width=96, height=32, command=self._copy_all_logs,
+        )
+        self.log_copy_btn.pack(side=tk.RIGHT)
+        self.log_lock_btn = ui_button(
+            header, "🔓", "ghost", width=40, height=32, command=self._toggle_log_scroll_lock,
+        )
+        self.log_lock_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        self._apply_log_lock_button()
 
         self.log_body = self._frame(card, COLORS["card"])
-        self.log_body.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        self.log_body.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 20))
         self.log_body.grid_rowconfigure(0, weight=1)
         self.log_body.grid_columnconfigure(0, weight=1)
 
@@ -2342,6 +2423,203 @@ class ReportApp:
             self._log_channel_cols[ch] = col_frame
 
         self.log_split_frame.grid_remove()
+
+    def _job_status_channels(self):
+        channels = ["website", "blog"]
+        if getattr(self, "admin_mode", False):
+            channels.append("cafe")
+        return channels
+
+    def _build_job_status_panel(self, parent):
+        wrap = self._frame(parent, COLORS["card"])
+        wrap.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 0))
+        if ctk:
+            panel = ctk.CTkFrame(
+                wrap, fg_color=COLORS["accent_light"], corner_radius=12,
+                border_width=1, border_color=COLORS["card_border"],
+            )
+            panel.pack(fill=tk.X)
+            inner = ctk.CTkFrame(panel, fg_color="transparent")
+            inner.pack(fill=tk.X, padx=16, pady=12)
+        else:
+            inner = tk.Frame(wrap, bg=COLORS["accent_light"], highlightbackground=COLORS["card_border"], highlightthickness=1)
+            inner.pack(fill=tk.X)
+            inner.configure(padx=12, pady=10)
+
+        ui_label(inner, "진행 현황", "subheading", COLORS["text"]).pack(anchor="w", pady=(0, 8))
+        self._job_ui = {}
+        for ch in self._job_status_channels():
+            if ctk:
+                row = ctk.CTkFrame(inner, fg_color="transparent")
+                top = ctk.CTkFrame(row, fg_color="transparent")
+            else:
+                row = tk.Frame(inner, bg=COLORS["accent_light"])
+                top = tk.Frame(row, bg=COLORS["accent_light"])
+            row.pack(fill=tk.X, pady=(0, 8))
+            top.pack(fill=tk.X)
+            ui_label(top, self._job_status[ch]["label"], "body_bold", COLORS["text"]).pack(side=tk.LEFT)
+            count = ui_label(top, "대기 중", "body_bold", COLORS["accent"])
+            count.pack(side=tk.LEFT, padx=(12, 0))
+            account = ui_label(top, "", "small", COLORS["text_muted"])
+            account.pack(side=tk.RIGHT)
+            if ctk:
+                bar = ctk.CTkProgressBar(
+                    row, height=16, corner_radius=8,
+                    progress_color=COLORS["accent"], fg_color="#c7d2fe",
+                )
+                bar.pack(fill=tk.X, pady=(6, 0))
+                bar.set(0)
+            else:
+                bar = ttk.Progressbar(
+                    row, mode="determinate", maximum=100, style="Job.Horizontal.TProgressbar",
+                )
+                bar.pack(fill=tk.X, pady=(6, 0))
+            skip = ui_label(row, "", "small", COLORS["warning"])
+            skip.pack(anchor="w", pady=(4, 0))
+            self._job_ui[ch] = {"count": count, "account": account, "bar": bar, "skip": skip}
+        self._refresh_job_status_ui()
+
+    def _begin_job(self, channel: str, total: int):
+        st = self._job_status.get(channel)
+        if not st:
+            return
+        st.update({
+            "done": 0,
+            "total": max(int(total), 0),
+            "account": "",
+            "running": True,
+            "stopped": False,
+            "skipped": [],
+            "skipping": "",
+        })
+        self._refresh_job_status_ui()
+
+    def _set_job_total(self, channel: str, total: int):
+        st = self._job_status.get(channel)
+        if not st:
+            return
+        st["total"] = max(int(total), 0)
+        self._refresh_job_status_ui()
+
+    def _set_job_account(self, channel: str, account_id: str):
+        st = self._job_status.get(channel)
+        if not st:
+            return
+        st["account"] = (account_id or "").strip()
+        if st.get("skipping") and st["skipping"] != st["account"]:
+            st["skipping"] = ""
+        self._refresh_job_status_ui()
+
+    def _mark_job_protected_skip(self, channel: str, account_id: str = ""):
+        st = self._job_status.get(channel)
+        if not st:
+            return
+        aid = (account_id or st.get("account") or "").strip()
+        if not aid:
+            return
+        skipped = list(st.get("skipped") or [])
+        if aid not in skipped:
+            skipped.append(aid)
+        st["skipped"] = skipped
+        st["skipping"] = aid
+        self._refresh_job_status_ui()
+
+    def _tick_job(self, channel: str, done: int, total: int | None = None):
+        st = self._job_status.get(channel)
+        if not st:
+            return
+        st["done"] = max(int(done), 0)
+        if total is not None:
+            st["total"] = max(int(total), 0)
+        self._refresh_job_status_ui()
+
+    def _finish_job(self, channel: str, stopped: bool = False):
+        st = self._job_status.get(channel)
+        if not st:
+            return
+        st["running"] = False
+        st["stopped"] = bool(stopped)
+        if not stopped and st["total"]:
+            st["done"] = st["total"]
+        self._refresh_job_status_ui()
+
+    def _parse_job_account_from_log(self, channel: str, message: str):
+        text = str(message or "")
+        matched = re.search(r"\[계정 시작\]\s+(\S+)", text)
+        if not matched:
+            matched = re.search(r"\[(?:카페|블로그)\] 계정 시작:\s+(\S+)", text)
+        if matched:
+            self._set_job_account(channel, matched.group(1))
+            return
+        if "보호조치" in text or "로그인 제한" in text:
+            if "보호조치 제외 계정" in text:
+                return
+            aid = ""
+            tagged = re.search(r"\[([^\]]+)\]", text)
+            if tagged:
+                token = tagged.group(1).strip()
+                skip_tags = {
+                    "계정 시작", "계정 완료", "집계", "수집",
+                    "카페", "블로그", "웹사이트", "공통",
+                }
+                if token not in skip_tags and not token.startswith("계정"):
+                    aid = token.split()[0]
+            self._mark_job_protected_skip(channel, aid)
+
+    def _refresh_job_status_ui(self):
+        if not getattr(self, "_job_ui", None):
+            return
+        for ch, widgets in self._job_ui.items():
+            st = self._job_status.get(ch, {})
+            done = int(st.get("done") or 0)
+            total = int(st.get("total") or 0)
+            account = st.get("account") or ""
+            running = bool(st.get("running"))
+            stopped = bool(st.get("stopped"))
+            skipped = list(st.get("skipped") or [])
+            skipping = st.get("skipping") or ""
+            if running:
+                count_text = f"{done} / {total} 진행 중" if total else f"{done}건 진행 중"
+                if skipped:
+                    count_text += f" · 건너뜀 {len(skipped)}"
+                if skipping and skipping == account:
+                    account_text = f"아이디  {account}  ·  보호조치 건너뜀"
+                elif account:
+                    account_text = f"아이디  {account}"
+                else:
+                    account_text = "아이디  —"
+            elif stopped and total:
+                count_text = f"{done} / {total} 중단"
+                if skipped:
+                    count_text += f" · 건너뜀 {len(skipped)}"
+                account_text = f"마지막  {account}" if account else ""
+            elif total and done >= total:
+                count_text = f"{total} / {total} 완료"
+                if skipped:
+                    count_text += f" · 건너뜀 {len(skipped)}"
+                account_text = ""
+            else:
+                count_text = "대기 중"
+                account_text = ""
+            widgets["count"].configure(text=count_text)
+            widgets["account"].configure(text=account_text)
+            skip_widget = widgets.get("skip")
+            if skip_widget is not None:
+                if skipped:
+                    names = ", ".join(skipped)
+                    skip_widget.configure(text=f"보호조치 건너뜀  {len(skipped)}개 · {names}")
+                else:
+                    skip_widget.configure(text="")
+            ratio = 0.0
+            if total > 0:
+                ratio = min(done / total, 1.0)
+            elif running:
+                ratio = 0.04
+            bar = widgets["bar"]
+            if ctk and hasattr(bar, "set"):
+                bar.set(ratio)
+            else:
+                bar.configure(value=int(ratio * 100))
 
     def _register_log_channel(self, channel: str):
         if channel not in self._log_buffers:
@@ -2428,6 +2706,84 @@ class ReportApp:
             tag = self._LOG_CHANNEL_LABELS.get(channel, channel)
             self._append_log_widget(self._log_widgets["single"], f"[{tag}] {message}")
 
+    def _toggle_log_scroll_lock(self):
+        self._log_scroll_locked = not getattr(self, "_log_scroll_locked", False)
+        self._apply_log_lock_button()
+        if not self._log_scroll_locked:
+            for widget in getattr(self, "_log_widgets", {}).values():
+                try:
+                    widget.see(tk.END)
+                except Exception:
+                    pass
+
+    def _apply_log_lock_button(self):
+        btn = getattr(self, "log_lock_btn", None)
+        if btn is None:
+            return
+        locked = bool(getattr(self, "_log_scroll_locked", False))
+        if ctk and hasattr(btn, "configure"):
+            try:
+                btn.configure(
+                    text="🔒" if locked else "🔓",
+                    fg_color=COLORS["accent"] if locked else COLORS["border"],
+                    hover_color=COLORS["accent_hover"] if locked else "#e2e8f0",
+                    text_color="#ffffff" if locked else COLORS["text"],
+                )
+                return
+            except Exception:
+                pass
+        try:
+            btn.configure(
+                text="🔒" if locked else "🔓",
+                bg=COLORS["accent"] if locked else COLORS["border"],
+                fg="#ffffff" if locked else COLORS["text"],
+            )
+        except Exception:
+            pass
+
+    def _visible_log_text(self) -> str:
+        if getattr(self, "_log_split_visible", False):
+            chunks = []
+            general = "\n".join(self._log_buffers.get("general") or [])
+            if general.strip():
+                chunks.append(f"[공통]\n{general}")
+            for ch in ("website", "blog", "cafe"):
+                if ch in self._log_active_channels:
+                    body = "\n".join(self._log_buffers.get(ch) or [])
+                    if body.strip():
+                        label = self._LOG_CHANNEL_LABELS.get(ch, ch)
+                        chunks.append(f"[{label}]\n{body}")
+            return "\n\n".join(chunks).strip()
+        lines = []
+        active = getattr(self, "_log_active_channels", set()) or set()
+        for ch, msg in getattr(self, "_log_all_lines", []):
+            if ch == "general" or len(active) <= 1:
+                lines.append(msg)
+            else:
+                tag = self._LOG_CHANNEL_LABELS.get(ch, ch)
+                lines.append(f"[{tag}] {msg}")
+        return "\n".join(lines).strip()
+
+    def _copy_all_logs(self):
+        text = self._visible_log_text()
+        if not text:
+            messagebox.showinfo("실행 로그", "복사할 로그가 없습니다.")
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+        except Exception:
+            messagebox.showerror("실행 로그", "클립보드 복사에 실패했습니다.")
+            return
+        btn = getattr(self, "log_copy_btn", None)
+        if btn is not None:
+            try:
+                btn.configure(text="복사됨")
+                self.root.after(1200, lambda: btn.configure(text="전체 복사"))
+            except Exception:
+                pass
+
     # ===================== Logic =====================
     def text_of(self, widget):
         return widget.get("1.0", tk.END)
@@ -2448,6 +2804,8 @@ class ReportApp:
                 saved_geom = data.get("window_geometry")
                 if isinstance(saved_geom, dict):
                     self.window_geometry = saved_geom
+                self.last_register_dual_kind = bool(data.get("last_register_dual_kind", False))
+                self.last_register_report_type = str(data.get("last_register_report_type", "") or "")
             except Exception:
                 pass
 
@@ -2458,9 +2816,18 @@ class ReportApp:
             "hagrid_mode": bool(self.hagrid_mode_var.get()) if hasattr(self, "hagrid_mode_var") else False,
             "browser_mode": self._selected_browser_mode(),
             "window_geometry": getattr(self, "window_geometry", {}),
+            "last_register_dual_kind": bool(getattr(self, "last_register_dual_kind", False)),
+            "last_register_report_type": str(getattr(self, "last_register_report_type", "") or ""),
         }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def save_register_prefs(self, *, dual_kind=None, report_type=None):
+        if dual_kind is not None:
+            self.last_register_dual_kind = bool(dual_kind)
+        if report_type is not None:
+            self.last_register_report_type = (report_type or "").strip()
+        self.save_settings()
 
     def _ensure_browser_vars(self):
         if not hasattr(self, "hagrid_mode_var"):
@@ -2553,6 +2920,8 @@ class ReportApp:
                         "search_url": value.get("search_url", ""),
                         "search_url_custom": value.get("search_url_custom", False),
                         "search_url_auto": value.get("search_url_auto", False),
+                        "login_mode": value.get("login_mode", ""),
+                        "guest_email": value.get("guest_email", ""),
                     }
             except Exception:
                 self.hidden_results = {}
@@ -2572,6 +2941,8 @@ class ReportApp:
                 "search_url": value.get("search_url", ""),
                 "search_url_custom": value.get("search_url_custom", False),
                 "search_url_auto": value.get("search_url_auto", False),
+                "login_mode": value.get("login_mode", ""),
+                "guest_email": value.get("guest_email", ""),
             }
         with open(RESULTS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -3293,6 +3664,113 @@ class ReportApp:
         return "별도입력" if search_url_custom else "사이트동일"
 
     @staticmethod
+    def pretty_rewrite(text: str) -> str:
+        cleaned = ReportApp._clean_rewrite_text(text or "")
+        cleaned = re.sub(r"[*_`#>]{1,}", "", cleaned)
+        cleaned = cleaned.replace("\r\n", "\n").strip()
+        parts = [re.sub(r"[ \t]+", " ", p).strip() for p in re.split(r"\n\s*\n", cleaned)]
+        paras = [p.replace("\n", " ").strip() for p in parts if p.strip()]
+        if len(paras) == 1 and len(paras[0]) > 160:
+            sents = re.split(r"(?<=다)\.\s+|(?<=요)\.\s+|(?<=니다)\.\s+", paras[0])
+            sents = [s.strip() for s in sents if s.strip()]
+            if len(sents) >= 3:
+                mid = max(1, len(sents) // 2)
+                first = ". ".join(sents[:mid])
+                second = ". ".join(sents[mid:])
+                if not first.endswith(("다", "요")):
+                    first += "."
+                if not second.endswith(("다", "요")):
+                    second += "."
+                paras = [first.strip(), second.strip()]
+        if not paras:
+            return cleaned
+        return "\n\n".join(paras)
+
+    @staticmethod
+    def _clean_rewrite_text(text: str) -> str:
+        cleaned = []
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                continue
+            cleaned.append(line)
+        return "\n".join(cleaned).strip()
+
+    @staticmethod
+    def _one_line_text(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    @staticmethod
+    def _short_datetime(dt: str) -> str:
+        try:
+            return datetime.strptime(dt, "%Y-%m-%d %H:%M:%S").strftime("%m-%d %H:%M")
+        except Exception:
+            return dt or ""
+
+    @staticmethod
+    def _site_display(site: str) -> str:
+        raw = (site or "").strip()
+        if not raw:
+            return ""
+        try:
+            parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+            host = parsed.netloc or raw
+            path = (parsed.path or "").rstrip("/")
+            if path and path != "/":
+                raw = f"{host}{path}"
+            else:
+                raw = host
+        except Exception:
+            pass
+        return raw if len(raw) <= 42 else raw[:42] + "..."
+
+    def _result_status_label(self, status: str, login_mode: str = "", guest_email: str = "") -> str:
+        if status == "protected":
+            return "보호조치"
+        if login_mode == "email" or guest_email:
+            return "이메일"
+        return "완료"
+
+    def _preview_tags_and_values(
+        self, site, report_type, original, rewritten, dt, account_id,
+        status="", login_mode="", guest_email="",
+    ):
+        display_account = self.account_result_label(account_id, login_mode, guest_email)
+        status_label = self._result_status_label(status, login_mode, guest_email)
+        if status == "protected":
+            preview = "보호조치 해제 필요"
+        else:
+            preview = self._one_line_text(self.pretty_rewrite(rewritten))
+        tags = [site, report_type, original, rewritten, dt]
+        if status == "protected":
+            tags = ["protected", *tags]
+        elif login_mode == "email" or guest_email:
+            tags.append("row_email")
+        values = (
+            self._short_datetime(dt),
+            display_account,
+            status_label,
+            report_type,
+            self._site_display(site),
+            self._truncate(preview, 90),
+        )
+        return tuple(tags), values
+
+    @staticmethod
+    def account_result_label(account_id: str, login_mode: str = "", guest_email: str = "") -> str:
+        aid = (account_id or "").strip()
+        if login_mode == "email" or guest_email:
+            return f"{aid} (이메일)" if aid else "이메일 신고"
+        return aid
+
+    @staticmethod
+    def account_id_from_label(label: str) -> str:
+        text = (label or "").strip()
+        if text.endswith("(이메일)"):
+            return text[: -len("(이메일)")].strip()
+        return text
+
+    @staticmethod
     def task_template_display(template_title: str, search_url_auto: bool = False) -> str:
         tag = "자동URL" if search_url_auto else "수동URL"
         return f"{template_title} [{tag}]"
@@ -3659,19 +4137,144 @@ class ReportApp:
                 pass
         self._destroy_account_cell_entry()
 
+    def _account_index_for_item(self, item) -> int:
+        children = list(self.account_tree.get_children())
+        try:
+            return children.index(item)
+        except ValueError:
+            return -1
+
+    def _update_account_password(self, index: int, new_password: str) -> bool:
+        password = (new_password or "").strip()
+        if index < 0 or index >= len(self.accounts):
+            return False
+        if not password:
+            messagebox.showwarning("입력 오류", "비밀번호를 입력해주세요.")
+            return False
+        account_id = self.accounts[index].get("id", "")
+        if self.accounts[index].get("password", "") == password:
+            return True
+        self.accounts[index]["password"] = password
+        self.save_accounts()
+        self.refresh_account_list()
+        children = list(self.account_tree.get_children())
+        if 0 <= index < len(children):
+            self.account_tree.selection_set(children[index])
+            self.account_tree.see(children[index])
+        self.log(f"비밀번호 변경: {account_id}")
+        return True
+
+    def change_selected_account_password(self):
+        selected = self.account_tree.selection()
+        if len(selected) != 1:
+            messagebox.showwarning("선택 오류", "비밀번호를 바꿀 계정을 하나만 선택해주세요.")
+            return
+        item = selected[0]
+        index = self._account_index_for_item(item)
+        if index < 0:
+            return
+        account_id = self.accounts[index].get("id", "")
+        current_pw = self.accounts[index].get("password", "")
+        self._open_password_change_dialog(index, account_id, current_pw)
+
+    def _open_password_change_dialog(self, index: int, account_id: str, current_pw: str):
+        top = tk.Toplevel(self.root) if not ctk else ctk.CTkToplevel(self.root)
+        top.title("비밀번호 변경")
+        top.resizable(False, False)
+        fit_toplevel(top, 420, 240, 380, 210, parent=self.root)
+        if ctk:
+            top.configure(fg_color=COLORS["bg"])
+        else:
+            top.configure(bg=COLORS["bg"])
+        inner = self._frame(top, COLORS["card"] if not ctk else COLORS["bg"])
+        inner.pack(fill=tk.BOTH, expand=True, padx=20, pady=18)
+        ui_label(inner, "아이디", "caption", COLORS["text_muted"]).pack(anchor="w")
+        ui_label(inner, account_id, "body_bold", COLORS["text"]).pack(anchor="w", pady=(0, 12))
+        ui_label(inner, "새 비밀번호", "caption", COLORS["text_muted"]).pack(anchor="w")
+        pw_var = tk.StringVar(value=current_pw)
+        if ctk:
+            pw_entry = ctk.CTkEntry(
+                inner, textvariable=pw_var, height=36,
+                fg_color=COLORS["input_bg"], text_color=COLORS["text"],
+                border_color=COLORS["input_border"],
+            )
+        else:
+            pw_entry = tk.Entry(
+                inner, textvariable=pw_var,
+                bg=COLORS["input_bg"], fg=COLORS["text"],
+            )
+        pw_entry.pack(fill=tk.X, pady=(4, 16))
+        pw_entry.focus_set()
+        pw_entry.icursor(tk.END)
+
+        def save_pw():
+            if self._update_account_password(index, pw_var.get()):
+                top.destroy()
+
+        btns = self._frame(inner, COLORS["card"] if not ctk else COLORS["bg"])
+        btns.pack(fill=tk.X)
+        ui_button(btns, "저장", "primary", height=36, command=save_pw).pack(side=tk.RIGHT)
+        ui_button(btns, "취소", "ghost", height=36, command=top.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+        top.bind("<Return>", lambda e: save_pw())
+        top.bind("<Escape>", lambda e: top.destroy())
+        top.transient(self.root)
+        top.grab_set()
+
+    def copy_selected_account_ids(self):
+        selected = self.account_tree.selection()
+        if not selected:
+            messagebox.showwarning("선택 오류", "복사할 계정을 선택해주세요.")
+            return
+        ids = []
+        for item in selected:
+            values = self.account_tree.item(item).get("values") or []
+            account_id = str(values[0]).strip() if values else ""
+            if account_id:
+                ids.append(account_id)
+        if not ids:
+            messagebox.showwarning("복사", "복사할 아이디가 없습니다.")
+            return
+        text = "\n".join(ids)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+        if len(ids) == 1:
+            self.log(f"아이디 복사: {ids[0]}")
+        else:
+            self.log(f"아이디 {len(ids)}개 복사")
+
+    def _on_account_tree_copy(self, event=None):
+        self.copy_selected_account_ids()
+        return "break"
+
+    def _copy_account_id_from_item(self, item):
+        values = self.account_tree.item(item).get("values") or []
+        account_id = str(values[0]).strip() if values else ""
+        if not account_id:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(account_id)
+        self.root.update_idletasks()
+        self.log(f"아이디 복사: {account_id}")
+
     def _on_account_tree_double_click(self, event):
         tree = self.account_tree
         if tree.identify_region(event.x, event.y) != "cell":
             return
         item = tree.identify_row(event.y)
         col = tree.identify_column(event.x)
-        if not item or not col:
+        if not item:
             return
-        col_idx = int(col.lstrip("#")) - 1
+        if col == "#1":
+            self._copy_account_id_from_item(item)
+            return "break"
+        if col != "#2":
+            return
+        index = self._account_index_for_item(item)
+        if index < 0:
+            return
         values = tree.item(item, "values")
-        if col_idx < 0 or col_idx >= len(values):
-            return
-        text = str(values[col_idx])
+        text = str(values[1]) if len(values) > 1 else ""
         bbox = tree.bbox(item, col)
         if not bbox:
             return
@@ -3693,7 +4296,15 @@ class ReportApp:
         entry.place(x=x, y=y, width=max(w, 80), height=h)
         entry.focus_set()
         entry.selection_range(0, tk.END)
-        entry.bind("<FocusOut>", lambda e: self._destroy_account_cell_entry())
+
+        def commit(event=None):
+            value = entry.get()
+            self._destroy_account_cell_entry()
+            self._update_account_password(index, value)
+            return "break"
+
+        entry.bind("<Return>", commit)
+        entry.bind("<FocusOut>", lambda e: commit())
         entry.bind("<Escape>", lambda e: (self._destroy_account_cell_entry(), "break"))
         self._account_cell_entry = entry
 
@@ -3715,9 +4326,10 @@ class ReportApp:
             self.show_api_btn.configure(text="표시")
 
     def log(self, message, channel: str = "general"):
-        ch = channel if channel in self._log_buffers else "general"
-        self._log_buffers[ch].append(message)
-        self._log_all_lines.append((ch, message))
+        ch = channel if channel in getattr(self, "_log_buffers", {}) else "general"
+        if hasattr(self, "_log_buffers"):
+            self._log_buffers[ch].append(message)
+            self._log_all_lines.append((ch, message))
         if hasattr(self, "_log_widgets"):
             self._append_log_ui(message, ch)
         elif hasattr(self, "log_text"):
@@ -3725,6 +4337,8 @@ class ReportApp:
             self.log_text.insert(tk.END, f"{message}\n")
             self.log_text.see(tk.END)
             self.log_text.configure(state=tk.DISABLED)
+        if ch in getattr(self, "_job_status", {}):
+            self._parse_job_account_from_log(ch, message)
 
     def parse_sites(self, text):
         sites = []
@@ -3870,40 +4484,39 @@ class ReportApp:
     def insert_preview(
         self, site, report_type, original, rewritten, dt=None, account_id=None,
         status=None, search_url_custom=False, search_url_auto=False,
+        login_mode="", guest_email="",
     ):
         if dt is None:
             dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        account_id = account_id or ""
-        display_rewritten = rewritten
-        if status == "protected":
-            display_rewritten = "보호조치 해제 필요"
-        tags = (site, report_type, original, rewritten)
-        if status == "protected":
-            tags = ("protected", site, report_type, original, rewritten)
-        stats = self.compute_site_report_stats()
-        site_count = self._format_site_count_cell(site, status or "", stats)
-        search_label = self.search_url_mode_label(bool(search_url_custom), bool(search_url_auto))
-        self.results_tree.insert("", tk.END, values=(
-            dt, account_id, site, search_label, report_type, site_count,
-            self._truncate(original, 45), self._truncate(display_rewritten, 45)),
-            tags=tags)
+        tags, values = self._preview_tags_and_values(
+            site, report_type, original, rewritten, dt, account_id or "",
+            status or "", login_mode, guest_email,
+        )
+        self.results_tree.insert("", tk.END, values=values, tags=tags)
         self.refresh_site_stats_panel()
+
+    def _unpack_result_tags(self, tags):
+        tags = list(tags or [])
+        if tags and tags[0] == "protected":
+            site, report_type, original, rewritten = tags[1:5]
+            dt = tags[5] if len(tags) > 5 else ""
+        else:
+            site, report_type, original, rewritten = tags[0:4]
+            dt = tags[4] if len(tags) > 4 else ""
+        return site, report_type, original, rewritten, dt
 
     def open_preview_detail(self):
         selected = self.results_tree.selection()
         if not selected:
             return
         row = self.results_tree.item(selected[0])["values"]
-        if len(row) < 5:
+        if len(row) < 2:
             return
-        dt, account_id, site, report_type = row[0], row[1], row[2], row[4]
+        account_id = self.account_id_from_label(str(row[1]))
         tags = self.results_tree.item(selected[0])["tags"]
         if not tags:
             return
-        if tags[0] == "protected":
-            site, report_type, original, rewritten = tags[1], tags[2], tags[3], tags[4]
-        else:
-            site, report_type, original, rewritten = tags[0], tags[1], tags[2], tags[3]
+        site, report_type, original, rewritten, dt = self._unpack_result_tags(tags)
         account_password = self.get_account_password_for_result(dt, account_id, site, report_type)
         result_meta = self.get_result_meta(dt, account_id, site, report_type)
         DetailWindow(
@@ -3912,6 +4525,8 @@ class ReportApp:
             search_url=result_meta.get("search_url", ""),
             search_url_custom=result_meta.get("search_url_custom", False),
             search_url_auto=result_meta.get("search_url_auto", False),
+            guest_email=result_meta.get("guest_email", ""),
+            login_mode=result_meta.get("login_mode", ""),
             app=self,
         )
 
@@ -4057,6 +4672,7 @@ class ReportApp:
         self._register_log_channel("cafe")
         self._sync_report_buttons()
         self.cafe_progress["value"] = 0
+        self._begin_job("cafe", max(total, 1))
 
         skip_pairs = {
             (r.get("account_id"), r.get("url"))
@@ -4085,13 +4701,15 @@ class ReportApp:
                 on_log(f"[수집] 검색결과에서 사라진 게시물 {disappeared}건 → 수집 목록에 「사라짐」 표시")
             total_work[0] = max(len(targets) * total, 1)
             on_log(f"진행 예정: URL {len(targets)}건 × 계정 {total}개 = {total_work[0]}회 시도")
+            self.root.after(0, lambda t=total_work[0]: self._set_job_total("cafe", t))
 
         def on_progress(delta):
             current[0] += delta
             self.root.after(
                 0,
-                lambda c=current[0]: self.cafe_progress.configure(
-                    value=min(c / total_work[0] * 100, 100)
+                lambda c=current[0], t=total_work[0]: (
+                    self.cafe_progress.configure(value=min(c / t * 100, 100)),
+                    self._tick_job("cafe", c, t),
                 ),
             )
 
@@ -4132,6 +4750,7 @@ class ReportApp:
         self._cafe_reporter = None
         self._unregister_log_channel("cafe")
         self._sync_report_buttons()
+        self._finish_job("cafe", stopped=stopped)
         if not stopped:
             self.cafe_progress.configure(value=100)
         self.log("=" * 55, channel="cafe")
@@ -4166,6 +4785,7 @@ class ReportApp:
         self._register_log_channel("blog")
         self._sync_report_buttons()
         self.blog_progress["value"] = 0
+        self._begin_job("blog", max(len(self.accounts) * len(self.blog_urls), 1))
 
         skip_pairs = {
             (r.get("account_id"), self._normalize_blog_url(r.get("url", "")))
@@ -4226,8 +4846,9 @@ class ReportApp:
             current[0] += delta
             self.root.after(
                 0,
-                lambda c=current[0]: self.blog_progress.configure(
-                    value=min(c / total_work[0] * 100, 100)
+                lambda c=current[0], t=total_work[0]: (
+                    self.blog_progress.configure(value=min(c / t * 100, 100)),
+                    self._tick_job("blog", c, t),
                 ),
             )
 
@@ -4272,6 +4893,7 @@ class ReportApp:
         self._blog_reporter = None
         self._unregister_log_channel("blog")
         self._sync_report_buttons()
+        self._finish_job("blog", stopped=stopped)
         if not stopped:
             self.blog_progress.configure(value=100)
         self.log("=" * 55, channel="blog")
@@ -4311,6 +4933,7 @@ class ReportApp:
         self._register_log_channel("website")
         self._sync_report_buttons()
         self.progress["value"] = 0
+        self._begin_job("website", total)
 
         def on_log(message):
             self.root.after(0, lambda m=message: self.log(m, channel="website"))
@@ -4325,20 +4948,33 @@ class ReportApp:
                 "search_url": item.get("search_url", ""),
                 "search_url_custom": item.get("search_url_custom", False),
                 "search_url_auto": item.get("search_url_auto", False),
+                "login_mode": item.get("login_mode", ""),
+                "guest_email": item.get("guest_email", ""),
             }
             dt = self._add_result(item["site"], item["report_type"], data, item["account_id"])
             self.root.after(
                 0,
                 lambda s=item["site"], rt=item["report_type"], o=item["original"], r=item["rewritten"],
                        d=dt, a=item["account_id"], st=status,
-                       suc=item.get("search_url_custom", False), sa=item.get("search_url_auto", False):
-                self.insert_preview(s, rt, o, r, d, a, st, search_url_custom=suc, search_url_auto=sa)
+                       suc=item.get("search_url_custom", False), sa=item.get("search_url_auto", False),
+                       lm=item.get("login_mode", ""), ge=item.get("guest_email", ""):
+                self.insert_preview(
+                    s, rt, o, r, d, a, st,
+                    search_url_custom=suc, search_url_auto=sa,
+                    login_mode=lm, guest_email=ge,
+                )
             )
 
         current = [0]
         def on_progress(delta):
             current[0] += delta
-            self.root.after(0, lambda c=current[0]: self.progress.configure(value=min(c / total * 100, 100)))
+            self.root.after(
+                0,
+                lambda c=current[0]: (
+                    self.progress.configure(value=min(c / total * 100, 100)),
+                    self._tick_job("website", c, total),
+                ),
+            )
 
         def run():
             stopped = False
@@ -4385,6 +5021,7 @@ class ReportApp:
         self._website_reporter = None
         self._unregister_log_channel("website")
         self._sync_report_buttons()
+        self._finish_job("website", stopped=stopped)
         if not stopped:
             self.progress.configure(value=100)
         self.log("=" * 55, channel="website")
@@ -4441,44 +5078,35 @@ class ReportApp:
         return f"{valid}회" if valid else "-"
 
     def refresh_site_stats_panel(self):
-        if not hasattr(self, "site_stats_text"):
+        if not hasattr(self, "site_stats_tree"):
             return
         stats = self.compute_site_report_stats()
-        lines = []
-        all_protected_accounts = set()
+        for item in self.site_stats_tree.get_children():
+            self.site_stats_tree.delete(item)
+        total_valid = 0
+        total_protected = 0
         if not stats:
-            lines.append("등록된 신고 결과가 없습니다.")
+            self.site_stats_tree.insert("", tk.END, values=("등록된 신고 결과가 없습니다.", "", ""))
         else:
             for site, info in sorted(stats.items(), key=lambda x: (-x[1]["valid"], x[0])):
-                short = self._truncate(site, 90)
-                line = f"• {short}  →  신고 {info['valid']}회"
+                total_valid += info["valid"]
+                total_protected += info["protected"]
+                note = ""
                 if info["protected"]:
                     accs = ", ".join(sorted(info["protected_accounts"]))
-                    line += f"  (보호조치 {info['protected']}건 제외"
+                    note = f"보호 {info['protected']}건 제외"
                     if accs:
-                        line += f": {accs}"
-                    line += ")"
-                    all_protected_accounts.update(info["protected_accounts"])
-                lines.append(line)
-            if all_protected_accounts:
-                lines.append("")
-                lines.append(
-                    f"⚠ 보호조치 제외 계정: {', '.join(sorted(all_protected_accounts))}"
+                        note += f" · {accs}"
+                self.site_stats_tree.insert(
+                    "", tk.END,
+                    values=(self._site_display(site), f"{info['valid']}회", note),
                 )
-        text = "\n".join(lines)
-        if ctk and isinstance(self.site_stats_text, ctk.CTkTextbox):
-            self.site_stats_text.configure(state="normal")
-            self.site_stats_text.delete("1.0", tk.END)
-            self.site_stats_text.insert("1.0", text)
-            self.site_stats_text.configure(state="disabled")
-        else:
-            self.site_stats_text.configure(state=tk.NORMAL)
-            self.site_stats_text.delete("1.0", tk.END)
-            self.site_stats_text.insert(tk.END, text)
-            self.site_stats_text.configure(state=tk.DISABLED)
+        if hasattr(self, "results_summary_label"):
+            self.results_summary_label.configure(
+                text=f"유효 {total_valid}회 · 보호제외 {total_protected}건"
+            )
 
     def refresh_results_tree(self, keyword=""):
-        stats = self.compute_site_report_stats()
         self.refresh_site_stats_panel()
         for item in self.results_tree.get_children():
             self.results_tree.delete(item)
@@ -4488,28 +5116,23 @@ class ReportApp:
                 data.get("site", ""),
                 data.get("report_type", ""),
                 data.get("account_id", ""),
-                data.get("rewritten", "")
+                data.get("rewritten", ""),
+                data.get("original", ""),
             ]).lower()
             if k and k not in search_target:
                 continue
-            dt = data.get("datetime", "")
-            account_id = data.get("account_id", "")
-            status = data.get("status", "")
-            site = data.get("site", "")
-            display_rewritten = data["rewritten"]
-            if status == "protected":
-                display_rewritten = "보호조치 해제 필요"
-            site_count = self._format_site_count_cell(site, status, stats)
-            search_label = self.search_url_mode_label(
-                bool(data.get("search_url_custom")), bool(data.get("search_url_auto")),
+            tags, values = self._preview_tags_and_values(
+                data.get("site", ""),
+                data.get("report_type", ""),
+                data.get("original", ""),
+                data.get("rewritten", ""),
+                data.get("datetime", ""),
+                data.get("account_id", ""),
+                data.get("status", ""),
+                data.get("login_mode", ""),
+                data.get("guest_email", ""),
             )
-            tags = (data["site"], data["report_type"], data["original"], data["rewritten"])
-            if status == "protected":
-                tags = ("protected", data["site"], data["report_type"], data["original"], data["rewritten"])
-            self.results_tree.insert("", tk.END, values=(
-                dt, account_id, site, search_label, data["report_type"], site_count,
-                self._truncate(data["original"], 45), self._truncate(display_rewritten, 45)),
-                tags=tags)
+            self.results_tree.insert("", tk.END, values=values, tags=tags)
 
     def delete_selected_result(self):
         selected = self.results_tree.selection()
@@ -4518,12 +5141,16 @@ class ReportApp:
         keys_to_remove: set[str] = set()
         for item in selected:
             values = self.results_tree.item(item)["values"]
-            if len(values) < 5:
+            tags = self.results_tree.item(item)["tags"]
+            if not tags:
                 continue
-            dt, account, site, rt = values[0], values[1], values[2], values[4]
+            site, rt, _orig, _rew, dt = self._unpack_result_tags(tags)
+            account_id = self.account_id_from_label(str(values[1]) if len(values) > 1 else "")
             for key, data in self.hidden_results.items():
-                if (data.get("datetime") == dt and data.get("account_id", "") == account
-                        and data.get("site") == site and data.get("report_type") == rt):
+                if (data.get("datetime") == dt
+                        and data.get("account_id", "") == account_id
+                        and data.get("site") == site
+                        and data.get("report_type") == rt):
                     keys_to_remove.add(key)
                     break
         if not keys_to_remove:

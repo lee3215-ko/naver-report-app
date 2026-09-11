@@ -5,7 +5,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
-from chrome_browser import DEFAULT_BROWSER_MODE, create_webdriver
+from chrome_browser import DEFAULT_BROWSER_MODE, create_webdriver, quit_webdriver
 
 
 def build_naver_search_url_simple(keyword: str) -> str:
@@ -61,7 +61,7 @@ def fetch_naver_search_url_live(keyword: str, driver=None, log=None, browser_mod
         return build_naver_search_url_simple(kw)
     finally:
         if owns_driver and driver is not None:
-            driver.quit()
+            quit_webdriver(driver)
 
 
 def build_naver_search_url(keyword: str, *, driver=None, log=None, live: bool = True, browser_mode: str = DEFAULT_BROWSER_MODE) -> str:
