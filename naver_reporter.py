@@ -2,8 +2,12 @@ import json
 import os
 import random
 import re
+import ssl
 import time
 import base64
+import ctypes
+import urllib.request
+from ctypes import wintypes
 from datetime import datetime
 from urllib.parse import quote, urlparse, urlunparse
 
@@ -25,12 +29,58 @@ from chrome_browser import create_webdriver, normalize_browser_mode, quit_webdri
 from naver_search_url import fetch_naver_search_url_live
 
 
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+VK_MENU = 0x12
+VK_CONTROL = 0x11
+_ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", _ULONG_PTR),
+    )
+
+
+class _INPUT(ctypes.Structure):
+    class _I(ctypes.Union):
+        _fields_ = (("ki", _KEYBDINPUT),)
+    _anonymous_ = ("i",)
+    _fields_ = (("type", wintypes.DWORD), ("i", _I))
+
+
+def _send_windows_hotkey(mod: str, key: str) -> None:
+    vk_mod = VK_CONTROL if str(mod).lower() in ("ctrl", "control") else VK_MENU
+    ch = str(key or "").strip().upper()[:1]
+    if not ch:
+        return
+    vk_key = ord(ch)
+    extra = _ULONG_PTR(0)
+
+    def _send(vk, up=False):
+        flags = KEYEVENTF_KEYUP if up else 0
+        inp = _INPUT(type=INPUT_KEYBOARD, ki=_KEYBDINPUT(vk, 0, flags, 0, extra))
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+
+    _send(vk_mod, False)
+    time.sleep(0.05)
+    _send(vk_key, False)
+    time.sleep(0.05)
+    _send(vk_key, True)
+    time.sleep(0.05)
+    _send(vk_mod, True)
+
+
 class CaptchaSessionReset(Exception):
-    """정답 오답 팝업 5회 — 창을 닫고 실패한 사이트부터 재개."""
+    """정답 오답 팝업 5회 — VPN 전환 후 같은 사이트부터 재개."""
 
 
 class CaptchaSkipAccount(Exception):
-    """오답 5회 대기 후 실패 계정은 건너뛰고 다음 계정이 해당 사이트부터 이어감."""
+    """세션 복구 실패 시 다음 계정이 해당 사이트부터 이어감."""
 
     def __init__(self, task_index: int):
         super().__init__(str(task_index))
@@ -38,7 +88,7 @@ class CaptchaSkipAccount(Exception):
 
 
 class CaptchaStopReport(Exception):
-    """창 재시작 이후에도 정답 오답 팝업 5회 — 신고 자동 정지."""
+    """대기 중 정지 등 신고 자동 중단."""
 
 
 class NaverReporter:
@@ -62,7 +112,8 @@ class NaverReporter:
                  rest_state=None,
                  booster_mode: bool = False,
                  delay_scale: float | None = None,
-                 captcha_state=None):
+                 captcha_state=None,
+                 vpn_hotkey=None):
         self.api_key = api_key
         self.model = model
         self.headless = headless
@@ -99,6 +150,7 @@ class NaverReporter:
         self.resume_task_index = None
         self.skip_report_keys: set[tuple] = set()
         self.captcha_state = captcha_state if isinstance(captcha_state, dict) else {}
+        self.vpn_hotkey = vpn_hotkey if isinstance(vpn_hotkey, dict) else {}
 
     def request_cancel(self):
         self.cancel_requested = True
@@ -1184,11 +1236,88 @@ class NaverReporter:
             time.sleep(min(0.25, max(0.05, end - time.time())))
         self._emit_delay(None)
 
-    def _wait_captcha_cooldown(self, seconds: int = 300):
-        self.log(f"정답 오답 팝업 5회 — 브라우저를 닫고 {seconds // 60}분 대기 후 다음 계정이 이어서 신고합니다")
+    def _wait_captcha_cooldown(self, seconds: int = 30):
+        self.log("정답 오답 팝업 5회 — 브라우저를 닫고 VPN으로 IP를 바꿉니다")
         self.quit_driver()
-        self._wait_with_countdown(seconds, "재시작 대기")
-        self.log("5분 대기 종료 — 다음 계정이 실패한 사이트부터 이어서 신고합니다")
+        old_ip = self._public_ip()
+        if old_ip:
+            self.log(f"변경 전 IP: {old_ip}")
+        self._press_vpn_hotkey()
+        new_ip = self._wait_for_ip_change(old_ip, timeout=max(int(seconds), 1))
+        if new_ip and old_ip and new_ip != old_ip:
+            self.log(f"IP 변경 확인: {old_ip} → {new_ip} — 바로 이어서 진행합니다")
+        elif new_ip:
+            self.log(f"현재 IP: {new_ip} — 이어서 진행합니다")
+        else:
+            self.log("IP 확인 실패 — 30초 대기 후 이어서 진행합니다")
+
+    def _ssl_context(self):
+        try:
+            import certifi
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            return ssl.create_default_context()
+
+    def _public_ip(self) -> str:
+        ctx = self._ssl_context()
+        for url in (
+            "https://api.ipify.org",
+            "https://ipv4.icanhazip.com",
+            "https://ifconfig.me/ip",
+        ):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
+                    ip = (resp.read().decode("utf-8", "ignore") or "").strip()
+                if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", ip) or ":" in ip:
+                    return ip
+            except Exception:
+                continue
+        return ""
+
+    def _wait_for_ip_change(self, old_ip: str, timeout: int = 30) -> str:
+        end = time.time() + timeout
+        last_ip = old_ip
+        last_shown = None
+        while True:
+            if self._should_stop():
+                self._emit_delay(None)
+                self.log("대기 중 신고가 정지되었습니다")
+                raise CaptchaStopReport("stopped")
+            remaining = int(end - time.time() + 0.999)
+            if remaining != last_shown:
+                last_shown = remaining
+                self._emit_delay(max(remaining, 0), "VPN 대기")
+            if old_ip:
+                new_ip = self._public_ip()
+                if new_ip:
+                    last_ip = new_ip
+                    if new_ip != old_ip:
+                        self._emit_delay(None)
+                        return new_ip
+            if remaining <= 0:
+                break
+            time.sleep(1.2)
+        self._emit_delay(None)
+        return last_ip or self._public_ip()
+
+    def _press_vpn_hotkey(self):
+        spec = getattr(self, "vpn_hotkey", None)
+        if not isinstance(spec, dict):
+            return
+        mod = str(spec.get("mod") or "").strip().lower()
+        key = str(spec.get("key") or "").strip().upper()
+        if mod not in ("alt", "ctrl", "control"):
+            return
+        if not key or len(key) != 1 or not (key.isalpha() or key.isdigit()):
+            return
+        label = "Ctrl" if mod in ("ctrl", "control") else "Alt"
+        self.log(f"VPN 단축키 입력: {label}+{key}")
+        try:
+            _send_windows_hotkey(mod, key)
+            time.sleep(2.5)
+        except Exception as exc:
+            self.log(f"VPN 단축키 입력 실패: {exc}")
 
     def _resume_session_after_wait(self, naver_id: str, naver_pw: str):
         self.start_driver()
@@ -1202,32 +1331,9 @@ class NaverReporter:
             return
         ok, reason = self.login(naver_id, naver_pw, from_inquiry=True)
         if not ok:
-            self.log(f"휴식 후 로그인 실패 ({reason or '원인 미상'}) — 다음 계정으로 넘깁니다")
+            self.log(f"VPN 전환 후 로그인 실패 ({reason or '원인 미상'}) — 다음 계정으로 넘깁니다")
             raise CaptchaSkipAccount(int(getattr(self, "_current_task_index", 0) or 0) + 1)
         self._remember_inquiry_tab()
-
-    def _maybe_rest_after_success(self, success: bool, naver_id: str, naver_pw: str):
-        if not success or self._should_stop():
-            return
-        state = getattr(self, "rest_state", None)
-        if not isinstance(state, dict):
-            return
-        minutes = 0
-        try:
-            minutes = max(0, int(state.get("minutes") or 0))
-        except (TypeError, ValueError):
-            minutes = 0
-        if minutes <= 0:
-            return
-        state["count"] = int(state.get("count") or 0) + 1
-        if state["count"] < 10:
-            return
-        state["count"] = 0
-        self.log(f"신고 10건 완료 — 브라우저를 닫고 {minutes}분 휴식 후 이어서 진행합니다")
-        self.quit_driver()
-        self._wait_with_countdown(minutes * 60, "휴식")
-        self.log("휴식 종료 — 이어서 신고합니다")
-        self._resume_session_after_wait(naver_id, naver_pw)
 
     def _fill_form_with_captcha_policy(
         self,
@@ -1260,9 +1366,12 @@ class NaverReporter:
                         state["watch_index"] = task_index
                         state["strikes"] = 1
                     round_no = int(state.get("strikes") or 1)
-                    self.log(f"오답 팝업 5회 — {round_no}/3회차, 브라우저를 닫고 5분 대기 후 재개합니다")
-                self._wait_captcha_cooldown(300)
-                raise CaptchaSkipAccount(task_index)
+                    self.log(f"오답 팝업 5회 — {round_no}/3회차 VPN 전환 후 같은 사이트부터 다시 진행합니다")
+                else:
+                    self.log("오답 팝업 5회 — VPN 전환 후 같은 사이트부터 다시 진행합니다")
+                self._wait_captcha_cooldown(30)
+                self._resume_session_after_wait(naver_id, naver_pw)
+                continue
             except CaptchaStopReport as exc:
                 if str(exc) != "stopped":
                     self.log("같은 사이트에서 오답 팝업 5회가 3번째 반복되어 신고를 자동 정지합니다")
@@ -3548,7 +3657,7 @@ class NaverReporter:
         return True
 
     def _submit_inquiry(self, wait) -> bool:
-        """문의하기 제출. 오답 팝업 5회면 브라우저를 닫고 대기한다."""
+        """문의하기 제출. 오답 팝업 5회면 VPN 전환 후 같은 사이트부터 다시 진행한다."""
         max_attempts = 5
         wrong_hits = 0
         for attempt in range(max_attempts):
@@ -3599,7 +3708,7 @@ class NaverReporter:
 
         self.log("문의 제출 실패 (최대 재시도 초과)")
         if wrong_hits >= 5 or int(getattr(self, "_wrong_captcha_count", 0)) >= 5:
-            self.log("정답 오답 팝업 5회 — 다음 사이트로 넘어가지 않고 대기합니다")
+            self.log("정답 오답 팝업 5회 — VPN 전환 후 같은 사이트부터 다시 진행합니다")
             self._enforce_wrong_captcha_limit()
         return False
 
@@ -3861,14 +3970,6 @@ class NaverReporter:
                 if success:
                     self._clear_captcha_watch_if_done(idx)
                     self._mark_task_reported(naver_id, site, report_type, search_url_auto)
-                    try:
-                        self._maybe_rest_after_success(True, naver_id, naver_pw)
-                    except CaptchaSkipAccount as skip:
-                        self.resume_task_index = skip.task_index
-                        self.log(f"[{naver_id}] 휴식 후 로그인 실패 — 다음 계정이 이어서 진행합니다")
-                        break
-                    except CaptchaStopReport:
-                        break
                 self._human_delay(2.0, 4.5)
         finally:
             if not keep_driver:
@@ -3962,14 +4063,6 @@ class NaverReporter:
             if success:
                 self._clear_captcha_watch_if_done(idx)
                 self._mark_task_reported(naver_id, site, report_type, search_url_auto)
-                try:
-                    self._maybe_rest_after_success(True, naver_id, naver_pw)
-                except CaptchaSkipAccount as skip:
-                    self.resume_task_index = skip.task_index
-                    self.log(f"[{naver_id}] 휴식 후 세션 복구 실패 — 다음 계정이 이어서 진행합니다")
-                    break
-                except CaptchaStopReport:
-                    break
             self._human_delay(0.4, 0.9)
         return results
 

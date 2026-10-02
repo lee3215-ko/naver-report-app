@@ -785,13 +785,18 @@ class RegisterWindow:
     def _restore_register_prefs(self):
         dual_kind = bool(getattr(self.app, "last_register_dual_kind", False))
         report_type = (getattr(self.app, "last_register_report_type", "") or "").strip()
+        last_tpl = (getattr(self.app, "last_register_template", "") or "").strip()
         if report_type:
             self._set_type_text(report_type)
         self.dual_kind_report = dual_kind
         self._apply_dual_kind_report_ui()
+        ids = [tid for tid, _title in self.app.get_template_options()]
+        if last_tpl and last_tpl in ids:
+            self.template_var.set(last_tpl)
+            self._build_template_buttons()
 
-    def _persist_register_prefs(self, *, dual_kind=None, report_type=None):
-        self.app.save_register_prefs(dual_kind=dual_kind, report_type=report_type)
+    def _persist_register_prefs(self, *, dual_kind=None, report_type=None, template=None):
+        self.app.save_register_prefs(dual_kind=dual_kind, report_type=report_type, template=template)
 
     def _cancel_pending_after(self):
         for after_id in (self._preview_after_id, self._focus_after_id):
@@ -901,6 +906,7 @@ class RegisterWindow:
             self._persist_register_prefs(
                 dual_kind=self.dual_kind_report,
                 report_type=self._get_type_text(),
+                template=self.template_var.get(),
             )
 
     def _toggle_search_auto(self):
@@ -920,6 +926,7 @@ class RegisterWindow:
         self._persist_register_prefs(
             dual_kind=self.dual_kind_report,
             report_type=self._get_type_text(),
+            template=self.template_var.get(),
         )
 
     def _apply_dual_kind_report_ui(self):
@@ -1144,6 +1151,8 @@ class RegisterWindow:
     def _pick_template(self, name):
         self.template_var.set(name)
         self._on_tpl_select(name)
+        if not self.edit_mode:
+            self._persist_register_prefs(template=name)
 
     def _parse_search_url_lines(self, *, ignore_auto: bool = False):
         if self.search_url_auto and not ignore_auto and not self.dual_kind_report:
@@ -1292,7 +1301,7 @@ class RegisterWindow:
             site, effective, custom, auto = pairs[0]
             idx = self.task_index
             category = self._get_inquiry_category()
-            self._persist_register_prefs(report_type=report_type)
+            self._persist_register_prefs(report_type=report_type, template=template_choice)
 
             def apply_edit():
                 self.app.update_task(
@@ -1309,7 +1318,9 @@ class RegisterWindow:
         batch = list(pairs)
         site_count = len(self._parse_site_lines())
         dual_kind = self.dual_kind_report
-        self._persist_register_prefs(dual_kind=dual_kind, report_type=report_type)
+        self._persist_register_prefs(
+            dual_kind=dual_kind, report_type=report_type, template=template_choice,
+        )
 
         def apply_register():
             for site, effective, custom, auto in batch:
@@ -1394,6 +1405,7 @@ class ReportApp:
         self._progress_account_ids: list[str] | None = None
         self.last_register_dual_kind = False
         self.last_register_report_type = ""
+        self.last_register_template = ""
 
         self.sidebar = SidebarNav(
             self.root,
@@ -1634,25 +1646,43 @@ class ReportApp:
                 bg=COLORS["accent_light"], fg=COLORS["accent"], padx=10, pady=2,
             )
         self.task_count_label.pack(side=tk.RIGHT)
-        rest_wrap = self._frame(header, COLORS["card"])
-        rest_wrap.pack(side=tk.RIGHT, padx=(0, 16))
-        ui_label(rest_wrap, "10건마다 휴식", "body_bold", COLORS["text"]).pack(side=tk.LEFT)
-        if not hasattr(self, "rest_minutes_var"):
-            self.rest_minutes_var = tk.StringVar(value="0")
+        vpn_wrap = self._frame(header, COLORS["card"])
+        vpn_wrap.pack(side=tk.RIGHT, padx=(0, 16))
+        ui_label(vpn_wrap, "VPN", "body_bold", COLORS["text"]).pack(side=tk.LEFT, padx=(0, 6))
+        if not hasattr(self, "vpn_mod_var"):
+            self.vpn_mod_var = tk.StringVar(value="Alt")
+        if not hasattr(self, "vpn_key_var"):
+            self.vpn_key_var = tk.StringVar(value="")
         if ctk:
-            self.rest_minutes_entry = ctk.CTkEntry(
-                rest_wrap, textvariable=self.rest_minutes_var, width=56, height=32,
+            self.vpn_mod_combo = ctk.CTkComboBox(
+                vpn_wrap, values=["Alt", "Ctrl"], variable=self.vpn_mod_var,
+                width=78, height=32, state="readonly",
+                command=lambda _v: self._on_vpn_hotkey_change(),
+                font=FONTS["body_bold"],
+                border_color=COLORS["input_border"], fg_color=COLORS["input_bg"],
+                text_color=COLORS["text"],
+            )
+            self.vpn_key_entry = ctk.CTkEntry(
+                vpn_wrap, textvariable=self.vpn_key_var, width=40, height=32,
                 justify="center", font=FONTS["body_bold"],
                 border_color=COLORS["input_border"], fg_color=COLORS["input_bg"],
                 text_color=COLORS["text"], corner_radius=8,
             )
         else:
-            self.rest_minutes_entry = tk.Entry(
-                rest_wrap, textvariable=self.rest_minutes_var, width=4, justify="center",
+            self.vpn_mod_combo = ttk.Combobox(
+                vpn_wrap, textvariable=self.vpn_mod_var, values=["Alt", "Ctrl"],
+                state="readonly", width=6, font=FONTS["body_bold"],
+            )
+            self.vpn_mod_combo.bind("<<ComboboxSelected>>", lambda e: self._on_vpn_hotkey_change())
+            self.vpn_key_entry = tk.Entry(
+                vpn_wrap, textvariable=self.vpn_key_var, width=3, justify="center",
                 font=FONTS["body_bold"], bg=COLORS["input_bg"], fg=COLORS["text"],
             )
-        self.rest_minutes_entry.pack(side=tk.LEFT, padx=(8, 4))
-        ui_label(rest_wrap, "분", "body", COLORS["text_muted"]).pack(side=tk.LEFT)
+        self.vpn_mod_combo.pack(side=tk.LEFT)
+        ui_label(vpn_wrap, "+", "body_bold", COLORS["text"]).pack(side=tk.LEFT, padx=6)
+        self.vpn_key_entry.pack(side=tk.LEFT)
+        self.vpn_key_entry.bind("<KeyRelease>", lambda e: self._on_vpn_key_typed())
+        self.vpn_key_entry.bind("<FocusOut>", lambda e: self._on_vpn_hotkey_change())
 
         task_container = self._frame(bottom_card, COLORS["card"])
         task_container.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 14))
@@ -2903,12 +2933,11 @@ class ReportApp:
                     self.window_geometry = saved_geom
                 self.last_register_dual_kind = bool(data.get("last_register_dual_kind", False))
                 self.last_register_report_type = str(data.get("last_register_report_type", "") or "")
-                if hasattr(self, "rest_minutes_var"):
-                    saved_rest = data.get("rest_minutes", 0)
-                    try:
-                        self.rest_minutes_var.set(str(max(0, int(saved_rest))))
-                    except (TypeError, ValueError):
-                        self.rest_minutes_var.set("0")
+                self.last_register_template = str(data.get("last_register_template", "") or "")
+                if hasattr(self, "vpn_mod_var"):
+                    self.vpn_mod_var.set(self._normalize_vpn_mod(data.get("vpn_mod", "Alt")))
+                if hasattr(self, "vpn_key_var"):
+                    self.vpn_key_var.set(self._normalize_vpn_key(data.get("vpn_key", "")))
                 saved_ids = data.get("progress_account_ids")
                 if isinstance(saved_ids, list) and saved_ids:
                     self._progress_account_ids = [str(x) for x in saved_ids if str(x).strip()]
@@ -2926,27 +2955,56 @@ class ReportApp:
             "window_geometry": getattr(self, "window_geometry", {}),
             "last_register_dual_kind": bool(getattr(self, "last_register_dual_kind", False)),
             "last_register_report_type": str(getattr(self, "last_register_report_type", "") or ""),
-            "rest_minutes": self._rest_minutes_value(),
+            "last_register_template": str(getattr(self, "last_register_template", "") or ""),
+            "vpn_mod": self._vpn_mod_value(),
+            "vpn_key": self._vpn_key_value(),
             "progress_account_ids": list(self._progress_account_ids or []),
         }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def save_register_prefs(self, *, dual_kind=None, report_type=None):
+    def save_register_prefs(self, *, dual_kind=None, report_type=None, template=None):
         if dual_kind is not None:
             self.last_register_dual_kind = bool(dual_kind)
         if report_type is not None:
             self.last_register_report_type = (report_type or "").strip()
+        if template is not None:
+            self.last_register_template = (template or "").strip()
         self.save_settings()
 
-    def _rest_minutes_value(self) -> int:
-        raw = ""
-        if hasattr(self, "rest_minutes_var"):
-            raw = str(self.rest_minutes_var.get() or "").strip()
-        try:
-            return max(0, int(raw))
-        except ValueError:
-            return 0
+    def _normalize_vpn_mod(self, value) -> str:
+        raw = str(value or "").strip().lower()
+        return "Ctrl" if raw in ("ctrl", "control", "컨트롤") else "Alt"
+
+    def _normalize_vpn_key(self, value) -> str:
+        chars = [c.upper() for c in str(value or "") if c.isalnum()]
+        return chars[-1] if chars else ""
+
+    def _vpn_mod_value(self) -> str:
+        if hasattr(self, "vpn_mod_var"):
+            return self._normalize_vpn_mod(self.vpn_mod_var.get())
+        return "Alt"
+
+    def _vpn_key_value(self) -> str:
+        if hasattr(self, "vpn_key_var"):
+            return self._normalize_vpn_key(self.vpn_key_var.get())
+        return ""
+
+    def _vpn_hotkey_spec(self) -> dict:
+        return {"mod": self._vpn_mod_value().lower(), "key": self._vpn_key_value()}
+
+    def _on_vpn_key_typed(self):
+        if not hasattr(self, "vpn_key_var"):
+            return
+        key = self._normalize_vpn_key(self.vpn_key_var.get())
+        if self.vpn_key_var.get() != key:
+            self.vpn_key_var.set(key)
+
+    def _on_vpn_hotkey_change(self):
+        if hasattr(self, "vpn_mod_var"):
+            self.vpn_mod_var.set(self._vpn_mod_value())
+        self._on_vpn_key_typed()
+        self.save_settings()
 
     def _ensure_browser_vars(self):
         if not hasattr(self, "hagrid_mode_var"):
@@ -5372,8 +5430,8 @@ class ReportApp:
         def on_delay(remaining, label="재시작 대기"):
             self.root.after(0, lambda r=remaining, lb=label: self._set_captcha_delay(r, lb))
 
-        rest_state = {"count": 0, "minutes": self._rest_minutes_value()}
         captcha_state = {"watch_index": None, "strikes": 0}
+        vpn_hotkey = self._vpn_hotkey_spec()
 
         def run():
             stopped = False
@@ -5389,9 +5447,9 @@ class ReportApp:
                     progress_callback=on_progress,
                     site_callback=on_site,
                     delay_callback=on_delay,
-                    rest_state=rest_state,
                     booster_mode=True,
                     captcha_state=captcha_state,
+                    vpn_hotkey=vpn_hotkey,
                 )
                 self._website_reporter = shared
             try:
@@ -5417,8 +5475,8 @@ class ReportApp:
                         progress_callback=on_progress,
                         site_callback=on_site,
                         delay_callback=on_delay,
-                        rest_state=rest_state,
                         captcha_state=captcha_state,
+                        vpn_hotkey=vpn_hotkey,
                     )
                     if not booster:
                         self._website_reporter = reporter
