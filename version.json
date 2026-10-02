@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.30",
-    "url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/605163207",
-    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.30/NaverReport.zip",
-    "notes":  "진행중 노란 표시 유지, 신고/등록 실시간 갱신, 이미 신고한 계정 건너뛰기, 새 계정 등록 시 신고/등록 초기화",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/605163207",
-    "asset_id":  605163207,
+    "version":  "1.0.31",
+    "url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.31/NaverReport.zip",
+    "download_url":  "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.31/NaverReport.zip",
+    "notes":  "자동/수동 URL 신고 순서 및 카운트 분리, 오답 팝업 5회 대기 3회차 후 정지, 이미 신고한 계정 건너뛰기",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/naver-report-app/releases/assets/605163207",
-                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.30/NaverReport.zip",
+                          "https://github.com/lee3215-ko/naver-report-app/releases/download/v1.0.31/NaverReport.zip",
                           "https://github.com/lee3215-ko/naver-report-app/releases/latest/download/NaverReport.zip"
                       ]
 }

@@ -61,7 +61,8 @@ class NaverReporter:
                  delay_callback=None,
                  rest_state=None,
                  booster_mode: bool = False,
-                 delay_scale: float | None = None):
+                 delay_scale: float | None = None,
+                 captcha_state=None):
         self.api_key = api_key
         self.model = model
         self.headless = headless
@@ -96,7 +97,8 @@ class NaverReporter:
         self._wrong_captcha_count = 0
         self._captcha_browser_resets = 0
         self.resume_task_index = None
-        self.skip_report_keys: set[tuple[str, str, str]] = set()
+        self.skip_report_keys: set[tuple] = set()
+        self.captcha_state = captcha_state if isinstance(captcha_state, dict) else {}
 
     def request_cancel(self):
         self.cancel_requested = True
@@ -1097,7 +1099,43 @@ class NaverReporter:
     def _is_wrong_captcha_alert(self, text: str) -> bool:
         if not text:
             return False
-        return any(k in text for k in ("정답을 정확", "다시 입력", "정확하게"))
+        compact = self._normalize_popup_text(text)
+        if "정답을정확" in compact:
+            return True
+        return "정답" in compact and ("다시입력" in compact or "정확하게" in compact)
+
+    def _consume_wrong_captcha_popup(self, timeout: float = 1.0) -> str | None:
+        msg = self._read_popup_message(timeout=timeout, dismiss=True)
+        if msg and self._is_wrong_captcha_alert(msg):
+            return msg
+        return None
+
+    def _task_url_kind(self, search_url_auto) -> str:
+        if isinstance(search_url_auto, str):
+            raw = search_url_auto.strip().lower()
+            if raw in ("auto", "자동", "자동url", "true", "1"):
+                return "auto"
+            return "manual"
+        return "auto" if bool(search_url_auto) else "manual"
+
+    def _enforce_wrong_captcha_limit(self):
+        self._wrong_captcha_count = 0
+        current = int(getattr(self, "_current_task_index", -1))
+        state = getattr(self, "captcha_state", None)
+        if not isinstance(state, dict):
+            raise CaptchaSessionReset()
+        watch = state.get("watch_index")
+        strikes = int(state.get("strikes") or 0)
+        if watch is not None and current == int(watch) and strikes >= 2:
+            self.log("같은 사이트에서 오답 팝업 5회가 3번째 반복되어 신고를 정지합니다")
+            raise CaptchaStopReport()
+        raise CaptchaSessionReset()
+
+    def _clear_captcha_watch_if_done(self, task_index: int):
+        state = getattr(self, "captcha_state", None)
+        if isinstance(state, dict) and state.get("watch_index") == task_index:
+            state["watch_index"] = None
+            state["strikes"] = 0
 
     def _notify_active_site(self, idx: int, site: str):
         cb = getattr(self, "site_callback", None)
@@ -1114,10 +1152,7 @@ class NaverReporter:
         self.log(f"정답 오답 팝업 ({n}/5)")
         if n < 5:
             return
-        self._wrong_captcha_count = 0
-        if int(getattr(self, "_captcha_browser_resets", 0)) < 1:
-            raise CaptchaSessionReset()
-        raise CaptchaStopReport()
+        self._enforce_wrong_captcha_limit()
 
     def _emit_delay(self, remaining_sec: int | None, label: str = "재시작 대기"):
         cb = getattr(self, "delay_callback", None)
@@ -1216,13 +1251,21 @@ class NaverReporter:
                     naver_id=naver_id,
                 )
             except CaptchaSessionReset:
-                self._captcha_browser_resets = int(getattr(self, "_captcha_browser_resets", 0)) + 1
                 self._wrong_captcha_count = 0
+                state = getattr(self, "captcha_state", None)
+                if isinstance(state, dict):
+                    if state.get("watch_index") == task_index:
+                        state["strikes"] = int(state.get("strikes") or 0) + 1
+                    else:
+                        state["watch_index"] = task_index
+                        state["strikes"] = 1
+                    round_no = int(state.get("strikes") or 1)
+                    self.log(f"오답 팝업 5회 — {round_no}/3회차, 브라우저를 닫고 5분 대기 후 재개합니다")
                 self._wait_captcha_cooldown(300)
                 raise CaptchaSkipAccount(task_index)
             except CaptchaStopReport as exc:
                 if str(exc) != "stopped":
-                    self.log("정답 오답 팝업이 재시작 후에도 5회 반복되어 신고를 자동 정지합니다")
+                    self.log("같은 사이트에서 오답 팝업 5회가 3번째 반복되어 신고를 자동 정지합니다")
                 self.request_cancel()
                 raise
 
@@ -1239,11 +1282,13 @@ class NaverReporter:
         self.log("신고 접수 완료 확인 대기...")
         end = time.time() + timeout
         poll = 0.12 if self.booster_mode else 0.5
-        alert_wait = 0.12 if self.booster_mode else 0.8
+        alert_wait = 0.2 if self.booster_mode else 0.8
+        self._submit_wrong_captcha = False
         while time.time() < end:
-            alert_text = self._accept_alert(timeout=alert_wait)
-            if alert_text and self._is_wrong_captcha_alert(alert_text):
+            alert_text = self._consume_wrong_captcha_popup(timeout=alert_wait)
+            if alert_text:
                 self.log("접수 대기 중 오답 팝업 감지")
+                self._submit_wrong_captcha = True
                 self._note_wrong_captcha()
                 return False
 
@@ -1251,6 +1296,13 @@ class NaverReporter:
                 body = self.driver.find_element(By.TAG_NAME, "body").text
             except Exception:
                 body = ""
+
+            if body and ("정답을 정확" in body or "정답을정확" in self._normalize_popup_text(body)):
+                self._consume_wrong_captcha_popup(timeout=0.4)
+                self.log("접수 대기 중 오답 팝업 감지")
+                self._submit_wrong_captcha = True
+                self._note_wrong_captcha()
+                return False
 
             success_keywords = (
                 "문의가 접수",
@@ -3496,8 +3548,9 @@ class NaverReporter:
         return True
 
     def _submit_inquiry(self, wait) -> bool:
-        """문의하기 제출. 오답 팝업 시 새 질문으로 재시도."""
+        """문의하기 제출. 오답 팝업 5회면 브라우저를 닫고 대기한다."""
         max_attempts = 5
+        wrong_hits = 0
         for attempt in range(max_attempts):
             if attempt > 0:
                 self._human_delay(1.0, 2.0)
@@ -3518,9 +3571,10 @@ class NaverReporter:
             self.log(f"문의하기 버튼 클릭 ({attempt + 1}/{max_attempts})")
             self._human_delay(1.0, 2.0)
 
-            alert_text = self._accept_alert(timeout=4)
-            if alert_text and self._is_wrong_captcha_alert(alert_text):
-                self.log("보안 질문 오답 — 새 질문으로 재시도")
+            popup = self._consume_wrong_captcha_popup(timeout=4)
+            if popup:
+                wrong_hits += 1
+                self.log(f"보안 질문 오답 — 새 질문으로 재시도 ({popup[:80]})")
                 self._note_wrong_captcha()
                 self._human_delay(1.5, 2.5)
                 continue
@@ -3529,14 +3583,24 @@ class NaverReporter:
                 self._wrong_captcha_count = 0
                 return True
 
+            if getattr(self, "_submit_wrong_captcha", False):
+                wrong_hits += 1
+                self._human_delay(1.5, 2.5)
+                continue
+
             if self._is_on_inquiry_form() and self._has_inquiry_captcha():
-                self.log("접수 미완료 — 보안 질문 재시도")
+                wrong_hits += 1
+                self.log("접수 미완료 — 오답으로 보고 보안 질문 재시도")
+                self._note_wrong_captcha()
                 continue
 
             self.log("접수 완료 확인 실패 — 재시도")
             self._human_delay(1.0, 2.0)
 
         self.log("문의 제출 실패 (최대 재시도 초과)")
+        if wrong_hits >= 5 or int(getattr(self, "_wrong_captcha_count", 0)) >= 5:
+            self.log("정답 오답 팝업 5회 — 다음 사이트로 넘어가지 않고 대기합니다")
+            self._enforce_wrong_captcha_limit()
         return False
 
     def fill_form(
@@ -3655,18 +3719,29 @@ class NaverReporter:
             if self.progress_callback:
                 self.progress_callback(1)
 
+    def _report_skip_key(self, naver_id: str, task: dict | None = None, *, site: str = "", report_type: str = "", search_url_auto=False) -> tuple:
+        if task is not None:
+            site = (task.get("site") or "").strip()
+            report_type = (task.get("report_type") or "").strip()
+            search_url_auto = task.get("search_url_auto")
+        mode = self._task_url_kind(search_url_auto)
+        return ((naver_id or "").strip(), (site or "").strip(), (report_type or "").strip(), mode)
+
     def _skip_already_reported_task(self, naver_id: str, idx: int, task: dict, tasks: list) -> bool:
-        site = (task.get("site") or "").strip()
-        report_type = (task.get("report_type") or "").strip()
-        if (naver_id, site, report_type) not in (self.skip_report_keys or set()):
+        key = self._report_skip_key(naver_id, task)
+        if key not in (self.skip_report_keys or set()):
             return False
-        self.log(f"[{naver_id}] {idx + 1}/{len(tasks)} 이미 신고한 계정 — 건너뜀 ({site})")
+        mode = "자동URL" if self._task_url_kind(task.get("search_url_auto")) == "auto" else "수동URL"
+        site = (task.get("site") or "").strip()
+        self.log(f"[{naver_id}] {idx + 1}/{len(tasks)} 이미 신고함 — {mode} 건너뜀 ({site})")
         if self.progress_callback:
             self.progress_callback(1)
         return True
 
-    def _mark_task_reported(self, naver_id: str, site: str, report_type: str):
-        self.skip_report_keys.add(((naver_id or "").strip(), (site or "").strip(), (report_type or "").strip()))
+    def _mark_task_reported(self, naver_id: str, site: str, report_type: str, search_url_auto: bool = False):
+        self.skip_report_keys.add(self._report_skip_key(
+            naver_id, site=site, report_type=report_type, search_url_auto=search_url_auto,
+        ))
 
     def report(
         self,
@@ -3728,8 +3803,9 @@ class NaverReporter:
                 report_type = task.get("report_type", "")
                 template = task.get("template", "")
                 search_url = task.get("search_url", "") or site
-                search_url_custom = task.get("search_url_custom", False)
-                search_url_auto = task.get("search_url_auto", False)
+                search_url_custom = bool(task.get("search_url_custom", False))
+                search_url_auto = self._task_url_kind(task.get("search_url_auto")) == "auto"
+                url_kind = "auto" if search_url_auto else "manual"
                 inquiry_category = task.get("inquiry_category", "illegal")
                 if search_url_auto and report_type:
                     warmed = self._consume_warmup_search_url(report_type)
@@ -3774,6 +3850,7 @@ class NaverReporter:
                     "search_url": search_url,
                     "search_url_custom": search_url_custom,
                     "search_url_auto": search_url_auto,
+                    "url_kind": url_kind,
                     "login_mode": "email" if self._guest_email_used else "login",
                     "guest_email": self._guest_email_address,
                 })
@@ -3782,7 +3859,8 @@ class NaverReporter:
                 if self.progress_callback:
                     self.progress_callback(1)
                 if success:
-                    self._mark_task_reported(naver_id, site, report_type)
+                    self._clear_captcha_watch_if_done(idx)
+                    self._mark_task_reported(naver_id, site, report_type, search_url_auto)
                     try:
                         self._maybe_rest_after_success(True, naver_id, naver_pw)
                     except CaptchaSkipAccount as skip:
@@ -3835,8 +3913,9 @@ class NaverReporter:
             report_type = task.get("report_type", "")
             template = task.get("template", "")
             search_url = task.get("search_url", "") or site
-            search_url_custom = task.get("search_url_custom", False)
-            search_url_auto = task.get("search_url_auto", False)
+            search_url_custom = bool(task.get("search_url_custom", False))
+            search_url_auto = self._task_url_kind(task.get("search_url_auto")) == "auto"
+            url_kind = "auto" if search_url_auto else "manual"
             inquiry_category = task.get("inquiry_category", "illegal")
             if search_url_auto and report_type:
                 search_url = self._collect_auto_search_url(report_type) or search_url
@@ -3872,6 +3951,7 @@ class NaverReporter:
                 "search_url": search_url,
                 "search_url_custom": search_url_custom,
                 "search_url_auto": search_url_auto,
+                "url_kind": url_kind,
                 "login_mode": "email",
                 "guest_email": self._guest_email_address or self._booster_email,
             })
@@ -3880,7 +3960,8 @@ class NaverReporter:
             if self.progress_callback:
                 self.progress_callback(1)
             if success:
-                self._mark_task_reported(naver_id, site, report_type)
+                self._clear_captcha_watch_if_done(idx)
+                self._mark_task_reported(naver_id, site, report_type, search_url_auto)
                 try:
                     self._maybe_rest_after_success(True, naver_id, naver_pw)
                 except CaptchaSkipAccount as skip:

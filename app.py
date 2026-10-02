@@ -3040,6 +3040,7 @@ class ReportApp:
                         "search_url": value.get("search_url", ""),
                         "search_url_custom": value.get("search_url_custom", False),
                         "search_url_auto": value.get("search_url_auto", False),
+                        "url_kind": value.get("url_kind", ""),
                         "login_mode": value.get("login_mode", ""),
                         "guest_email": value.get("guest_email", ""),
                     }
@@ -3062,6 +3063,7 @@ class ReportApp:
                 "search_url": value.get("search_url", ""),
                 "search_url_custom": value.get("search_url_custom", False),
                 "search_url_auto": value.get("search_url_auto", False),
+                "url_kind": value.get("url_kind") or ("auto" if value.get("search_url_auto") else "manual"),
                 "login_mode": value.get("login_mode", ""),
                 "guest_email": value.get("guest_email", ""),
             }
@@ -3089,6 +3091,9 @@ class ReportApp:
                 task["search_url"] = site
             if "inquiry_category" not in task:
                 task["inquiry_category"] = DEFAULT_INQUIRY_CATEGORY
+            kind = self._url_kind_from_record(task)
+            task["url_kind"] = kind
+            task["search_url_auto"] = kind == "auto"
         self.refresh_task_list()
 
     def save_tasks(self):
@@ -3914,6 +3919,7 @@ class ReportApp:
             "search_url": search_url or site,
             "search_url_custom": bool(search_url_custom),
             "search_url_auto": bool(search_url_auto),
+            "url_kind": "auto" if search_url_auto else "manual",
             "inquiry_category": category,
         })
         mode = self.search_url_mode_label(search_url_custom, search_url_auto)
@@ -3940,6 +3946,7 @@ class ReportApp:
             "search_url": search_url or site,
             "search_url_custom": bool(search_url_custom),
             "search_url_auto": bool(search_url_auto),
+            "url_kind": "auto" if search_url_auto else "manual",
             "inquiry_category": category,
         }
         self.save_tasks()
@@ -3961,7 +3968,7 @@ class ReportApp:
             template_title = self.get_template_title(task.get("template_name", ""))
             template_cell = self.task_template_display(
                 template_title,
-                bool(task.get("search_url_auto", False)),
+                self._url_kind_from_record(task) == "auto",
             )
             self.task_tree.insert("", tk.END, values=(
                 idx,
@@ -4007,8 +4014,36 @@ class ReportApp:
             return False
         return bool(data.get("success")) or status in ("ok", "already_reported", "previously_reported")
 
-    def _successful_report_keys(self) -> set[tuple[str, str, str]]:
-        keys: set[tuple[str, str, str]] = set()
+    def _url_kind_from_record(self, rec: dict | None, explicit=None) -> str:
+        rec = rec or {}
+        if explicit is not None:
+            value = explicit
+        else:
+            kind = str(rec.get("url_kind") or "").strip().lower()
+            if kind in ("auto", "manual"):
+                return kind
+            value = rec.get("search_url_auto")
+        if isinstance(value, str):
+            raw = value.strip().lower()
+            if raw in ("auto", "자동", "자동url", "true", "1"):
+                return "auto"
+            if raw in ("manual", "수동", "수동url", "false", "0", ""):
+                return "manual"
+        return "auto" if bool(value) else "manual"
+
+    def _report_skip_key(self, account_id: str, task: dict | None = None, *, site: str = "", report_type: str = "", search_url_auto=None, url_kind: str = "") -> tuple[str, str, str, str]:
+        if task is not None:
+            site = (task.get("site") or "").strip()
+            report_type = (task.get("report_type") or "").strip()
+            mode = self._url_kind_from_record(task)
+        else:
+            mode = (url_kind or "").strip().lower()
+            if mode not in ("auto", "manual"):
+                mode = self._url_kind_from_record({"search_url_auto": search_url_auto, "url_kind": url_kind})
+        return ((account_id or "").strip(), (site or "").strip(), (report_type or "").strip(), mode)
+
+    def _successful_report_keys(self) -> set[tuple[str, str, str, str]]:
+        keys: set[tuple[str, str, str, str]] = set()
         for data in getattr(self, "hidden_results", {}).values():
             if not self._result_counts_as_reported(data):
                 continue
@@ -4016,27 +4051,32 @@ class ReportApp:
             site = (data.get("site") or "").strip()
             report_type = (data.get("report_type") or "").strip()
             if aid and site:
-                keys.add((aid, site, report_type))
+                keys.add(self._report_skip_key(
+                    aid, site=site, report_type=report_type,
+                    search_url_auto=data.get("search_url_auto"),
+                    url_kind=str(data.get("url_kind") or ""),
+                ))
         return keys
 
-    def _account_has_pending_tasks(self, account_id: str, skip_keys: set[tuple[str, str, str]]) -> bool:
+    def _account_has_pending_tasks(self, account_id: str, skip_keys: set) -> bool:
         aid = (account_id or "").strip()
         for task in getattr(self, "tasks", []) or []:
-            site = (task.get("site") or "").strip()
-            report_type = (task.get("report_type") or "").strip()
-            if (aid, site, report_type) not in skip_keys:
+            if self._report_skip_key(aid, task) not in skip_keys:
                 return True
         return False
 
-    def _reported_account_count(self, site: str, report_type: str = "") -> int:
-        site = (site or "").strip()
-        report_type = (report_type or "").strip()
+    def _reported_account_count(self, task: dict) -> int:
+        site = (task.get("site") or "").strip()
+        report_type = (task.get("report_type") or "").strip()
+        kind = self._url_kind_from_record(task)
         scope = set(self._progress_scope_ids())
         accounts = set()
         for data in getattr(self, "hidden_results", {}).values():
             if (data.get("site") or "").strip() != site:
                 continue
             if report_type and (data.get("report_type") or "").strip() != report_type:
+                continue
+            if self._url_kind_from_record(data) != kind:
                 continue
             if not self._result_counts_as_reported(data):
                 continue
@@ -4046,7 +4086,7 @@ class ReportApp:
         return len(accounts)
 
     def _task_account_progress_cell(self, task: dict) -> str:
-        done = self._reported_account_count(task.get("site", ""), task.get("report_type", ""))
+        done = self._reported_account_count(task)
         total = len(self._progress_scope_ids())
         return f"{done} / {total}"
 
@@ -4780,7 +4820,9 @@ class ReportApp:
     def _add_result(self, site, report_type, data, account_id=None):
         dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         account_id = account_id or data.get("account_id") or ""
-        key = f"{dt}|{report_type}|{site}|{account_id}"
+        kind = self._url_kind_from_record(data)
+        data = {**data, "url_kind": kind, "search_url_auto": kind == "auto"}
+        key = f"{dt}|{report_type}|{site}|{account_id}|{kind}"
         self.hidden_results[key] = {"site": site, "report_type": report_type, "account_id": account_id, **data, "datetime": dt}
         return dt
 
@@ -5285,16 +5327,19 @@ class ReportApp:
                 "account_password": item.get("account_password", ""),
                 "search_url": item.get("search_url", ""),
                 "search_url_custom": item.get("search_url_custom", False),
-                "search_url_auto": item.get("search_url_auto", False),
+                "search_url_auto": bool(item.get("search_url_auto") or item.get("url_kind") == "auto"),
+                "url_kind": self._url_kind_from_record(item),
                 "login_mode": item.get("login_mode", ""),
                 "guest_email": item.get("guest_email", ""),
             }
             dt = self._add_result(item["site"], item["report_type"], data, item["account_id"])
             if self._result_counts_as_reported({**data, "account_id": item.get("account_id", ""), "site": item.get("site", ""), "report_type": item.get("report_type", "")}):
-                skip_keys.add((
+                skip_keys.add(self._report_skip_key(
                     (item.get("account_id") or "").strip(),
-                    (item.get("site") or "").strip(),
-                    (item.get("report_type") or "").strip(),
+                    site=(item.get("site") or "").strip(),
+                    report_type=(item.get("report_type") or "").strip(),
+                    search_url_auto=item.get("search_url_auto"),
+                    url_kind=self._url_kind_from_record(item),
                 ))
             self.root.after(0, self._refresh_task_account_counts)
             self.root.after(
@@ -5328,6 +5373,7 @@ class ReportApp:
             self.root.after(0, lambda r=remaining, lb=label: self._set_captcha_delay(r, lb))
 
         rest_state = {"count": 0, "minutes": self._rest_minutes_value()}
+        captcha_state = {"watch_index": None, "strikes": 0}
 
         def run():
             stopped = False
@@ -5345,6 +5391,7 @@ class ReportApp:
                     delay_callback=on_delay,
                     rest_state=rest_state,
                     booster_mode=True,
+                    captcha_state=captcha_state,
                 )
                 self._website_reporter = shared
             try:
@@ -5371,6 +5418,7 @@ class ReportApp:
                         site_callback=on_site,
                         delay_callback=on_delay,
                         rest_state=rest_state,
+                        captcha_state=captcha_state,
                     )
                     if not booster:
                         self._website_reporter = reporter
