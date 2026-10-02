@@ -25,6 +25,22 @@ from chrome_browser import create_webdriver, normalize_browser_mode, quit_webdri
 from naver_search_url import fetch_naver_search_url_live
 
 
+class CaptchaSessionReset(Exception):
+    """정답 오답 팝업 5회 — 창을 닫고 실패한 사이트부터 재개."""
+
+
+class CaptchaSkipAccount(Exception):
+    """오답 5회 대기 후 실패 계정은 건너뛰고 다음 계정이 해당 사이트부터 이어감."""
+
+    def __init__(self, task_index: int):
+        super().__init__(str(task_index))
+        self.task_index = int(task_index)
+
+
+class CaptchaStopReport(Exception):
+    """창 재시작 이후에도 정답 오답 팝업 5회 — 신고 자동 정지."""
+
+
 class NaverReporter:
     """네이버 고객센터 불법성 신고 자동화 (Selenium)"""
 
@@ -41,6 +57,9 @@ class NaverReporter:
                  log_callback=None,
                  result_callback=None,
                  progress_callback=None,
+                 site_callback=None,
+                 delay_callback=None,
+                 rest_state=None,
                  booster_mode: bool = False,
                  delay_scale: float | None = None):
         self.api_key = api_key
@@ -50,6 +69,9 @@ class NaverReporter:
         self.log_callback = log_callback or print
         self.result_callback = result_callback
         self.progress_callback = progress_callback
+        self.site_callback = site_callback
+        self.delay_callback = delay_callback
+        self.rest_state = rest_state if isinstance(rest_state, dict) else {"count": 0, "minutes": 0}
         self.booster_mode = bool(booster_mode)
         if delay_scale is None:
             self.delay_scale = 0.10 if self.booster_mode else 0.62
@@ -71,6 +93,10 @@ class NaverReporter:
         self._guest_email_used = False
         self._guest_email_address = ""
         self._booster_email = ""
+        self._wrong_captcha_count = 0
+        self._captcha_browser_resets = 0
+        self.resume_task_index = None
+        self.skip_report_keys: set[tuple[str, str, str]] = set()
 
     def request_cancel(self):
         self.cancel_requested = True
@@ -1073,6 +1099,133 @@ class NaverReporter:
             return False
         return any(k in text for k in ("정답을 정확", "다시 입력", "정확하게"))
 
+    def _notify_active_site(self, idx: int, site: str):
+        cb = getattr(self, "site_callback", None)
+        if not cb:
+            return
+        try:
+            cb(idx, site)
+        except Exception:
+            pass
+
+    def _note_wrong_captcha(self):
+        self._wrong_captcha_count = int(getattr(self, "_wrong_captcha_count", 0)) + 1
+        n = self._wrong_captcha_count
+        self.log(f"정답 오답 팝업 ({n}/5)")
+        if n < 5:
+            return
+        self._wrong_captcha_count = 0
+        if int(getattr(self, "_captcha_browser_resets", 0)) < 1:
+            raise CaptchaSessionReset()
+        raise CaptchaStopReport()
+
+    def _emit_delay(self, remaining_sec: int | None, label: str = "재시작 대기"):
+        cb = getattr(self, "delay_callback", None)
+        if not cb:
+            return
+        try:
+            cb(remaining_sec, label)
+        except TypeError:
+            cb(remaining_sec)
+        except Exception:
+            pass
+
+    def _wait_with_countdown(self, seconds: int, label: str = "재시작 대기"):
+        end = time.time() + max(int(seconds), 1)
+        last_shown = None
+        while True:
+            if self._should_stop():
+                self._emit_delay(None)
+                self.log("대기 중 신고가 정지되었습니다")
+                raise CaptchaStopReport("stopped")
+            remaining = int(end - time.time() + 0.999)
+            if remaining <= 0:
+                break
+            if remaining != last_shown:
+                last_shown = remaining
+                self._emit_delay(remaining, label)
+                if remaining % 30 == 0 or remaining <= 10:
+                    self.log(f"{label} {remaining // 60}분 {remaining % 60:02d}초")
+            time.sleep(min(0.25, max(0.05, end - time.time())))
+        self._emit_delay(None)
+
+    def _wait_captcha_cooldown(self, seconds: int = 300):
+        self.log(f"정답 오답 팝업 5회 — 브라우저를 닫고 {seconds // 60}분 대기 후 다음 계정이 이어서 신고합니다")
+        self.quit_driver()
+        self._wait_with_countdown(seconds, "재시작 대기")
+        self.log("5분 대기 종료 — 다음 계정이 실패한 사이트부터 이어서 신고합니다")
+
+    def _resume_session_after_wait(self, naver_id: str, naver_pw: str):
+        self.start_driver()
+        if self.booster_mode:
+            self._guest_email_used = False
+            self._guest_email_address = ""
+            self._booster_email = self._random_booster_email(naver_id)
+            self._open_url_with_referrer(self.INQUIRY_FORM_URL)
+            self._wait(25).until(lambda d: self._is_on_inquiry_form() or bool(self._inquiry_guest_email_field()))
+            self._remember_inquiry_tab()
+            return
+        ok, reason = self.login(naver_id, naver_pw, from_inquiry=True)
+        if not ok:
+            self.log(f"휴식 후 로그인 실패 ({reason or '원인 미상'}) — 다음 계정으로 넘깁니다")
+            raise CaptchaSkipAccount(int(getattr(self, "_current_task_index", 0) or 0) + 1)
+        self._remember_inquiry_tab()
+
+    def _maybe_rest_after_success(self, success: bool, naver_id: str, naver_pw: str):
+        if not success or self._should_stop():
+            return
+        state = getattr(self, "rest_state", None)
+        if not isinstance(state, dict):
+            return
+        minutes = 0
+        try:
+            minutes = max(0, int(state.get("minutes") or 0))
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes <= 0:
+            return
+        state["count"] = int(state.get("count") or 0) + 1
+        if state["count"] < 10:
+            return
+        state["count"] = 0
+        self.log(f"신고 10건 완료 — 브라우저를 닫고 {minutes}분 휴식 후 이어서 진행합니다")
+        self.quit_driver()
+        self._wait_with_countdown(minutes * 60, "휴식")
+        self.log("휴식 종료 — 이어서 신고합니다")
+        self._resume_session_after_wait(naver_id, naver_pw)
+
+    def _fill_form_with_captcha_policy(
+        self,
+        site: str,
+        report_type: str,
+        rewritten: str,
+        search_url: str,
+        inquiry_category: str,
+        naver_id: str,
+        naver_pw: str,
+        task_index: int = 0,
+    ) -> bool:
+        while True:
+            if self._should_stop():
+                return False
+            try:
+                return self.fill_form(
+                    site, report_type, rewritten,
+                    search_url=search_url,
+                    inquiry_category=inquiry_category,
+                    naver_id=naver_id,
+                )
+            except CaptchaSessionReset:
+                self._captcha_browser_resets = int(getattr(self, "_captcha_browser_resets", 0)) + 1
+                self._wrong_captcha_count = 0
+                self._wait_captcha_cooldown(300)
+                raise CaptchaSkipAccount(task_index)
+            except CaptchaStopReport as exc:
+                if str(exc) != "stopped":
+                    self.log("정답 오답 팝업이 재시작 후에도 5회 반복되어 신고를 자동 정지합니다")
+                self.request_cancel()
+                raise
+
     def _has_inquiry_captcha(self) -> bool:
         return bool(
             self._find_inquiry_question()
@@ -1091,6 +1244,7 @@ class NaverReporter:
             alert_text = self._accept_alert(timeout=alert_wait)
             if alert_text and self._is_wrong_captcha_alert(alert_text):
                 self.log("접수 대기 중 오답 팝업 감지")
+                self._note_wrong_captcha()
                 return False
 
             try:
@@ -1108,6 +1262,7 @@ class NaverReporter:
                 "문의가 정상",
             )
             if any(k in body for k in success_keywords):
+                self._wrong_captcha_count = 0
                 self.log("신고 접수 완료 확인")
                 return True
 
@@ -1264,13 +1419,21 @@ class NaverReporter:
         return "\n\n".join(paras)
 
     def start_driver(self):
+        if self.driver or self._search_driver:
+            self.quit_driver()
         self.log("브라우저 준비 중...")
         self._inquiry_window = ""
         self._search_window = ""
         self._search_driver = None
         self._guest_email_used = False
         self._guest_email_address = ""
-        self.driver, info = create_webdriver(self.browser_mode, headless=self.headless)
+        profile_key = f"{self.browser_mode}-booster" if self.booster_mode else None
+        self.driver, info = create_webdriver(
+            self.browser_mode,
+            headless=self.headless,
+            profile_key=profile_key,
+            log=self.log,
+        )
         version = info.get("version") or ""
         label = info.get("label") or "브라우저"
         if version:
@@ -1278,9 +1441,9 @@ class NaverReporter:
         else:
             self.log(f"{label} 사용 (앱 전용 프로필, 일상 브라우저와 분리)")
         if info.get("launch") == "attach":
-            self.log("설치된 브라우저를 직접 실행한 뒤 연결했습니다")
+            self.log("이미 열린 브라우저에 연결했습니다")
         else:
-            self.log("브라우저 연결 실패 — ChromeDriver 실행으로 대체")
+            self.log("브라우저를 실행하고 연결했습니다")
         if info.get("webdriver_flag"):
             self.log("자동화 표시(navigator.webdriver)가 남아 있습니다")
         ua = info.get("user_agent") or ""
@@ -1288,6 +1451,25 @@ class NaverReporter:
             self.log(f"브라우저 시작 완료 ({ua})")
         else:
             self.log("브라우저 시작 완료")
+        try:
+            self.driver.execute_script("return 1")
+        except Exception as exc:
+            self.log(f"브라우저 세션 확인 실패: {exc}")
+            raise
+
+    def _driver_alive(self) -> bool:
+        if not self.driver:
+            return False
+        try:
+            _ = self.driver.current_window_handle
+            return True
+        except Exception:
+            return False
+
+    def _ensure_driver(self):
+        if self._driver_alive():
+            return
+        self.start_driver()
 
     def quit_driver(self):
         had = bool(self.driver or self._search_driver)
@@ -3339,10 +3521,12 @@ class NaverReporter:
             alert_text = self._accept_alert(timeout=4)
             if alert_text and self._is_wrong_captcha_alert(alert_text):
                 self.log("보안 질문 오답 — 새 질문으로 재시도")
+                self._note_wrong_captcha()
                 self._human_delay(1.5, 2.5)
                 continue
 
             if self._wait_submit_success():
+                self._wrong_captcha_count = 0
                 return True
 
             if self._is_on_inquiry_form() and self._has_inquiry_captcha():
@@ -3420,6 +3604,8 @@ class NaverReporter:
                 if not self._solve_inquiry_followup():
                     self.log("추가 질문 처리 실패")
                     return False
+            except (CaptchaSessionReset, CaptchaStopReport):
+                raise
             except Exception as e:
                 self.log(f"유형 선택 처리 오류: {e}")
                 return False
@@ -3433,6 +3619,8 @@ class NaverReporter:
                 self.log("문의 접수 실패")
                 return False
             return True
+        except (CaptchaSessionReset, CaptchaStopReport):
+            raise
         except Exception as e:
             self.log(f"폼 작성 오류: {e}")
             return False
@@ -3467,12 +3655,37 @@ class NaverReporter:
             if self.progress_callback:
                 self.progress_callback(1)
 
-    def report(self, naver_id: str, naver_pw: str, tasks: list, keep_driver: bool = False) -> list:
+    def _skip_already_reported_task(self, naver_id: str, idx: int, task: dict, tasks: list) -> bool:
+        site = (task.get("site") or "").strip()
+        report_type = (task.get("report_type") or "").strip()
+        if (naver_id, site, report_type) not in (self.skip_report_keys or set()):
+            return False
+        self.log(f"[{naver_id}] {idx + 1}/{len(tasks)} 이미 신고한 계정 — 건너뜀 ({site})")
+        if self.progress_callback:
+            self.progress_callback(1)
+        return True
+
+    def _mark_task_reported(self, naver_id: str, site: str, report_type: str):
+        self.skip_report_keys.add(((naver_id or "").strip(), (site or "").strip(), (report_type or "").strip()))
+
+    def report(
+        self,
+        naver_id: str,
+        naver_pw: str,
+        tasks: list,
+        keep_driver: bool = False,
+        start_task_index: int = 0,
+        skip_keys: set | None = None,
+    ) -> list:
         """한 계정으로 모든 task를 처리합니다."""
         results = []
+        self.resume_task_index = None
+        self.account_advanced = False
+        if skip_keys is not None:
+            self.skip_report_keys = skip_keys
         try:
             if self.booster_mode:
-                return self._report_booster(naver_id, naver_pw, tasks)
+                return self._report_booster(naver_id, naver_pw, tasks, start_task_index=start_task_index)
             if not self.driver:
                 self.start_driver()
             ok, reason = self.login(naver_id, naver_pw, from_inquiry=True)
@@ -3502,6 +3715,11 @@ class NaverReporter:
                 self.log("첫 항목이 수동 URL — 유형 검색 생략")
 
             for idx, task in enumerate(tasks):
+                if idx < int(start_task_index or 0):
+                    continue
+                if self._skip_already_reported_task(naver_id, idx, task, tasks):
+                    continue
+                self.account_advanced = True
                 if self._should_stop():
                     self.log("사용자 요청으로 신고 중단")
                     break
@@ -3521,17 +3739,28 @@ class NaverReporter:
                     else:
                         search_url = self._collect_auto_search_url(report_type) or search_url
 
+                self._notify_active_site(idx, site)
+                self._current_task_index = idx
                 self._human_delay(1.0, 2.5)
                 rewritten = self._rewrite(template, naver_id, site, report_type)
                 self.log(f"[{naver_id}] {idx + 1}/{len(tasks)} 리라이트 완료 ({len(rewritten)}자)")
                 self._human_delay(0.8, 1.8)
 
-                success = self.fill_form(
-                    site, report_type, rewritten,
-                    search_url=search_url,
-                    inquiry_category=inquiry_category,
-                    naver_id=naver_id,
-                )
+                try:
+                    success = self._fill_form_with_captcha_policy(
+                        site, report_type, rewritten, search_url,
+                        inquiry_category, naver_id, naver_pw,
+                        task_index=idx,
+                    )
+                except CaptchaSkipAccount as skip:
+                    self.resume_task_index = skip.task_index
+                    self.log(
+                        f"[{naver_id}] 오답 5회 — 이 계정은 건너뛰고 "
+                        f"다음 계정이 {skip.task_index + 1}번 사이트부터 이어갑니다"
+                    )
+                    break
+                except CaptchaStopReport:
+                    break
                 dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 results.append({
                     "account_id": naver_id,
@@ -3552,32 +3781,53 @@ class NaverReporter:
                     self.result_callback(results[-1])
                 if self.progress_callback:
                     self.progress_callback(1)
+                if success:
+                    self._mark_task_reported(naver_id, site, report_type)
+                    try:
+                        self._maybe_rest_after_success(True, naver_id, naver_pw)
+                    except CaptchaSkipAccount as skip:
+                        self.resume_task_index = skip.task_index
+                        self.log(f"[{naver_id}] 휴식 후 로그인 실패 — 다음 계정이 이어서 진행합니다")
+                        break
+                    except CaptchaStopReport:
+                        break
                 self._human_delay(2.0, 4.5)
         finally:
             if not keep_driver:
                 self.quit_driver()
         return results
 
-    def _report_booster(self, naver_id: str, naver_pw: str, tasks: list) -> list:
+    def _report_booster(self, naver_id: str, naver_pw: str, tasks: list, start_task_index: int = 0) -> list:
         results = []
-        if not self.driver:
-            self.start_driver()
+        self.resume_task_index = None
+        self.account_advanced = False
+        self._ensure_driver()
         self._current_naver_id = naver_id
         self._guest_email_used = False
         self._guest_email_address = ""
         self._booster_email = self._random_booster_email(naver_id)
         self.log(f"부스터 신고 진행 — 로그인 생략, 신고 페이지에서 이메일만 입력 ({self._booster_email})")
-        self._open_url_with_referrer(self.INQUIRY_FORM_URL)
-        self._human_delay(0.5, 0.9)
         try:
-            self._wait(18).until(lambda d: self._is_on_inquiry_form() or bool(self._inquiry_guest_email_field()))
+            self._open_url_with_referrer(self.INQUIRY_FORM_URL)
+        except WebDriverException as exc:
+            self.log(f"부스터 — 신고 페이지 연결 실패, 브라우저 한 개만 다시 엽니다 ({exc})")
+            self.start_driver()
+            self._open_url_with_referrer(self.INQUIRY_FORM_URL)
+        self._human_delay(0.8, 1.2)
+        try:
+            self._wait(25).until(lambda d: self._is_on_inquiry_form() or bool(self._inquiry_guest_email_field()))
         except TimeoutException:
-            self.log("부스터 — 신고 페이지 로드 실패")
+            self.log("부스터 — 신고 페이지 로드 실패 (브라우저는 유지)")
             return results
         self._remember_inquiry_tab()
         # 부스터는 검색용 Chrome을 띄우지 않고 자동 URL을 즉시 생성합니다.
 
         for idx, task in enumerate(tasks):
+            if idx < int(start_task_index or 0):
+                continue
+            if self._skip_already_reported_task(naver_id, idx, task, tasks):
+                continue
+            self.account_advanced = True
             if self._should_stop():
                 self.log("사용자 요청으로 부스터 신고 중단")
                 break
@@ -3590,14 +3840,25 @@ class NaverReporter:
             inquiry_category = task.get("inquiry_category", "illegal")
             if search_url_auto and report_type:
                 search_url = self._collect_auto_search_url(report_type) or search_url
+            self._notify_active_site(idx, site)
+            self._current_task_index = idx
             rewritten = self._rewrite(template, naver_id, site, report_type)
             self.log(f"[{naver_id}] {idx + 1}/{len(tasks)} 리라이트 완료 ({len(rewritten)}자)")
-            success = self.fill_form(
-                site, report_type, rewritten,
-                search_url=search_url,
-                inquiry_category=inquiry_category,
-                naver_id=naver_id,
-            )
+            try:
+                success = self._fill_form_with_captcha_policy(
+                    site, report_type, rewritten, search_url,
+                    inquiry_category, naver_id, naver_pw,
+                    task_index=idx,
+                )
+            except CaptchaSkipAccount as skip:
+                self.resume_task_index = skip.task_index
+                self.log(
+                    f"[{naver_id}] 오답 5회 — 이 계정은 건너뛰고 "
+                    f"다음 계정이 {skip.task_index + 1}번 사이트부터 이어갑니다"
+                )
+                break
+            except CaptchaStopReport:
+                break
             dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             results.append({
                 "account_id": naver_id,
@@ -3618,6 +3879,16 @@ class NaverReporter:
                 self.result_callback(results[-1])
             if self.progress_callback:
                 self.progress_callback(1)
+            if success:
+                self._mark_task_reported(naver_id, site, report_type)
+                try:
+                    self._maybe_rest_after_success(True, naver_id, naver_pw)
+                except CaptchaSkipAccount as skip:
+                    self.resume_task_index = skip.task_index
+                    self.log(f"[{naver_id}] 휴식 후 세션 복구 실패 — 다음 계정이 이어서 진행합니다")
+                    break
+                except CaptchaStopReport:
+                    break
             self._human_delay(0.4, 0.9)
         return results
 

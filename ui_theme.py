@@ -309,8 +309,23 @@ class PageHeader:
         self.subtitle.pack(anchor="w", pady=(4, 0))
 
         version_text = f"v{app_version}" if app_version else ""
-        self.version_label = label(top_row, version_text, "body_bold", COLORS["accent"])
-        self.version_label.pack(side=tk.RIGHT, anchor="ne", padx=(12, 0), pady=(8, 0))
+        right = frame(top_row, COLORS["bg"])
+        right.pack(side=tk.RIGHT, anchor="ne")
+        self.delay_label = label(right, "", "heading", COLORS["warning"])
+        self.delay_label.pack(side=tk.RIGHT, padx=(16, 0), pady=(4, 0))
+        self.version_label = label(right, version_text, "body_bold", COLORS["accent"])
+        self.version_label.pack(side=tk.RIGHT, padx=(12, 0), pady=(8, 0))
+
+    def set_delay(self, remaining_sec: int | None, label: str = "재시작 대기"):
+        if remaining_sec is None or remaining_sec <= 0:
+            text = ""
+        else:
+            minutes, seconds = divmod(max(int(remaining_sec), 0), 60)
+            text = f"{label}  {minutes}분 {seconds:02d}초"
+        if ctk:
+            self.delay_label.configure(text=text)
+        else:
+            self.delay_label.configure(text=text)
 
     def set(self, key):
         title, sub = PAGE_META.get(key, (key, ""))

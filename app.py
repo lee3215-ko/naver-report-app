@@ -1332,7 +1332,7 @@ class RegisterWindow:
 
 
 class ReportApp:
-    def __init__(self, root):
+    def __init__(self, root, *, preserve_window=False):
         self.root = root
         self.window_geometry = {}
         if os.path.exists(SETTINGS_FILE):
@@ -1344,15 +1344,16 @@ class ReportApp:
                 pass
 
         self.root.title(f"Naver Report · v{APP_VERSION}")
-        apply_main_window(
-            self.root,
-            preferred_w=1720,
-            preferred_h=980,
-            min_w=1480,
-            min_h=780,
-            geometry_store=self.window_geometry,
-            save_callback=self.save_window_geometry,
-        )
+        if not preserve_window:
+            apply_main_window(
+                self.root,
+                preferred_w=1720,
+                preferred_h=980,
+                min_w=1480,
+                min_h=780,
+                geometry_store=self.window_geometry,
+                save_callback=self.save_window_geometry,
+            )
         if ctk:
             ctk.set_appearance_mode("light")
             ctk.set_default_color_theme("blue")
@@ -1372,6 +1373,7 @@ class ReportApp:
         style.configure("Results.Treeview", rowheight=44, font=FONTS["body"])
         style.configure("Job.Horizontal.TProgressbar",
                         troughcolor=COLORS["accent_light"], background=COLORS["accent"], thickness=16)
+        style.map("Task.Treeview", background=[], foreground=[])
 
         self._job_status = {
             "website": {"label": "웹사이트", "done": 0, "total": 0, "account": "", "running": False, "stopped": False, "skipped": [], "skipping": ""},
@@ -1388,6 +1390,8 @@ class ReportApp:
         self._task_drag_state = None
         self._task_drag_indicator = None
         self._task_drag_ghost = None
+        self._active_task_index = None
+        self._progress_account_ids: list[str] | None = None
         self.last_register_dual_kind = False
         self.last_register_report_type = ""
 
@@ -1452,6 +1456,46 @@ class ReportApp:
         self._cafe_reporter = None
         self._blog_reporter = None
         self.page_header.set("웹사이트신고")
+
+    def is_busy(self) -> bool:
+        return any(
+            (
+                getattr(self, "_report_running", False),
+                getattr(self, "_booster_running", False),
+                getattr(self, "_cafe_running", False),
+                getattr(self, "_blog_running", False),
+                getattr(self, "_preview_running", False),
+            )
+        )
+
+    def has_open_dialogs(self) -> bool:
+        try:
+            for child in self.root.winfo_children():
+                if child.winfo_class() in ("Toplevel", "CTkToplevel"):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def prepare_reload(self):
+        try:
+            self.save_window_geometry()
+        except Exception:
+            pass
+
+    def _reporter_cls(self):
+        try:
+            from paths import is_frozen
+
+            if not is_frozen():
+                import dev_reload
+
+                return dev_reload.reload_logic()
+        except Exception:
+            pass
+        from naver_reporter import NaverReporter as _NaverReporter
+
+        return _NaverReporter
 
     def on_tab_change(self, name):
         for n, page in self.pages.items():
@@ -1590,6 +1634,25 @@ class ReportApp:
                 bg=COLORS["accent_light"], fg=COLORS["accent"], padx=10, pady=2,
             )
         self.task_count_label.pack(side=tk.RIGHT)
+        rest_wrap = self._frame(header, COLORS["card"])
+        rest_wrap.pack(side=tk.RIGHT, padx=(0, 16))
+        ui_label(rest_wrap, "10건마다 휴식", "body_bold", COLORS["text"]).pack(side=tk.LEFT)
+        if not hasattr(self, "rest_minutes_var"):
+            self.rest_minutes_var = tk.StringVar(value="0")
+        if ctk:
+            self.rest_minutes_entry = ctk.CTkEntry(
+                rest_wrap, textvariable=self.rest_minutes_var, width=56, height=32,
+                justify="center", font=FONTS["body_bold"],
+                border_color=COLORS["input_border"], fg_color=COLORS["input_bg"],
+                text_color=COLORS["text"], corner_radius=8,
+            )
+        else:
+            self.rest_minutes_entry = tk.Entry(
+                rest_wrap, textvariable=self.rest_minutes_var, width=4, justify="center",
+                font=FONTS["body_bold"], bg=COLORS["input_bg"], fg=COLORS["text"],
+            )
+        self.rest_minutes_entry.pack(side=tk.LEFT, padx=(8, 4))
+        ui_label(rest_wrap, "분", "body", COLORS["text_muted"]).pack(side=tk.LEFT)
 
         task_container = self._frame(bottom_card, COLORS["card"])
         task_container.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 14))
@@ -1979,17 +2042,19 @@ class ReportApp:
         parent.grid_columnconfigure(0, weight=1)
 
         tree = ttk.Treeview(
-            parent, columns=("no", "report_type", "site", "template_name"),
+            parent, columns=("no", "report_type", "site", "accounts", "template_name"),
             show="headings", style="Task.Treeview", selectmode="extended",
         )
         tree.heading("no", text="No.")
         tree.heading("report_type", text="유형")
         tree.heading("site", text="사이트")
+        tree.heading("accounts", text="신고/등록")
         tree.heading("template_name", text="원고")
         tree.column("no", width=50, anchor="center")
-        tree.column("report_type", width=100, anchor="center")
-        tree.column("site", width=500, anchor="w")
-        tree.column("template_name", width=200, anchor="center")
+        tree.column("report_type", width=90, anchor="center")
+        tree.column("site", width=420, anchor="w")
+        tree.column("accounts", width=110, anchor="center")
+        tree.column("template_name", width=180, anchor="center")
         tree.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
@@ -1997,12 +2062,17 @@ class ReportApp:
         tree.tag_configure("drag_source", background="#dbeafe")
         tree.tag_configure("drag_target", background="#e0f2fe")
         tree.tag_configure("drop_flash", background="#bbf7d0")
+        tree.tag_configure("in_progress", background="#fbbf24", foreground="#1c1917")
+        tree.tag_configure("chosen", background=COLORS["table_selected"], foreground=COLORS["text"])
         tree.bind("<Delete>", lambda e: self.delete_selected_task())
         tree.bind("<Double-1>", lambda e: self.open_edit_task())
         tree.bind("<ButtonPress-1>", self._on_task_drag_press, add="+")
         tree.bind("<B1-Motion>", self._on_task_drag_motion, add="+")
         tree.bind("<ButtonRelease-1>", self._on_task_drag_release, add="+")
         tree.bind("<MouseWheel>", self._on_task_tree_mousewheel, add="+")
+        tree.bind("<<TreeviewSelect>>", lambda e: self._apply_task_progress_tags(), add="+")
+        tree.bind("<Control-a>", self._select_all_tasks)
+        tree.bind("<Control-A>", self._select_all_tasks)
         return tree
 
     # ===================== Results Tab =====================
@@ -2833,6 +2903,17 @@ class ReportApp:
                     self.window_geometry = saved_geom
                 self.last_register_dual_kind = bool(data.get("last_register_dual_kind", False))
                 self.last_register_report_type = str(data.get("last_register_report_type", "") or "")
+                if hasattr(self, "rest_minutes_var"):
+                    saved_rest = data.get("rest_minutes", 0)
+                    try:
+                        self.rest_minutes_var.set(str(max(0, int(saved_rest))))
+                    except (TypeError, ValueError):
+                        self.rest_minutes_var.set("0")
+                saved_ids = data.get("progress_account_ids")
+                if isinstance(saved_ids, list) and saved_ids:
+                    self._progress_account_ids = [str(x) for x in saved_ids if str(x).strip()]
+                else:
+                    self._progress_account_ids = None
             except Exception:
                 pass
 
@@ -2845,6 +2926,8 @@ class ReportApp:
             "window_geometry": getattr(self, "window_geometry", {}),
             "last_register_dual_kind": bool(getattr(self, "last_register_dual_kind", False)),
             "last_register_report_type": str(getattr(self, "last_register_report_type", "") or ""),
+            "rest_minutes": self._rest_minutes_value(),
+            "progress_account_ids": list(self._progress_account_ids or []),
         }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2855,6 +2938,15 @@ class ReportApp:
         if report_type is not None:
             self.last_register_report_type = (report_type or "").strip()
         self.save_settings()
+
+    def _rest_minutes_value(self) -> int:
+        raw = ""
+        if hasattr(self, "rest_minutes_var"):
+            raw = str(self.rest_minutes_var.get() or "").strip()
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
 
     def _ensure_browser_vars(self):
         if not hasattr(self, "hagrid_mode_var"):
@@ -2944,6 +3036,7 @@ class ReportApp:
                         "rewritten": value.get("rewritten", ""),
                         "datetime": value.get("datetime", ""),
                         "status": value.get("status", ""),
+                        "success": value.get("success"),
                         "search_url": value.get("search_url", ""),
                         "search_url_custom": value.get("search_url_custom", False),
                         "search_url_auto": value.get("search_url_auto", False),
@@ -2965,6 +3058,7 @@ class ReportApp:
                 "rewritten": value["rewritten"],
                 "datetime": value.get("datetime", ""),
                 "status": value.get("status", ""),
+                "success": value.get("success"),
                 "search_url": value.get("search_url", ""),
                 "search_url_custom": value.get("search_url_custom", False),
                 "search_url_auto": value.get("search_url_auto", False),
@@ -3873,9 +3967,151 @@ class ReportApp:
                 idx,
                 task.get("report_type", ""),
                 task.get("site", ""),
+                self._task_account_progress_cell(task),
                 template_cell,
             ))
         self.task_count_label.configure(text=f"{len(self.tasks)}개")
+        self._apply_task_progress_tags()
+
+    def _progress_scope_ids(self) -> list[str]:
+        current = [acc.get("id", "") for acc in (getattr(self, "accounts", []) or []) if acc.get("id")]
+        batch = getattr(self, "_progress_account_ids", None)
+        if batch:
+            current_set = set(current)
+            scope = [aid for aid in batch if aid in current_set]
+            if scope:
+                return scope
+        return current
+
+    def _accounts_for_progress_round(self) -> list[dict]:
+        scope = set(self._progress_scope_ids())
+        return [acc for acc in (getattr(self, "accounts", []) or []) if acc.get("id") in scope]
+
+    def _begin_progress_batch(self, account_ids: list[str]):
+        ids = []
+        seen = set()
+        for aid in account_ids:
+            aid = (aid or "").strip()
+            if aid and aid not in seen:
+                seen.add(aid)
+                ids.append(aid)
+        self._progress_account_ids = ids or None
+        self.save_settings()
+        self._refresh_task_account_counts()
+
+    def _result_counts_as_reported(self, data: dict) -> bool:
+        status = (data.get("status") or "").strip()
+        if status in ("protected", "failed", "login_failed"):
+            return False
+        if data.get("success") is False:
+            return False
+        return bool(data.get("success")) or status in ("ok", "already_reported", "previously_reported")
+
+    def _successful_report_keys(self) -> set[tuple[str, str, str]]:
+        keys: set[tuple[str, str, str]] = set()
+        for data in getattr(self, "hidden_results", {}).values():
+            if not self._result_counts_as_reported(data):
+                continue
+            aid = (data.get("account_id") or data.get("guest_email") or "").strip()
+            site = (data.get("site") or "").strip()
+            report_type = (data.get("report_type") or "").strip()
+            if aid and site:
+                keys.add((aid, site, report_type))
+        return keys
+
+    def _account_has_pending_tasks(self, account_id: str, skip_keys: set[tuple[str, str, str]]) -> bool:
+        aid = (account_id or "").strip()
+        for task in getattr(self, "tasks", []) or []:
+            site = (task.get("site") or "").strip()
+            report_type = (task.get("report_type") or "").strip()
+            if (aid, site, report_type) not in skip_keys:
+                return True
+        return False
+
+    def _reported_account_count(self, site: str, report_type: str = "") -> int:
+        site = (site or "").strip()
+        report_type = (report_type or "").strip()
+        scope = set(self._progress_scope_ids())
+        accounts = set()
+        for data in getattr(self, "hidden_results", {}).values():
+            if (data.get("site") or "").strip() != site:
+                continue
+            if report_type and (data.get("report_type") or "").strip() != report_type:
+                continue
+            if not self._result_counts_as_reported(data):
+                continue
+            aid = (data.get("account_id") or data.get("guest_email") or "").strip()
+            if aid and aid in scope:
+                accounts.add(aid)
+        return len(accounts)
+
+    def _task_account_progress_cell(self, task: dict) -> str:
+        done = self._reported_account_count(task.get("site", ""), task.get("report_type", ""))
+        total = len(self._progress_scope_ids())
+        return f"{done} / {total}"
+
+    def _refresh_task_account_counts(self):
+        tree = getattr(self, "task_tree", None)
+        drag = getattr(self, "_task_drag_state", None)
+        if tree is None or (drag and drag.get("active")):
+            return
+        children = tree.get_children()
+        tasks = getattr(self, "tasks", []) or []
+        for i, iid in enumerate(children):
+            if i >= len(tasks):
+                break
+            values = list(tree.item(iid, "values") or [])
+            if len(values) < 5:
+                continue
+            values[3] = self._task_account_progress_cell(tasks[i])
+            tree.item(iid, values=values)
+
+    def _set_active_task(self, index: int | None, site: str = ""):
+        self._active_task_index = index
+        self._apply_task_progress_tags(scroll=True)
+
+    def _set_captcha_delay(self, remaining_sec: int | None, label: str = "재시작 대기"):
+        header = getattr(self, "page_header", None)
+        if header is not None and hasattr(header, "set_delay"):
+            header.set_delay(remaining_sec, label)
+
+    def _apply_task_progress_tags(self, *, scroll: bool = False):
+        tree = getattr(self, "task_tree", None)
+        if tree is None:
+            return
+        active = getattr(self, "_active_task_index", None)
+        children = tree.get_children()
+        selected = set(tree.selection())
+        dragging = bool(getattr(self, "_task_drag_state", None) and self._task_drag_state.get("active"))
+        for i, iid in enumerate(children):
+            tags = []
+            if dragging:
+                tags.extend(
+                    t for t in (tree.item(iid, "tags") or ())
+                    if t in ("drag_source", "drag_target", "drop_flash")
+                )
+            if active is not None and i == active:
+                tags = ["in_progress"] + [t for t in tags if t != "in_progress"]
+            elif iid in selected:
+                tags = ["chosen"] + [t for t in tags if t != "chosen"]
+            seen = []
+            for tag in tags:
+                if tag not in seen:
+                    seen.append(tag)
+            tree.item(iid, tags=tuple(seen))
+        if scroll and active is not None and 0 <= active < len(children):
+            try:
+                tree.see(children[active])
+            except Exception:
+                pass
+
+    def _select_all_tasks(self, event=None):
+        tree = getattr(self, "task_tree", None)
+        if tree is None:
+            return "break"
+        tree.selection_set(tree.get_children())
+        self._apply_task_progress_tags()
+        return "break"
 
     def _clear_task_drag_ui(self):
         tree = self.task_tree
@@ -3887,6 +4123,7 @@ class ReportApp:
             self._task_drag_ghost.destroy()
             self._task_drag_ghost = None
         self._task_drag_state = None
+        self._apply_task_progress_tags()
 
     def _ensure_task_drag_indicator(self):
         if self._task_drag_indicator is None:
@@ -4118,7 +4355,7 @@ class ReportApp:
 
     def _pulse_task_row(self, iid: str, step: int = 0):
         if step >= 6:
-            self.task_tree.item(iid, tags=())
+            self._apply_task_progress_tags()
             return
         tag = ("drop_flash",) if step % 2 == 0 else ()
         self.task_tree.item(iid, tags=tag)
@@ -4366,6 +4603,11 @@ class ReportApp:
             self.log_text.configure(state=tk.DISABLED)
         if ch in getattr(self, "_job_status", {}):
             self._parse_job_account_from_log(ch, message)
+        try:
+            with open(data_path("app.log"), "a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [{ch}] {message}\n")
+        except Exception:
+            pass
 
     def parse_sites(self, text):
         sites = []
@@ -4414,11 +4656,13 @@ class ReportApp:
             return
 
         added, skipped = 0, 0
+        added_ids = []
         for naver_id, naver_pw in entries:
             if any(acc["id"] == naver_id for acc in self.accounts):
                 skipped += 1
                 continue
             self.accounts.append({"id": naver_id, "password": naver_pw})
+            added_ids.append(naver_id)
             added += 1
 
         if added == 0:
@@ -4427,9 +4671,10 @@ class ReportApp:
 
         self.save_accounts()
         self.refresh_account_list()
+        self._begin_progress_batch(added_ids)
         self._set_textbox_content(self.bulk_id_text, "")
         self._set_textbox_content(self.bulk_pw_text, "")
-        self.log(f"계정 일괄 등록: {added}개 추가, {skipped}개 중복 스킵")
+        self.log(f"계정 일괄 등록: {added}개 추가, {skipped}개 중복 스킵 — 신고/등록 초기화")
         messagebox.showinfo("완료", f"{added}개 계정이 등록되었습니다.")
 
     def generate_random_accounts(self, count: int = 10):
@@ -4453,7 +4698,8 @@ class ReportApp:
             return
         self.save_accounts()
         self.refresh_account_list()
-        self.log(f"랜덤 계정 {len(added)}개 추가: {', '.join(added)}")
+        self._begin_progress_batch(added)
+        self.log(f"랜덤 계정 {len(added)}개 추가: {', '.join(added)} — 신고/등록 초기화")
         messagebox.showinfo("완료", f"랜덤 계정 {len(added)}개를 추가했습니다.")
 
     def delete_selected_account(self):
@@ -4464,8 +4710,13 @@ class ReportApp:
         ids_to_remove = {self.account_tree.item(item)["values"][0] for item in selected}
         removed = [acc["id"] for acc in self.accounts if acc["id"] in ids_to_remove]
         self.accounts = [acc for acc in self.accounts if acc["id"] not in ids_to_remove]
+        if self._progress_account_ids:
+            remain = [aid for aid in self._progress_account_ids if aid not in ids_to_remove]
+            self._progress_account_ids = remain or None
+            self.save_settings()
         self.save_accounts()
         self.refresh_account_list()
+        self._refresh_task_account_counts()
         if len(removed) == 1:
             self.log(f"계정 삭제 완료: {removed[0]}")
         else:
@@ -4528,8 +4779,9 @@ class ReportApp:
 
     def _add_result(self, site, report_type, data, account_id=None):
         dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        key = f"{dt}|{report_type}|{site}"
-        self.hidden_results[key] = {"site": site, "report_type": report_type, "account_id": account_id or "", **data, "datetime": dt}
+        account_id = account_id or data.get("account_id") or ""
+        key = f"{dt}|{report_type}|{site}|{account_id}"
+        self.hidden_results[key] = {"site": site, "report_type": report_type, "account_id": account_id, **data, "datetime": dt}
         return dt
 
     def insert_preview(
@@ -4545,6 +4797,7 @@ class ReportApp:
         )
         self.results_tree.insert("", tk.END, values=values, tags=tags)
         self.refresh_site_stats_panel()
+        self._refresh_task_account_counts()
 
     def _unpack_result_tags(self, tags):
         tags = list(tags or [])
@@ -4774,7 +5027,7 @@ class ReportApp:
 
         def run():
             stopped = False
-            reporter = NaverReporter(
+            reporter = self._reporter_cls()(
                 api_key=api_key or "cafe-only",
                 model=self.model_var.get(),
                 headless=bool(self.hagrid_mode_var.get()),
@@ -4913,7 +5166,7 @@ class ReportApp:
 
         def run():
             stopped = False
-            reporter = NaverReporter(
+            reporter = self._reporter_cls()(
                 api_key=api_key or "blog-only",
                 model=self.model_var.get(),
                 headless=bool(self.hagrid_mode_var.get()),
@@ -4983,18 +5236,33 @@ class ReportApp:
         if not self.tasks:
             messagebox.showwarning("등록 필요", "신고 항목을 하나 이상 등록해주세요.")
             return
+        skip_keys = self._successful_report_keys()
+        round_accounts = self._accounts_for_progress_round()
+        if not round_accounts:
+            messagebox.showwarning("계정 필요", "네이버 계정을 하나 이상 등록해주세요.")
+            self.tabs.select("Settings")
+            return
+        if not any(self._account_has_pending_tasks(acc.get("id", ""), skip_keys) for acc in round_accounts):
+            messagebox.showinfo(
+                "이미 신고 완료",
+                "이번 계정으로 이미 모든 사이트 신고가 끝나 있습니다.\n새 계정을 추가하면 신고/등록이 다시 0부터 시작합니다.",
+            )
+            self._refresh_task_account_counts()
+            return
 
-        total = len(self.accounts) * len(self.tasks)
+        total = len(round_accounts) * len(self.tasks)
         self.log("=" * 55, channel="website")
         if booster:
             self.log(
                 f"부스터 신고 시작 | 로그인 생략 · 이메일만 입력 | "
-                f"항목:{len(self.tasks)}개, 계정:{len(self.accounts)}개, 총:{total}개",
+                f"항목:{len(self.tasks)}개, 계정:{len(round_accounts)}개, 총:{total}개",
                 channel="website",
             )
             self.log("부스터 — 신고 페이지에서 @gmail.com 이메일만 사용합니다", channel="website")
         else:
-            self.log(f"신고 시작 | 항목:{len(self.tasks)}개, 계정:{len(self.accounts)}개, 총:{total}개", channel="website")
+            self.log(f"신고 시작 | 항목:{len(self.tasks)}개, 계정:{len(round_accounts)}개, 총:{total}개", channel="website")
+        if self._progress_account_ids:
+            self.log(f"이번 신고/등록: 새로 등록한 계정 {len(round_accounts)}개 기준 (이전 계정은 건너뜀)", channel="website")
         self._report_running = True
         self._booster_running = bool(booster)
         self._website_stop_requested = False
@@ -5013,6 +5281,7 @@ class ReportApp:
                 "original": item["original"],
                 "rewritten": item["rewritten"],
                 "status": status,
+                "success": item.get("success"),
                 "account_password": item.get("account_password", ""),
                 "search_url": item.get("search_url", ""),
                 "search_url_custom": item.get("search_url_custom", False),
@@ -5021,6 +5290,13 @@ class ReportApp:
                 "guest_email": item.get("guest_email", ""),
             }
             dt = self._add_result(item["site"], item["report_type"], data, item["account_id"])
+            if self._result_counts_as_reported({**data, "account_id": item.get("account_id", ""), "site": item.get("site", ""), "report_type": item.get("report_type", "")}):
+                skip_keys.add((
+                    (item.get("account_id") or "").strip(),
+                    (item.get("site") or "").strip(),
+                    (item.get("report_type") or "").strip(),
+                ))
+            self.root.after(0, self._refresh_task_account_counts)
             self.root.after(
                 0,
                 lambda s=item["site"], rt=item["report_type"], o=item["original"], r=item["rewritten"],
@@ -5045,11 +5321,19 @@ class ReportApp:
                 ),
             )
 
+        def on_site(idx, site):
+            self.root.after(0, lambda i=idx, s=site: self._set_active_task(i, s))
+
+        def on_delay(remaining, label="재시작 대기"):
+            self.root.after(0, lambda r=remaining, lb=label: self._set_captcha_delay(r, lb))
+
+        rest_state = {"count": 0, "minutes": self._rest_minutes_value()}
+
         def run():
             stopped = False
             shared = None
             if booster:
-                shared = NaverReporter(
+                shared = self._reporter_cls()(
                     api_key=api_key,
                     model=self.model_var.get(),
                     headless=bool(self.hagrid_mode_var.get()),
@@ -5057,17 +5341,26 @@ class ReportApp:
                     log_callback=on_log,
                     result_callback=on_result,
                     progress_callback=on_progress,
+                    site_callback=on_site,
+                    delay_callback=on_delay,
+                    rest_state=rest_state,
                     booster_mode=True,
                 )
                 self._website_reporter = shared
             try:
-                for account in self.accounts:
+                resume_idx = 0
+                for account in round_accounts:
                     if self._website_stop_requested:
                         stopped = True
                         break
                     account_id = account["id"]
+                    if not self._account_has_pending_tasks(account_id, skip_keys):
+                        on_log(f"[계정 건너뜀] {account_id} — 이미 신고한 계정")
+                        continue
                     on_log(f"[계정 시작] {account_id}" + (" (부스터)" if booster else ""))
-                    reporter = shared or NaverReporter(
+                    if resume_idx:
+                        on_log(f"이어서 시작: {resume_idx + 1}번 사이트부터")
+                    reporter = shared or self._reporter_cls()(
                         api_key=api_key,
                         model=self.model_var.get(),
                         headless=bool(self.hagrid_mode_var.get()),
@@ -5075,6 +5368,9 @@ class ReportApp:
                         log_callback=on_log,
                         result_callback=on_result,
                         progress_callback=on_progress,
+                        site_callback=on_site,
+                        delay_callback=on_delay,
+                        rest_state=rest_state,
                     )
                     if not booster:
                         self._website_reporter = reporter
@@ -5082,6 +5378,8 @@ class ReportApp:
                         reporter.report(
                             account_id, account["password"], self.tasks,
                             keep_driver=bool(booster),
+                            start_task_index=resume_idx,
+                            skip_keys=skip_keys,
                         )
                         if reporter.cancel_requested or self._website_stop_requested:
                             stopped = True
@@ -5091,7 +5389,11 @@ class ReportApp:
                         if not booster:
                             self._website_reporter = None
                     on_log(f"[계정 완료] {account_id}" + (" (부스터)" if booster else ""))
-                    if self._website_stop_requested:
+                    if getattr(reporter, "resume_task_index", None) is not None:
+                        resume_idx = reporter.resume_task_index
+                    elif getattr(reporter, "account_advanced", False):
+                        resume_idx = 0
+                    if self._website_stop_requested or (reporter and reporter.cancel_requested):
                         stopped = True
                         break
             finally:
@@ -5115,6 +5417,8 @@ class ReportApp:
         self._report_running = False
         self._booster_running = False
         self._website_stop_requested = False
+        self._set_active_task(None)
+        self._set_captcha_delay(None)
         self._website_reporter = None
         self._unregister_log_channel("website")
         self._sync_report_buttons()
@@ -5126,6 +5430,7 @@ class ReportApp:
             self.log("부스터 신고가 중단되었습니다." if was_booster else "신고 작업이 중단되었습니다.", channel="website")
         else:
             self.log("부스터 신고 완료" if was_booster else "신고 내용 생성 완료", channel="website")
+        self._refresh_task_account_counts()
         stats = self.compute_site_report_stats()
         protected_accounts = set()
         for info in stats.values():
