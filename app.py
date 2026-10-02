@@ -11,7 +11,7 @@ from datetime import datetime
 from urllib.parse import quote, urlparse
 
 from chrome_browser import BROWSER_MODE_LABELS, DEFAULT_BROWSER_MODE, browser_mode_label, normalize_browser_mode
-from naver_reporter import NaverReporter
+from naver_reporter import NaverReporter, _send_windows_hotkey
 from naver_search_url import build_naver_search_url as resolve_naver_search_url
 from paths import data_path, APP_VERSION, is_admin_mode
 from ui_theme import (
@@ -1683,6 +1683,9 @@ class ReportApp:
         self.vpn_key_entry.pack(side=tk.LEFT)
         self.vpn_key_entry.bind("<KeyRelease>", lambda e: self._on_vpn_key_typed())
         self.vpn_key_entry.bind("<FocusOut>", lambda e: self._on_vpn_hotkey_change())
+        ui_button(vpn_wrap, "테스트", "ghost", width=72, height=32, command=self._test_vpn_hotkey).pack(
+            side=tk.LEFT, padx=(8, 0),
+        )
 
         task_container = self._frame(bottom_card, COLORS["card"])
         task_container.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 14))
@@ -3005,6 +3008,26 @@ class ReportApp:
             self.vpn_mod_var.set(self._vpn_mod_value())
         self._on_vpn_key_typed()
         self.save_settings()
+
+    def _test_vpn_hotkey(self):
+        spec = self._vpn_hotkey_spec()
+        mod = str(spec.get("mod") or "").strip().lower()
+        key = str(spec.get("key") or "").strip().upper()
+        if mod not in ("alt", "ctrl", "control") or not key:
+            messagebox.showwarning("VPN 단축키", "Alt/Ctrl과 키를 먼저 입력하세요.", parent=self.root)
+            return
+        label = "Ctrl" if mod in ("ctrl", "control") else "Alt"
+        self.log(f"VPN 단축키 테스트: 0.5초 후 {label}+{key} 전송")
+
+        def run():
+            try:
+                time.sleep(0.5)
+                _send_windows_hotkey(mod, key)
+                self.root.after(0, lambda: self.log(f"VPN 단축키 전송 완료: {label}+{key}"))
+            except Exception as exc:
+                self.root.after(0, lambda: self.log(f"VPN 단축키 전송 실패: {exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _ensure_browser_vars(self):
         if not hasattr(self, "hagrid_mode_var"):

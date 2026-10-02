@@ -30,10 +30,25 @@ from naver_search_url import fetch_naver_search_url_live
 
 
 INPUT_KEYBOARD = 1
+KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
-VK_MENU = 0x12
-VK_CONTROL = 0x11
+KEYEVENTF_SCANCODE = 0x0008
+MAPVK_VK_TO_VSC = 0
+VK_LMENU = 0xA4
+VK_LCONTROL = 0xA2
 _ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", _ULONG_PTR),
+    )
 
 
 class _KEYBDINPUT(ctypes.Structure):
@@ -46,33 +61,73 @@ class _KEYBDINPUT(ctypes.Structure):
     )
 
 
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    )
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = (("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT))
+
+
 class _INPUT(ctypes.Structure):
-    class _I(ctypes.Union):
-        _fields_ = (("ki", _KEYBDINPUT),)
-    _anonymous_ = ("i",)
-    _fields_ = (("type", wintypes.DWORD), ("i", _I))
+    _anonymous_ = ("u",)
+    _fields_ = (("type", wintypes.DWORD), ("u", _INPUTUNION))
+
+
+_user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+_user32.SendInput.restype = wintypes.UINT
+_user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
+_user32.MapVirtualKeyW.restype = wintypes.UINT
+_user32.keybd_event.argtypes = (wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, _ULONG_PTR)
 
 
 def _send_windows_hotkey(mod: str, key: str) -> None:
-    vk_mod = VK_CONTROL if str(mod).lower() in ("ctrl", "control") else VK_MENU
+    use_ctrl = str(mod).lower() in ("ctrl", "control")
+    vk_mod = VK_LCONTROL if use_ctrl else VK_LMENU
     ch = str(key or "").strip().upper()[:1]
     if not ch:
         return
     vk_key = ord(ch)
     extra = _ULONG_PTR(0)
 
-    def _send(vk, up=False):
-        flags = KEYEVENTF_KEYUP if up else 0
-        inp = _INPUT(type=INPUT_KEYBOARD, ki=_KEYBDINPUT(vk, 0, flags, 0, extra))
-        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+    def _scan(vk: int) -> int:
+        return int(_user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) or 0)
 
-    _send(vk_mod, False)
-    time.sleep(0.05)
-    _send(vk_key, False)
-    time.sleep(0.05)
-    _send(vk_key, True)
-    time.sleep(0.05)
-    _send(vk_mod, True)
+    def _make(vk: int, up: bool = False) -> _INPUT:
+        scan = _scan(vk)
+        if scan:
+            flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if up else 0)
+            ki = _KEYBDINPUT(0, scan, flags, 0, extra)
+        else:
+            flags = KEYEVENTF_KEYUP if up else 0
+            ki = _KEYBDINPUT(vk, 0, flags, 0, extra)
+        return _INPUT(type=INPUT_KEYBOARD, u=_INPUTUNION(ki=ki))
+
+    events = (_INPUT * 4)(
+        _make(vk_mod, False),
+        _make(vk_key, False),
+        _make(vk_key, True),
+        _make(vk_mod, True),
+    )
+    sent = _user32.SendInput(4, events, ctypes.sizeof(_INPUT))
+    if sent == 4:
+        return
+
+    flags_up = KEYEVENTF_KEYUP
+    _user32.keybd_event(vk_mod, _scan(vk_mod), 0, extra)
+    time.sleep(0.03)
+    _user32.keybd_event(vk_key, _scan(vk_key), 0, extra)
+    time.sleep(0.03)
+    _user32.keybd_event(vk_key, _scan(vk_key), flags_up, extra)
+    time.sleep(0.03)
+    _user32.keybd_event(vk_mod, _scan(vk_mod), flags_up, extra)
+    if sent == 0:
+        err = ctypes.get_last_error()
+        raise RuntimeError(f"SendInput 실패 (오류 {err}) — keybd_event로 다시 보냈습니다")
 
 
 class CaptchaSessionReset(Exception):
@@ -1243,13 +1298,16 @@ class NaverReporter:
         if old_ip:
             self.log(f"변경 전 IP: {old_ip}")
         self._press_vpn_hotkey()
-        new_ip = self._wait_for_ip_change(old_ip, timeout=max(int(seconds), 1))
+        wait_sec = max(int(seconds), 1)
+        self.log(f"VPN 단축키 후 {wait_sec}초 대기합니다")
+        self._wait_with_countdown(wait_sec, "VPN 대기")
+        new_ip = self._public_ip()
         if new_ip and old_ip and new_ip != old_ip:
-            self.log(f"IP 변경 확인: {old_ip} → {new_ip} — 바로 이어서 진행합니다")
+            self.log(f"IP 변경 확인: {old_ip} → {new_ip} — 이어서 진행합니다")
         elif new_ip:
             self.log(f"현재 IP: {new_ip} — 이어서 진행합니다")
         else:
-            self.log("IP 확인 실패 — 30초 대기 후 이어서 진행합니다")
+            self.log("IP 확인 실패 — 대기 종료 후 이어서 진행합니다")
 
     def _ssl_context(self):
         try:
@@ -1315,7 +1373,7 @@ class NaverReporter:
         self.log(f"VPN 단축키 입력: {label}+{key}")
         try:
             _send_windows_hotkey(mod, key)
-            time.sleep(2.5)
+            time.sleep(0.2)
         except Exception as exc:
             self.log(f"VPN 단축키 입력 실패: {exc}")
 
