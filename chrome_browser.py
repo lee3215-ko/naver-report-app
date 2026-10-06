@@ -226,7 +226,25 @@ def _kill_wdm_driver_processes(exe_name: str) -> None:
         pass
 
 
-def _find_cached_driver(kind: str) -> str:
+def _major_version(text: str) -> int:
+    match = re.search(r"(\d+)\.", str(text or ""))
+    if not match:
+        match = re.fullmatch(r"(\d+)", str(text or "").strip())
+    try:
+        return int(match.group(1)) if match else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _driver_major_from_path(path: str) -> int:
+    for part in os.path.normpath(path or "").split(os.sep):
+        major = _major_version(part)
+        if major >= 80:
+            return major
+    return 0
+
+
+def _find_cached_driver(kind: str, major: int = 0) -> str:
     exe = "chromedriver.exe" if kind == "chromedriver" else "msedgedriver.exe"
     root = os.path.join(os.path.expanduser("~"), ".wdm", "drivers", kind, "win64")
     found: list[str] = []
@@ -242,23 +260,60 @@ def _find_cached_driver(kind: str) -> str:
         or "edgedriver-win64" in p.replace("\\", "/").lower()
     ]
     pool = nested or found
+    if major:
+        matched = [p for p in pool if _driver_major_from_path(p) == major]
+        if matched:
+            return max(matched, key=os.path.getmtime)
+        return ""
     return max(pool, key=os.path.getmtime)
+
+
+def _install_chrome_driver(chrome_version: str = "") -> str:
+    major = _major_version(chrome_version)
+    attempts: list[str] = []
+    if chrome_version:
+        attempts.append(chrome_version)
+    if major:
+        attempts.append(str(major))
+    attempts.append("")
+    last_error = None
+    for version in attempts:
+        try:
+            manager = ChromeDriverManager(driver_version=version) if version else ChromeDriverManager()
+            path = manager.install()
+            if path and os.path.isfile(path):
+                if major and _driver_major_from_path(path) not in (0, major):
+                    continue
+                return path
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error:
+        raise last_error
+    return ""
 
 
 def _chrome_service() -> ChromeService:
     global _CACHED_CHROME_DRIVER
     _kill_wdm_driver_processes("chromedriver.exe")
-    path = _CACHED_CHROME_DRIVER if _CACHED_CHROME_DRIVER and os.path.isfile(_CACHED_CHROME_DRIVER) else _find_cached_driver("chromedriver")
+    chrome_version = get_chrome_version()
+    chrome_major = _major_version(chrome_version)
+    path = ""
+    if _CACHED_CHROME_DRIVER and os.path.isfile(_CACHED_CHROME_DRIVER):
+        if not chrome_major or _driver_major_from_path(_CACHED_CHROME_DRIVER) in (0, chrome_major):
+            path = _CACHED_CHROME_DRIVER
+    if not path:
+        path = _find_cached_driver("chromedriver", chrome_major)
     if path and os.path.isfile(path):
         _CACHED_CHROME_DRIVER = path
         return ChromeService(path)
     try:
-        path = ChromeDriverManager().install()
+        path = _install_chrome_driver(chrome_version)
         if path and os.path.isfile(path):
             _CACHED_CHROME_DRIVER = path
             return ChromeService(path)
     except OSError:
-        path = _find_cached_driver("chromedriver")
+        path = _find_cached_driver("chromedriver", chrome_major) or _find_cached_driver("chromedriver")
         if path and os.path.isfile(path):
             _CACHED_CHROME_DRIVER = path
             return ChromeService(path)
